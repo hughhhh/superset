@@ -16,7 +16,7 @@
 # under the License.
 import logging
 
-from flask import request, Response
+from flask import request, Response, url_for
 from flask_appbuilder.api import expose, protect, safe
 from marshmallow import ValidationError
 
@@ -31,6 +31,7 @@ from superset.commands.dataset.exceptions import (
 from superset.commands.explore.permalink.create import CreateExplorePermalinkCommand
 from superset.commands.explore.permalink.get import GetExplorePermalinkCommand
 from superset.constants import MODEL_API_RW_METHOD_PERMISSION_MAP
+from superset.exceptions import SupersetTemplateException
 from superset.explore.permalink.exceptions import ExplorePermalinkInvalidStateError
 from superset.explore.permalink.schemas import ExplorePermalinkStateSchema
 from superset.extensions import event_logger
@@ -95,8 +96,7 @@ class ExplorePermalinkRestApi(BaseSupersetApi):
         try:
             state = self.add_model_schema.load(request.json)
             key = CreateExplorePermalinkCommand(state=state).run()
-            http_origin = request.headers.environ.get("HTTP_ORIGIN")
-            url = f"{http_origin}/superset/explore/p/{key}/"
+            url = url_for("ExplorePermalinkView.permalink", key=key, _external=True)
             return self.response(201, key=key, url=url)
         except ValidationError as ex:
             return self.response(400, message=ex.messages)
@@ -108,6 +108,8 @@ class ExplorePermalinkRestApi(BaseSupersetApi):
             return self.response(403, message=str(ex))
         except (ChartNotFoundError, DatasetNotFoundError) as ex:
             return self.response(404, message=str(ex))
+        except SupersetTemplateException as ex:
+            return self.response(ex.status, message=str(ex))
 
     @expose("/permalink/<string:key>", methods=("GET",))
     @protect()
@@ -163,3 +165,5 @@ class ExplorePermalinkRestApi(BaseSupersetApi):
             return self.response(403, message=str(ex))
         except (ChartNotFoundError, DatasetNotFoundError) as ex:
             return self.response(404, message=str(ex))
+        except SupersetTemplateException as ex:
+            return self.response(ex.status, message=str(ex))

@@ -19,20 +19,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { shallowEqual, useSelector } from 'react-redux';
 import { useInView } from 'react-intersection-observer';
-import { omit } from 'lodash';
-import { EmptyStateMedium } from 'src/components/EmptyState';
-import {
-  t,
-  styled,
-  css,
-  FeatureFlag,
-  isFeatureEnabled,
-} from '@superset-ui/core';
+import { EmptyState, Skeleton } from '@superset-ui/core/components';
+import { t } from '@apache-superset/core/translation';
+import { FeatureFlag, isFeatureEnabled } from '@superset-ui/core';
+import { styled, css } from '@apache-superset/core/theme';
 import QueryTable from 'src/SqlLab/components/QueryTable';
 import { SqlLabRootState } from 'src/SqlLab/types';
 import { useEditorQueriesQuery } from 'src/hooks/apiResources/queries';
-import { Skeleton } from 'src/components';
 import useEffectEvent from 'src/hooks/useEffectEvent';
+import useQueryEditor from 'src/SqlLab/hooks/useQueryEditor';
+import PanelToolbar from 'src/components/PanelToolbar';
+import { ViewLocations } from 'src/SqlLab/contributions';
+import { mergeQueryStatus } from './mergeQueryStatus';
 
 interface QueryHistoryProps {
   queryEditorId: string | number;
@@ -42,7 +40,7 @@ interface QueryHistoryProps {
 
 const StyledEmptyStateWrapper = styled.div`
   height: 100%;
-  .antd5-empty-image img {
+  .ant-empty-image img {
     margin-right: 28px;
   }
 
@@ -64,6 +62,10 @@ const QueryHistory = ({
   displayLimit,
   latestQueryId,
 }: QueryHistoryProps) => {
+  const { id, tabViewId } = useQueryEditor(String(queryEditorId), [
+    'tabViewId',
+  ]);
+  const editorId = tabViewId ?? id;
   const [ref, hasReachedBottom] = useInView({ threshold: 0 });
   const [pageIndex, setPageIndex] = useState(0);
   const queries = useSelector(
@@ -75,26 +77,31 @@ const QueryHistory = ({
     isLoading,
     isFetching,
   } = useEditorQueriesQuery(
-    { editorId: `${queryEditorId}`, pageIndex },
+    { editorId, pageIndex },
     {
       skip: !isFeatureEnabled(FeatureFlag.SqllabBackendPersistence),
     },
   );
-  const editorQueries = useMemo(
-    () =>
-      data
-        ? getEditorQueries(
-            omit(
-              queries,
-              data.result.map(({ id }) => id),
-            ),
-            queryEditorId,
-          )
-            .concat(data.result)
-            .reverse()
-        : getEditorQueries(queries, queryEditorId),
-    [queries, data, queryEditorId],
-  );
+  const editorQueries = useMemo(() => {
+    if (!data) {
+      return getEditorQueries(queries, editorId);
+    }
+    const remoteIds = new Set(data.result.map(({ id }) => id));
+    const mergedRemoteQueries = data.result.map(remoteQuery => {
+      const localQuery = queries[remoteQuery.id];
+      return localQuery
+        ? mergeQueryStatus(remoteQuery, localQuery)
+        : remoteQuery;
+    });
+    return getEditorQueries(queries, editorId)
+      .filter(({ id }) => !remoteIds.has(id))
+      .concat(mergedRemoteQueries)
+      .sort((a, b) => {
+        const aTime = a.startDttm || 0;
+        const bTime = b.startDttm || 0;
+        return aTime - bTime;
+      });
+  }, [queries, data, editorId]);
 
   const loadNext = useEffectEvent(() => {
     setPageIndex(pageIndex + 1);
@@ -115,6 +122,7 @@ const QueryHistory = ({
 
   return editorQueries.length > 0 ? (
     <>
+      <PanelToolbar viewId={ViewLocations.sqllab.queryHistory} />
       <QueryTable
         columns={[
           'state',
@@ -143,8 +151,9 @@ const QueryHistory = ({
     </>
   ) : (
     <StyledEmptyStateWrapper>
-      <EmptyStateMedium
+      <EmptyState
         title={t('Run a query to display query history')}
+        size="medium"
         image="document.svg"
       />
     </StyledEmptyStateWrapper>

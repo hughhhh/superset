@@ -16,6 +16,35 @@
 # under the License.
 from typing import Any
 
+from superset.migrations.shared.migrate_viz.query_functions import (
+    build_query_context,
+    contribution_operator,
+    ensure_is_array,
+    extract_extra_metrics,
+    flatten_operator,
+    get_column_label,
+    get_metric_label,
+    get_x_axis_column,
+    histogram_operator,
+    is_adhoc_metric_simple,
+    is_physical_column,
+    is_time_comparison,
+    is_x_axis_set,
+    normalize_order_by,
+    omit,
+    pivot_operator,
+    prophet_operator,
+    rank_operator,
+    remove_duplicates,
+    remove_form_data_suffix,
+    rename_operator,
+    resample_operator,
+    retain_form_data_suffix,
+    rolling_window_operator,
+    sort_operator,
+    time_compare_operator,
+    time_compare_pivot_operator,
+)
 from superset.utils.core import as_list
 
 from .base import MigrateViz
@@ -34,6 +63,19 @@ class MigrateTreeMap(MigrateViz):
             and len(self.data["metrics"]) > 0
         ):
             self.data["metric"] = self.data["metrics"][0]
+
+    def _build_query(self) -> dict[str, Any]:
+        metric = self.data.get("metric")
+        sort_by_metric = self.data.get("sort_by_metric")
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            new_query_object = base_query_object.copy()
+
+            if sort_by_metric:
+                new_query_object["orderby"] = [[metric, False]]
+            return [new_query_object]
+
+        return build_query_context(self.data, process)
 
 
 class MigratePivotTable(MigrateViz):
@@ -70,6 +112,58 @@ class MigratePivotTable(MigrateViz):
 
         self.data["rowOrder"] = "value_z_to_a"
 
+    def _build_query(self) -> dict[str, Any]:
+        groupby_columns = self.data.get("groupbyColumns", [])
+        groupby_rows = self.data.get("groupbyRows", [])
+        extra_form_data = self.data.get("extra_form_data", {})
+        time_grain_sqla = extra_form_data.get("time_grain_sqla") or self.data.get(
+            "time_grain_sqla"
+        )
+
+        unique_columns = ensure_is_array(groupby_columns) + ensure_is_array(
+            groupby_rows
+        )
+
+        columns = []
+        for col in unique_columns:
+            if (
+                is_physical_column(col)
+                and time_grain_sqla
+                and (
+                    self.data.get("temporal_columns_lookup", {}).get(col)
+                    or self.data.get("granularity_sqla") == col
+                )
+            ):
+                col_dict = {
+                    "timeGrain": time_grain_sqla,
+                    "columnType": "BASE_AXIS",
+                    "sqlExpression": col,
+                    "label": col,
+                    "expressionType": "SQL",
+                }
+                if col_dict not in columns:
+                    columns.append(col_dict)
+            else:
+                if col not in columns:
+                    columns.append(col)
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            series_limit_metric = base_query_object.get("series_limit_metric")
+            metrics = base_query_object.get("metrics")
+            order_desc = base_query_object.get("order_desc")
+            orderby = None
+            if series_limit_metric:
+                orderby = [[series_limit_metric, not order_desc]]
+            elif isinstance(metrics, list) and metrics and metrics[0]:
+                orderby = [[metrics[0], not order_desc]]
+            new_query_object = base_query_object.copy()
+            if orderby is not None:
+                new_query_object["orderby"] = orderby
+            new_query_object["columns"] = columns
+            return [new_query_object]
+
+        return build_query_context(self.data, process)
+
 
 class MigrateDualLine(MigrateViz):
     has_x_axis_control = True
@@ -94,11 +188,72 @@ class MigrateDualLine(MigrateViz):
         super()._migrate_temporal_filter(rv_data)
         rv_data["adhoc_filters_b"] = rv_data.get("adhoc_filters") or []
 
+    def _build_query(self) -> dict[str, Any]:
+        base_form_data = self.data.copy()
+        form_data1 = remove_form_data_suffix(base_form_data, "_b")
+        form_data2 = retain_form_data_suffix(base_form_data, "_b")
+
+        def process_fn(fd: dict[str, Any]) -> dict[str, Any]:
+            def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+                query_object = base_query_object.copy()
+                query_object["columns"] = (
+                    ensure_is_array(get_x_axis_column(self.data))
+                    if is_x_axis_set(self.data)
+                    else []
+                ) + ensure_is_array(fd.get("groupby"))
+                query_object["series_columns"] = fd.get("groupby")
+                if not is_x_axis_set(self.data):
+                    query_object["is_timeseries"] = True
+                pivot_operator_runtime = (
+                    time_compare_pivot_operator(fd, query_object)
+                    if is_time_comparison(fd, query_object)
+                    else pivot_operator(fd, query_object)
+                )
+                tmp_query_object = query_object.copy()
+                tmp_query_object["time_offsets"] = (
+                    fd.get("time_compare")
+                    if is_time_comparison(fd, query_object)
+                    else []
+                )
+                tmp_query_object["post_processing"] = [
+                    pivot_operator_runtime,
+                    rolling_window_operator(fd, query_object),
+                    time_compare_operator(fd, query_object),
+                    resample_operator(fd, query_object),
+                    rename_operator(fd, query_object),
+                    flatten_operator(fd, query_object),
+                ]
+
+                if tmp_query_object["series_columns"] is None:
+                    tmp_query_object.pop("series_columns")
+                return [normalize_order_by(tmp_query_object)]
+
+            return build_query_context(fd, process)
+
+        query_contexts = [process_fn(form_data1), process_fn(form_data2)]
+        qc0 = query_contexts[0]
+        qc1 = query_contexts[1]
+        merged = qc0.copy()
+        merged["queries"] = qc0.get("queries", []) + qc1.get("queries", [])
+        return merged
+
 
 class MigrateSunburst(MigrateViz):
     source_viz_type = "sunburst"
     target_viz_type = "sunburst_v2"
     rename_keys = {"groupby": "columns"}
+
+    def _build_query(self) -> dict[str, Any]:
+        metric = self.data.get("metric")
+        sort_by_metric = self.data.get("sort_by_metric")
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            result = base_query_object.copy()
+            if sort_by_metric:
+                result["orderby"] = [[metric, False]]
+            return [result]
+
+        return build_query_context(self.data, process)
 
 
 class TimeseriesChart(MigrateViz):
@@ -142,9 +297,11 @@ class TimeseriesChart(MigrateViz):
         if (rolling_type := self.data.get("rolling_type")) and rolling_type != "None":
             self.data["rolling_type"] = rolling_type
 
-        if time_compare := self.data.get("time_compare"):
+        if (time_compare := self.data.get("time_compare")) is not None:
             self.data["time_compare"] = [
-                value + " ago" for value in as_list(time_compare) if value
+                v if v.endswith(" ago") else v + " ago"
+                for value in as_list(time_compare)
+                if (v := value.strip())
             ]
 
         comparison_type = self.data.get("comparison_type") or "values"
@@ -154,6 +311,63 @@ class TimeseriesChart(MigrateViz):
 
         if x_ticks_layout := self.data.get("x_ticks_layout"):
             self.data["x_ticks_layout"] = 45 if x_ticks_layout == "45°" else 0
+
+    def _build_query(self) -> dict[str, Any]:
+        groupby = self.data.get("groupby")
+
+        def query_builder(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            """
+            The `pivot_operator_in_runtime` determines how to pivot the dataframe
+              returned from the raw query.
+            1. If it's a time compared query, there will return a pivoted
+              dataframe that append time compared metrics.
+            """
+            extra_metrics = extract_extra_metrics(self.data)
+
+            pivot_operator_in_runtime = (
+                time_compare_pivot_operator(self.data, base_query_object)
+                if is_time_comparison(self.data, base_query_object)
+                else pivot_operator(self.data, base_query_object)
+            )
+
+            columns = (
+                ensure_is_array(get_x_axis_column(self.data))
+                if is_x_axis_set(self.data)
+                else []
+            ) + ensure_is_array(groupby)
+
+            time_offsets = (
+                self.data.get("time_compare")
+                if is_time_comparison(self.data, base_query_object)
+                else []
+            )
+
+            result = {
+                **base_query_object,
+                "metrics": (base_query_object.get("metrics") or []) + extra_metrics,
+                "columns": columns,
+                "series_columns": groupby,
+                **({"is_timeseries": True} if not is_x_axis_set(self.data) else {}),
+                # todo: move `normalize_order_by to extract_query_fields`
+                "orderby": normalize_order_by(base_query_object).get("orderby"),
+                "time_offsets": time_offsets,
+                "post_processing": [
+                    pivot_operator_in_runtime,
+                    rolling_window_operator(self.data, base_query_object),
+                    time_compare_operator(self.data, base_query_object),
+                    resample_operator(self.data, base_query_object),
+                    rename_operator(self.data, base_query_object),
+                    contribution_operator(self.data, base_query_object, time_offsets),
+                    sort_operator(self.data, base_query_object),
+                    flatten_operator(self.data, base_query_object),
+                    # todo: move prophet before flatten
+                    prophet_operator(self.data, base_query_object),
+                ],
+            }
+
+            return [result]
+
+        return build_query_context(self.data, query_builder)
 
 
 class MigrateLineChart(TimeseriesChart):
@@ -172,6 +386,21 @@ class MigrateLineChart(TimeseriesChart):
         elif line_interpolation == "step-after":
             self.target_viz_type = "echarts_timeseries_step"
             self.data["seriesType"] = "end"
+
+    def _build_query(self) -> dict[str, Any]:
+        return super()._build_query()
+
+
+class MigrateCompareChart(TimeseriesChart):
+    source_viz_type = "compare"
+    target_viz_type = "echarts_timeseries_line"
+
+    def _pre_action(self) -> None:
+        super()._pre_action()
+        # Restore the percent-change view the nvd3 renderer computed
+        # client-side; the ECharts line chart rebases series when this
+        # flag is set and offers a draggable baseline to re-index.
+        self.data["rebase_percent_change"] = True
 
 
 class MigrateAreaChart(TimeseriesChart):
@@ -194,6 +423,9 @@ class MigrateAreaChart(TimeseriesChart):
 
         self.data["opacity"] = 0.7
 
+    def _build_query(self) -> dict[str, Any]:
+        return super()._build_query()
+
 
 class MigrateBarChart(TimeseriesChart):
     source_viz_type = "bar"
@@ -207,6 +439,9 @@ class MigrateBarChart(TimeseriesChart):
         self.remove_keys.add("bar_stacked")
 
         self.data["stack"] = "Stack" if self.data.get("bar_stacked") else None
+
+    def _build_query(self) -> dict[str, Any]:
+        return super()._build_query()
 
 
 class MigrateDistBarChart(TimeseriesChart):
@@ -236,6 +471,10 @@ class MigrateDistBarChart(TimeseriesChart):
         self.remove_keys.add("bar_stacked")
 
         self.data["stack"] = "Stack" if self.data.get("bar_stacked") else None
+        self.data["x_ticks_layout"] = 45
+
+    def _build_query(self) -> dict[str, Any]:
+        return super()._build_query()
 
 
 class MigrateBubbleChart(MigrateViz):
@@ -266,6 +505,30 @@ class MigrateBubbleChart(MigrateViz):
         # Truncate y-axis by default to preserve layout
         self.data["y_axis_showminmax"] = True
 
+    def _build_query(self) -> dict[str, Any]:
+        columns = ensure_is_array(self.data.get("entity")) + ensure_is_array(
+            self.data.get("series")
+        )
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            if base_query_object.get("orderby"):
+                orderby = [
+                    [
+                        base_query_object["orderby"][0],
+                        not base_query_object.get("order_desc", False),
+                    ]
+                ]
+            else:
+                orderby = None
+
+            new_query_object = {**base_query_object, "columns": columns}
+            if orderby is not None:
+                new_query_object["orderby"] = orderby
+
+            return [new_query_object]
+
+        return build_query_context(self.data, process)
+
 
 class MigrateHeatmapChart(MigrateViz):
     source_viz_type = "heatmap"
@@ -280,6 +543,53 @@ class MigrateHeatmapChart(MigrateViz):
 
     def _pre_action(self) -> None:
         self.data["legend_type"] = "continuous"
+
+    def _build_query(self) -> dict[str, Any]:
+        groupby = self.data.get("groupby")
+        normalize_across = self.data.get("normalize_across")
+        sort_x_axis = self.data.get("sort_x_axis")
+        sort_y_axis = self.data.get("sort_y_axis")
+        x_axis = self.data.get("x_axis")
+
+        metric = get_metric_label(self.data.get("metric"))
+
+        columns = ensure_is_array(get_x_axis_column(self.data)) + ensure_is_array(
+            groupby
+        )
+
+        orderby = []
+        if sort_x_axis:
+            chosen = metric if "value" in sort_x_axis else columns[0]
+            ascending = "asc" in sort_x_axis
+            orderby.append([chosen, ascending])
+        if sort_y_axis:
+            chosen = metric if "value" in sort_y_axis else columns[1]
+            ascending = "asc" in sort_y_axis
+            orderby.append([chosen, ascending])
+
+        if normalize_across == "x":
+            group_by = get_column_label(x_axis)
+        elif normalize_across == "y":
+            group_by = get_column_label(groupby)
+        else:
+            group_by = None
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            new_query_object = base_query_object.copy()
+            new_query_object["columns"] = columns
+            if orderby:
+                new_query_object["orderby"] = orderby
+            new_query_object["post_processing"] = [
+                rank_operator(
+                    self.data,
+                    base_query_object,
+                    {"metric": metric, "group_by": group_by},
+                )
+            ]
+
+            return [new_query_object]
+
+        return build_query_context(self.data, process)
 
 
 class MigrateHistogramChart(MigrateViz):
@@ -304,6 +614,22 @@ class MigrateHistogramChart(MigrateViz):
         if not groupby:
             self.data["groupby"] = []
 
+    def _build_query(self) -> dict[str, Any]:
+        column = self.data.get("column")
+        groupby = self.data.get("groupby", [])
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            result = base_query_object.copy()
+            result["columns"] = groupby + [column]
+            result["post_processing"] = [
+                histogram_operator(self.data, base_query_object)
+            ]
+            if "metrics" in result.keys():
+                result.pop("metrics", None)
+            return [result]
+
+        return build_query_context(self.data, process)
+
 
 class MigrateSankey(MigrateViz):
     source_viz_type = "sankey"
@@ -315,3 +641,345 @@ class MigrateSankey(MigrateViz):
         if groupby and len(groupby) > 1:
             self.data["source"] = groupby[0]
             self.data["target"] = groupby[1]
+
+    def _build_query(self) -> dict[str, Any]:
+        metric = self.data.get("metric")
+        sort_by_metric = self.data.get("sort_by_metric")
+        source = self.data.get("source")
+        target = self.data.get("target")
+        groupby = [source, target]
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            result = base_query_object.copy()
+            result["groupby"] = groupby
+            if sort_by_metric:
+                result["orderby"] = [[metric, False]]
+            return [result]
+
+        return build_query_context(self.data, process)
+
+
+def _get_table_chart_time_offsets(
+    form_data: dict[str, Any], base_query_object: dict[str, Any]
+) -> list[Any]:
+    """
+    Resolve time_compare into the list of shifts buildQuery.ts sends as
+    time_offsets. table charts use a single-select time_compare control
+    whose choices include the special 'custom'/'inherit' shifts, which
+    resolve to start_date_offset/'inherit' rather than being used verbatim.
+
+    Chart-level shifts only apply when is_time_comparison(...) holds,
+    mirroring buildQuery.ts; the dashboard-level extra_form_data override
+    below is applied regardless, since it can force a comparison the chart
+    itself isn't configured for.
+    """
+    time_compare_shifts = ensure_is_array(form_data.get("time_compare"))
+    non_custom_or_inherit_shifts = [
+        shift for shift in time_compare_shifts if shift not in ("custom", "inherit")
+    ]
+    custom_or_inherit_shifts = [
+        shift for shift in time_compare_shifts if shift in ("custom", "inherit")
+    ]
+
+    time_offsets: list[Any] = []
+    if is_time_comparison(form_data, base_query_object):
+        time_offsets = list(non_custom_or_inherit_shifts)
+        if "custom" in custom_or_inherit_shifts:
+            time_offsets.append(form_data.get("start_date_offset"))
+        if "inherit" in custom_or_inherit_shifts:
+            time_offsets.append("inherit")
+
+    # Dashboard filter override - allows dashboard-level time shifts to
+    # OVERRIDE chart-level time shift settings, mirroring buildQuery.ts.
+    extra_form_data_time_compare = (form_data.get("extra_form_data") or {}).get(
+        "time_compare"
+    )
+    if extra_form_data_time_compare:
+        # extra_form_data.time_compare is typed as a single string on the
+        # frontend, but self.data comes from deserialized JSON with no
+        # runtime type guarantee — normalize defensively so an already-list
+        # value doesn't get double-nested into [[...]].
+        time_offsets = list(ensure_is_array(extra_form_data_time_compare))
+    return time_offsets
+
+
+def _reorder_table_chart_temporal_column(
+    columns: list[Any],
+    time_grain_sqla: Any,
+    temporal_columns_lookup: dict[str, Any],
+) -> list[Any]:
+    """
+    Move the first physical column with a temporal_columns_lookup entry to
+    the front of the columns list as a BASE_AXIS adhoc column, mirroring
+    buildQuery.ts's temporal-column handling in aggregate mode.
+    """
+    temporal_column = None
+    filtered_columns = []
+    for col in columns:
+        should_be_temporal = (
+            is_physical_column(col)
+            and time_grain_sqla
+            and temporal_columns_lookup.get(col)
+        )
+        if should_be_temporal and temporal_column is None:
+            temporal_column = {
+                "timeGrain": time_grain_sqla,
+                "columnType": "BASE_AXIS",
+                "sqlExpression": col,
+                "label": col,
+                "expressionType": "SQL",
+            }
+        else:
+            filtered_columns.append(col)
+    return [temporal_column] + filtered_columns if temporal_column else filtered_columns
+
+
+def _to_totals_aggregate(value: Any) -> str:
+    """
+    Narrow a raw totals_aggregate form-data value, mirroring
+    toTotalsAggregate() in @superset-ui/chart-controls. Anything other than
+    an explicit SUM/AVG -- including charts saved before the control
+    existed -- keeps each metric's own aggregation.
+    """
+    return value if value in ("SUM", "AVG") else "ORIGINAL"
+
+
+def _get_table_chart_totals_metrics(
+    metrics: list[Any], totals_aggregate: str
+) -> list[Any]:
+    """
+    Build the metrics for the totals query, mirroring getTotalsMetrics() in
+    @superset-ui/chart-controls: with SUM or AVG, each SIMPLE (adhoc) metric
+    is cloned with its aggregate replaced, since the totals query has no
+    GROUP BY. Custom-SQL and saved (string) metrics have no safe way to
+    rewrite an arbitrary aggregate, so they pass through unchanged.
+    """
+    if totals_aggregate == "ORIGINAL":
+        return metrics
+    return [
+        {**metric, "aggregate": totals_aggregate}
+        if is_adhoc_metric_simple(metric)
+        else metric
+        for metric in metrics
+    ]
+
+
+class MigrateTableChart(MigrateViz):
+    source_viz_type = "table"
+    target_viz_type = "ag-grid-table"
+    # Table V2 is still `IN DEVELOPMENT`, gated behind AG_GRID_TABLE_ENABLED.
+    # Without this, importing any `table` chart (e.g. `load_examples` on a
+    # fresh install with the flag at its default False) would silently turn
+    # it into an ag-grid-table chart the frontend can't render at all: "Item
+    # with key ag-grid-table is not registered."
+    requires_feature_flag = "AG_GRID_TABLE_ENABLED"
+    # allow_rearrange_columns/allow_render_html/header_groups are kept as-is:
+    # v2 reads them under the same names (see rename_keys below), so nothing
+    # to remove.(allow_rearrange_columns still gets a value materialized in
+    # _pre_action below when the source chart omits the key.)
+    remove_keys: set[str] = set()
+    rename_keys: dict[str, str] = {}  # no renames needed; names match 1:1
+
+    def _pre_action(self) -> None:
+        # page_length: 0 means "All rows" (no pagination) in both v1 and v2.
+        # v2's control panel doesn't offer 0 as a page_length dropdown
+        # choice, but it's still a working runtime value there -- e.g.
+        # getPageSize() in transformProps.ts picks 0 automatically for any
+        # chart under 5000 cells when page_length isn't set at all -- so
+        # keep it as-is rather than rewriting it to a paginated value.
+
+        # Table charts are explicitly excluded from Matrixify
+        # (MATRIXIFY_INCOMPATIBLE_CHARTS), so drop any matrixify_* keys
+        # rather than migrating them.
+        for key in [k for k in self.data if k.startswith("matrixify_")]:
+            self.data.pop(key)
+
+        # v1's control (and TableChart) default allow_rearrange_columns to
+        # False, and older saved charts may omit the key entirely. v2's
+        # transformProps.ts instead defaults a missing key to True, since
+        # for v2-native charts that predate the control it means "keep the
+        # always-on behavior v2 originally shipped with". Materialize v1's
+        # default explicitly here so a migrated chart keeps its original
+        # (non-draggable) behavior instead of picking up v2's unrelated
+        # default for its own pre-existing charts.
+        if "allow_rearrange_columns" not in self.data:
+            self.data["allow_rearrange_columns"] = False
+
+        # v1's TableChart always renders with Bootstrap-style zebra
+        # striping ("table-striped") -- there's no control for it, it's
+        # unconditional. v2's zebra_striping control defaults new charts to
+        # False (matching v2's own subtle-by-default look), so a migrated
+        # chart needs this materialized explicitly to keep its original
+        # striped appearance rather than silently losing it.
+        self.data["zebra_striping"] = True
+
+    def _build_aggregate_mode_query(
+        self, base_query_object: dict[str, Any], time_offsets: list[Any]
+    ) -> tuple[list[Any], list[Any], Any, list[Any]]:
+        """
+        Returns (metrics, columns, orderby, post_processing) for aggregate
+        mode, mirroring buildQuery.ts's QueryMode.Aggregate branch: sort-by
+        metric/default ordering, percent-metric contribution, time
+        comparison, and moving the temporal column to the front.
+        """
+        metrics = base_query_object.get("metrics") or []
+        orderby = base_query_object.get("orderby") or []
+        columns = list(base_query_object.get("columns") or [])
+        post_processing: list[Any] = []
+
+        sort_by_metric_options = ensure_is_array(
+            self.data.get("timeseries_limit_metric")
+        )
+        sort_by_metric = sort_by_metric_options[0] if sort_by_metric_options else None
+        if sort_by_metric:
+            orderby = [[sort_by_metric, not self.data.get("order_desc", False)]]
+        elif metrics:
+            orderby = [[metrics[0], False]]
+
+        if percent_metrics := ensure_is_array(self.data.get("percent_metrics")):
+            percent_metric_base_labels = [get_metric_label(m) for m in percent_metrics]
+            if is_time_comparison(self.data, base_query_object):
+                # Mirror buildQuery.ts's addComparisonPercentMetrics: expand
+                # each percent metric with its time-offset suffixes so
+                # shifted percent columns are computed/renamed too.
+                percent_metric_labels_with_time_comparison = [
+                    label
+                    for metric_label in percent_metric_base_labels
+                    for label in [
+                        metric_label,
+                        *[f"{metric_label}__{shift}" for shift in time_offsets],
+                    ]
+                ]
+            else:
+                percent_metric_labels_with_time_comparison = percent_metric_base_labels
+            percent_metric_labels = remove_duplicates(
+                percent_metric_labels_with_time_comparison, get_metric_label
+            )
+            metrics = remove_duplicates(metrics + percent_metrics, get_metric_label)
+            post_processing.append(
+                {
+                    "operation": "contribution",
+                    "options": {
+                        "columns": percent_metric_labels,
+                        "rename_columns": [f"%{m}" for m in percent_metric_labels],
+                    },
+                }
+            )
+
+        if time_offsets:
+            time_compare = time_compare_operator(self.data, base_query_object)
+            if time_compare:
+                post_processing.append(time_compare)
+
+        # Dashboard-level grain override takes precedence over the
+        # chart-level time_grain_sqla, mirroring buildQuery.ts.
+        extra_form_data_time_grain = (self.data.get("extra_form_data") or {}).get(
+            "time_grain_sqla"
+        )
+        time_grain_sqla = extra_form_data_time_grain or self.data.get("time_grain_sqla")
+        columns = _reorder_table_chart_temporal_column(
+            columns,
+            time_grain_sqla,
+            self.data.get("temporal_columns_lookup") or {},
+        )
+
+        return metrics, columns, orderby, post_processing
+
+    def _build_table_chart_extra_queries(
+        self, query_object: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """
+        Extra queries appended after the main query: an unlimited
+        percent-metrics-only query for percent_metric_calculation ==
+        'all_records', and a totals query when show_totals is on.
+        """
+        percent_metrics = ensure_is_array(self.data.get("percent_metrics"))
+        calculation_mode = self.data.get("percent_metric_calculation") or "row_limit"
+        metrics = query_object.get("metrics")
+        contribution_post_processing = next(
+            (
+                pp
+                for pp in query_object.get("post_processing") or []
+                if pp.get("operation") == "contribution"
+            ),
+            None,
+        )
+
+        extra_queries = []
+
+        if calculation_mode == "all_records" and percent_metrics:
+            extra_queries.append(
+                {
+                    **query_object,
+                    "columns": [],
+                    "metrics": percent_metrics,
+                    "post_processing": [],
+                    "row_limit": 0,
+                    "row_offset": 0,
+                    "orderby": [],
+                    "is_timeseries": False,
+                }
+            )
+
+        if metrics and self.data.get("show_totals"):
+            totals_aggregate = _to_totals_aggregate(self.data.get("totals_aggregate"))
+            extra_queries.append(
+                {
+                    **omit(query_object, ["order_desc", "orderby"]),
+                    "columns": [],
+                    "metrics": _get_table_chart_totals_metrics(
+                        metrics, totals_aggregate
+                    ),
+                    "row_limit": 0,
+                    "row_offset": 0,
+                    "post_processing": (
+                        [contribution_post_processing]
+                        if contribution_post_processing
+                        else []
+                    ),
+                }
+            )
+
+        return extra_queries
+
+    def _build_query(self) -> dict[str, Any]:
+        # Table v1 and v2 share the same buildQuery shape (groupby/metrics/
+        # percent_metrics/row_limit/order_by_cols/percent_metric_calculation),
+        # so this mirrors plugin-chart-table/src/buildQuery.ts and
+        # plugin-chart-ag-grid-table/src/buildQuery.ts, minus the
+        # request-time-only branches (server pagination paging/search state,
+        # download row-limit overrides) that don't apply to a persisted
+        # query_context.
+        query_mode = self.data.get("query_mode")
+        all_columns = ensure_is_array(self.data.get("all_columns"))
+        raw_mode = query_mode == "raw" or (query_mode is None and len(all_columns) > 0)
+
+        def process(base_query_object: dict[str, Any]) -> list[dict[str, Any]]:
+            time_offsets = _get_table_chart_time_offsets(self.data, base_query_object)
+
+            if raw_mode:
+                metrics = base_query_object.get("metrics")
+                columns = base_query_object.get("columns") or []
+                orderby = base_query_object.get("orderby") or []
+                post_processing: list[Any] = []
+            else:
+                metrics, columns, orderby, post_processing = (
+                    self._build_aggregate_mode_query(base_query_object, time_offsets)
+                )
+
+            query_object = {
+                **base_query_object,
+                "columns": columns,
+                "orderby": orderby,
+                "metrics": metrics,
+                "post_processing": post_processing,
+                "time_offsets": time_offsets,
+            }
+
+            extra_queries = (
+                [] if raw_mode else self._build_table_chart_extra_queries(query_object)
+            )
+
+            return [query_object, *extra_queries]
+
+        return build_query_context(self.data, process)

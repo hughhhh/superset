@@ -18,27 +18,35 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache, partial
-from typing import Any, Callable, cast, Optional, TYPE_CHECKING, TypedDict, Union
+from typing import Any, Callable, cast, TYPE_CHECKING, TypedDict, Union
 
-import dateutil
 from flask import current_app, g, has_request_context, request
 from flask_babel import gettext as _
-from jinja2 import DebugUndefined, Environment
+from jinja2 import DebugUndefined, Environment, TemplateSyntaxError, UndefinedError
+from jinja2.exceptions import SecurityError
 from jinja2.sandbox import SandboxedEnvironment
 from sqlalchemy.engine.interfaces import Dialect
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.expression import bindparam
 from sqlalchemy.types import String
 
+from superset import db, security_manager
 from superset.commands.dataset.exceptions import DatasetNotFoundError
 from superset.common.utils.time_range_utils import get_since_until_from_time_range
 from superset.constants import LRU_CACHE_MAX_SIZE, NO_TIME_RANGE
-from superset.exceptions import SupersetTemplateException
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+from superset.exceptions import (
+    SupersetSyntaxErrorException,
+    SupersetTemplateException,
+)
 from superset.extensions import feature_flag_manager
-from superset.sql_parse import Table
+from superset.sql.parse import Table
+from superset.superset_typing import Column, QueryObjectDict
 from superset.utils import json
 from superset.utils.core import (
     AdhocFilterClause,
@@ -54,6 +62,16 @@ if TYPE_CHECKING:
     from superset.connectors.sqla.models import SqlaTable
     from superset.models.core import Database
     from superset.models.sql_lab import Query
+    from superset.security.guest_token import GuestToken
+
+logger = logging.getLogger(__name__)
+
+
+class UndefinedTemplateFunctionException(SupersetTemplateException):
+    """Raised when an undefined function-like Jinja identifier is encountered."""
+
+    pass
+
 
 NONE_TYPE = type(None).__name__
 ALLOWED_TYPES = (
@@ -72,16 +90,22 @@ ALLOWED_TYPES = (
 )
 COLLECTION_TYPES = ("list", "dict", "tuple", "set")
 
+# Type alias for JSON-native types
+JsonValue = Union[
+    str, int, float, bool, list["JsonValue"], dict[str, "JsonValue"], None
+]
+
 
 @lru_cache(maxsize=LRU_CACHE_MAX_SIZE)
 def context_addons() -> dict[str, Any]:
     return current_app.config.get("JINJA_CONTEXT_ADDONS", {})
 
 
-class Filter(TypedDict):
+class Filter(TypedDict, total=False):
     op: str  # pylint: disable=C0103
     col: str
     val: Union[None, Any, list[Any]]
+    escaped_val: Union[None, Any, list[Any]]
 
 
 @dataclass
@@ -95,6 +119,70 @@ class TimeFilter:
     time_range: str | None
 
 
+class SQLSafeList(list[Any]):  # noqa: FURB189
+    """
+    A list of dialect-escaped values whose *whole-container* string
+    rendering cannot re-introduce raw quote characters.
+
+    Rendering a plain Python list in a Jinja template goes through
+    ``str()``/``repr()``, which wraps every string element in fresh quote
+    delimiters (and switches to double-quote delimiters when the element
+    contains a single quote, emitting that single quote raw). Either way
+    the rendered text can contain quote characters that were never
+    escaped for SQL, so a template interpolating the list inside its own
+    quotes -- e.g. ``LIKE '{{ filter.get('escaped_val') }}'`` -- could be
+    broken out of even though every string leaf was individually escaped.
+    This subclass renders as its (already-escaped) elements joined with
+    ``", "``, with no additional delimiters, so every quote in the output
+    is one the dialect's literal processor already escaped.
+    """
+
+    def __str__(self) -> str:
+        return ", ".join(str(element) for element in self)
+
+    __repr__ = __str__
+
+
+class SQLSafeDict(dict[Any, Any]):  # noqa: FURB189
+    """
+    A dict of dialect-escaped keys and values whose *whole-container*
+    string rendering cannot re-introduce raw quote characters. Mirrors
+    :class:`SQLSafeList` for the mapping case.
+
+    Keys are typically used for member lookups (for example
+    ``{{ get_guest_user_attribute('tenant').id }}``) rather than
+    interpolated into SQL directly, but a template can still render the
+    whole dict -- and a key, like a value, may originate from data the
+    caller does not fully control. Keys are therefore escaped the same
+    way values are, through ``ExtraCache._escape_value``, so whole-dict
+    rendering carries the same guarantee as whole-list rendering.
+    """
+
+    def __str__(self) -> str:
+        return ", ".join(f"{key}: {value}" for key, value in self.items())
+
+    __repr__ = __str__
+
+
+def _normalize_postgresql_backslash_escapes(dialect: Dialect) -> None:
+    """Correct a PostgreSQL dialect instance's ``_backslash_escapes`` default
+    in place so backslashes round-trip unchanged when the dialect is used to
+    render literals without a live connection.
+
+    A dialect built without a live connection (as ``Database.get_dialect()``
+    does) defaults ``_backslash_escapes`` to ``True``, which would double
+    every backslash even though every supported PostgreSQL version treats
+    the backslash as a plain character by default
+    (``standard_conforming_strings`` has been on since PostgreSQL 9.1). Left
+    uncorrected, a value like ``C:\\Users`` would be rewritten to
+    ``C:\\\\Users`` and silently fail to match the original value. Other
+    dialects (for example MySQL/MariaDB, which do treat the backslash as an
+    escape character) are left untouched.
+    """
+    if dialect.name == "postgresql":
+        dialect._backslash_escapes = False
+
+
 class ExtraCache:
     """
     Dummy class that exposes a method used to store additional values used in
@@ -105,23 +193,27 @@ class ExtraCache:
     # be added to the cache key.
     regex = re.compile(
         r"(\{\{|\{%)[^{}]*?("
-        r"current_user_id\([^()]*\)|"
-        r"current_username\([^()]*\)|"
-        r"current_user_email\([^()]*\)|"
-        r"cache_key_wrapper\([^()]*\)|"
-        r"url_param\([^()]*\)"
+        r"current_user_id\([^)]*\)|"
+        r"current_username\([^)]*\)|"
+        r"current_user_email\([^)]*\)|"
+        r"current_user_rls_rules\([^)]*\)|"
+        r"current_user_roles\([^)]*\)|"
+        r"cache_key_wrapper\([^)]*\)|"
+        r"url_param\([^)]*\)|"
+        r"get_guest_user_attribute\([^)]*\)"
         r")"
         r"[^{}]*?(\}\}|\%\})"
     )
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
-        extra_cache_keys: Optional[list[Any]] = None,
-        applied_filters: Optional[list[str]] = None,
-        removed_filters: Optional[list[str]] = None,
-        database: Optional[Database] = None,
-        dialect: Optional[Dialect] = None,
-        table: Optional[SqlaTable] = None,
+        extra_cache_keys: list[Any] | None = None,
+        applied_filters: list[str] | None = None,
+        removed_filters: list[str] | None = None,
+        database: Database | None = None,
+        dialect: Dialect | None = None,
+        table: SqlaTable | None = None,
+        query_context_filters: list[Any] | None = None,
     ):
         self.extra_cache_keys = extra_cache_keys
         self.applied_filters = applied_filters if applied_filters is not None else []
@@ -129,8 +221,9 @@ class ExtraCache:
         self.database = database
         self.dialect = dialect
         self.table = table
+        self.query_context_filters: list[Any] = query_context_filters or []
 
-    def current_user_id(self, add_to_cache_keys: bool = True) -> Optional[int]:
+    def current_user_id(self, add_to_cache_keys: bool = True) -> int | None:
         """
         Return the user ID of the user who is currently logged in.
 
@@ -144,33 +237,100 @@ class ExtraCache:
             return user_id
         return None
 
-    def current_username(self, add_to_cache_keys: bool = True) -> Optional[str]:
+    def current_username(
+        self, add_to_cache_keys: bool = True, escape_result: bool = True
+    ) -> str | None:
         """
         Return the username of the user who is currently logged in.
 
         :param add_to_cache_keys: Whether the value should be included in the cache key
+        :param escape_result: Should special characters in the result be escaped
         :returns: The username
         """
 
         if username := get_username():
+            # The documented templating pattern interpolates this value into a
+            # SQL literal, so apply the same dialect-specific escaping the other
+            # viewer-controlled macros (url_param, get_guest_user_attribute) use,
+            # keeping the identity macros consistent with their siblings.
+            if escape_result:
+                username = self._escape_value(username)
             if add_to_cache_keys:
                 self.cache_key_wrapper(username)
             return username
         return None
 
-    def current_user_email(self, add_to_cache_keys: bool = True) -> Optional[str]:
+    def current_user_email(
+        self, add_to_cache_keys: bool = True, escape_result: bool = True
+    ) -> str | None:
         """
         Return the email address of the user who is currently logged in.
 
         :param add_to_cache_keys: Whether the value should be included in the cache key
+        :param escape_result: Should special characters in the result be escaped
         :returns: The user email address
         """
 
         if email_address := get_user_email():
+            if escape_result:
+                email_address = self._escape_value(email_address)
             if add_to_cache_keys:
                 self.cache_key_wrapper(email_address)
             return email_address
         return None
+
+    def current_user_roles(self, add_to_cache_keys: bool = True) -> list[str] | None:
+        """
+        Return the sorted list of roles of the user who is currently logged in.
+
+        :param add_to_cache_keys: Whether the value should be included in the cache key
+        :returns: List of role names
+        """
+        try:
+            user_roles = sorted(
+                [role.name for role in security_manager.get_user_roles()]
+            )
+            if not user_roles:
+                return None
+            if add_to_cache_keys:
+                self.cache_key_wrapper(json.dumps(user_roles))
+            return user_roles
+        except SQLAlchemyError:
+            # `get_user_roles()` lazy-loads roles from db.session, so a caught
+            # DB error can leave it in "pending rollback" state. This runs
+            # during SQL templating, upstream of the engine build that would
+            # otherwise inherit the failed transaction. Narrower than the
+            # blanket handler below so a non-DB failure (e.g. serializing the
+            # roles for the cache key) never discards pending work.
+            db.session.rollback()  # pylint: disable=consider-using-transaction
+            return None
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def current_user_rls_rules(self) -> list[str] | None:
+        """
+        Return the row level security rules applied to the current user and dataset.
+        """
+        if not self.table:
+            return None
+
+        rls_rules = (
+            sorted(
+                [
+                    rule["clause"]
+                    for rule in security_manager.get_guest_rls_filters(self.table)
+                ]
+            )
+            if security_manager.is_guest_user()
+            else sorted(
+                [rule.clause for rule in security_manager.get_rls_filters(self.table)]
+            )
+        )
+        if not rls_rules:
+            return None
+
+        self.cache_key_wrapper(json.dumps(rls_rules))
+        return rls_rules
 
     def cache_key_wrapper(self, key: Any) -> Any:
         """
@@ -192,10 +352,10 @@ class ExtraCache:
     def url_param(
         self,
         param: str,
-        default: Optional[str] = None,
+        default: str | None = None,
         add_to_cache_keys: bool = True,
         escape_result: bool = True,
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Read a url or post parameter and use it in your SQL Lab query.
 
@@ -223,22 +383,97 @@ class ExtraCache:
         from superset.views.utils import get_form_data
 
         if has_request_context() and request.args.get(param):
-            return request.args.get(param, default)
-
-        form_data, _ = get_form_data()
-        url_params = form_data.get("url_params") or {}
-        result = url_params.get(param, default)
-        if result and escape_result and self.dialect:
-            # use the dialect specific quoting logic to escape string
-            result = String().literal_processor(dialect=self.dialect)(value=result)[
-                1:-1
-            ]
+            result = request.args.get(param, default)
+        else:
+            form_data, _ = get_form_data()
+            url_params = form_data.get("url_params") or {}
+            result = url_params.get(param, default)
+        # Escape the value regardless of its source (request args or form
+        # data); both are interpolated into the rendered SQL.
+        if result and escape_result:
+            # use the dialect-specific literal rendering to escape the string
+            result = self._escape_value(result)
         if add_to_cache_keys:
             self.cache_key_wrapper(result)
         return result
 
+    def get_guest_user_attribute(
+        self,
+        attribute_name: str,
+        default: JsonValue = None,
+        add_to_cache_keys: bool = True,
+        escape_result: bool = True,
+    ) -> JsonValue:
+        """
+        Get a specific user attribute from guest user.
+
+        This function retrieves attributes from the guest user token and supports
+        all JSON-native types (string, number, boolean, array, object, null).
+
+        Args:
+            attribute_name: Name of the attribute to retrieve
+            default: Default value if attribute not found (can be any JSON-native type)
+            add_to_cache_keys: Whether the resolved value should be included in the
+                cache key. The resolved value is keyed on every branch (including
+                the default and null) so two principals whose tokens render
+                different SQL never share a cache entry. Opting out is only safe
+                when the value cannot affect the query results.
+            escape_result: Escape string values (including strings nested inside
+                lists and object values) through the database dialect's literal
+                rendering so they are safe to interpolate into SQL, mirroring
+                ``url_param``. Enabled by default; non-string JSON types are
+                returned unchanged. Set to False for the raw value, in which case
+                the template author is responsible for validating the value. Pass
+                ``escape_result=False`` when piping a list-valued attribute
+                through the ``where_in`` filter: ``where_in`` applies its own
+                dialect-safe quoting, so leaving the default escaping on would
+                escape each value twice.
+
+        Returns:
+            The attribute value from the guest user token, or the default value.
+            Can be any JSON-native type: string, number, boolean, array, object, or
+            null.
+
+        Examples:
+            {{ get_guest_user_attribute('department') }}  # Returns: "Engineering"
+            {{ get_guest_user_attribute('is_admin') }}    # Returns: True
+            {{ get_guest_user_attribute('permissions') }} # Returns: ["read", "write"]
+            {{ get_guest_user_attribute('config') }}      # Returns: {"theme": "dark"}
+            {{ get_guest_user_attribute('missing', 'default') }} # Returns: "default"
+            full_name IN {{ get_guest_user_attribute('names', escape_result=False)
+                |where_in }}
+        """
+
+        result: JsonValue = default
+        # The macro only applies to guest users (embedded). is_guest_user()
+        # handles the feature-flag and request-context checks internally.
+        if security_manager.is_guest_user():
+            token: GuestToken = g.user.guest_token
+            user_attributes: dict[str, JsonValue] = (
+                token.get("user", {}).get("attributes") or {}
+            )
+            result = user_attributes.get(attribute_name, default)
+
+        if add_to_cache_keys:
+            # Key the resolved value on every branch (attribute, default, or
+            # null); a guest whose attribute is absent renders different SQL
+            # than one whose attribute is set, so both must contribute to the
+            # cache key. json.dumps gives a stable serialization for all
+            # JSON-native types.
+            cache_value = json.dumps(result, sort_keys=True)
+            self.cache_key_wrapper(
+                f"guest_user_attribute:{attribute_name}:{cache_value}"
+            )
+        # Guest attributes (and caller-supplied defaults) are interpolated into
+        # the rendered SQL, so escape strings with the dialect's literal
+        # rendering by default, mirroring url_param. Non-string JSON types pass
+        # through.
+        if escape_result:
+            result = self._escape_value(result)
+        return result
+
     def filter_values(
-        self, column: str, default: Optional[str] = None, remove_filter: bool = False
+        self, column: str, default: str | None = None, remove_filter: bool = False
     ) -> list[Any]:
         """Gets a values for a particular filter as a list
 
@@ -278,16 +513,82 @@ class ExtraCache:
 
         return return_val
 
+    def _escape_value(self, val: Any) -> Any:
+        """Return a dialect-quoted form of ``val`` suitable for direct SQL
+        interpolation. When no dialect is configured the value is returned
+        unchanged so callers see the raw value as before.
+
+        Strings are rendered through the dialect compiler's
+        ``render_literal_value`` (with the surrounding quotes stripped),
+        which applies dialect-specific escaping beyond quote doubling; in
+        particular, MySQL/MariaDB treat the backslash as an escape
+        character, so backslashes are doubled there to prevent a trailing
+        ``\\'`` from re-opening the string literal. Dialects whose escaping
+        mode cannot be introspected without a live connection err on the
+        side of over-escaping, which can distort a backslash-containing
+        value but can never widen the query.
+
+        PostgreSQL is special-cased via ``_normalize_postgresql_backslash_escapes``
+        to restore parity with PostgreSQL's default configuration, while
+        MySQL/MariaDB keep the stricter, backslash-doubling behavior above.
+
+        Lists are processed element-wise and dict keys/values recursively,
+        so strings nested inside JSON structures are also escaped. Non-string
+        leaf values are left as-is.
+
+        Lists and dicts are returned as :class:`SQLSafeList` /
+        :class:`SQLSafeDict` rather than plain ``list``/``dict``: Jinja
+        renders a whole container through ``str()``/``repr()``, which
+        wraps string elements in fresh quote delimiters that were never
+        escaped, so even a fully-escaped container could re-introduce raw
+        quotes when interpolated as a whole. The safe subclasses render
+        without adding such delimiters, while still comparing equal to
+        (and behaving like) their plain built-in counterparts everywhere
+        else.
+        """
+        if not self.dialect:
+            return val
+        if isinstance(val, str):
+            compiler = self.dialect.statement_compiler(self.dialect, None)
+            _normalize_postgresql_backslash_escapes(compiler.dialect)
+            return compiler.render_literal_value(val, String())[1:-1]
+        if isinstance(val, list):
+            return SQLSafeList(self._escape_value(v) for v in val)
+        if isinstance(val, dict):
+            return SQLSafeDict(
+                (self._escape_value(k), self._escape_value(v)) for k, v in val.items()
+            )
+        return val
+
     def get_filters(self, column: str, remove_filter: bool = False) -> list[Filter]:
         """Get the filters applied to the given column. In addition
            to returning values like the filter_values function
            the get_filters function returns the operator specified in the explorer UI.
+
+        Each filter dict additionally carries an ``escaped_val`` key when a
+        SQL dialect is available. Templates that interpolate the value into
+        a SQL string (for example a ``LIKE`` clause) should reference
+        ``escaped_val`` so the value is rendered through the dialect's
+        literal processor. ``val`` continues to expose the raw value for
+        non-SQL uses such as comparison, logging, or ``where_in``.
 
         This is useful if:
             - you want to handle more than the IN operator in your SQL clause
             - you want to handle generating custom SQL conditions for a filter
             - you want to have the ability for filter inside the main query for speed
             purposes
+
+        Always use the ``where_in`` filter for list membership rather than
+        building SQL by hand. The filter renders values with dialect-safe quoting
+        (via SQLAlchemy's ``literal_binds`` compilation) instead of interpolating
+        them directly into the SQL string.
+
+        .. warning::
+
+            Do not manually escape filter values (for example, with
+            ``replace("'", "''")``). Hand-rolled escaping is error-prone and easy
+            to get wrong across dialects. Rely on the ``where_in`` filter so values
+            are quoted safely by the engine.
 
         Usage example::
 
@@ -308,11 +609,11 @@ class ExtraCache:
                 {%- for filter in get_filters('full_name', remove_filter=True) -%}
                 {%- if filter.get('op') == 'IN' -%}
                     AND
-                    full_name IN ( {{ "'" + "', '".join(filter.get('val')) + "'" }} )
+                    full_name IN {{ filter.get('val')|where_in }}
                 {%- endif -%}
                 {%- if filter.get('op') == 'LIKE' -%}
                     AND
-                    full_name LIKE {{ "'" + filter.get('val') + "'" }}
+                    full_name LIKE '{{ filter.get('escaped_val') }}'
                 {%- endif -%}
                 {%- endfor -%}
                 UNION ALL
@@ -357,7 +658,15 @@ class ExtraCache:
                 flt.get("expressionType") == "SIMPLE"
                 and flt.get("clause") == "WHERE"
                 and flt.get("subject") == column
-                and val
+                and (
+                    val
+                    # IS_NULL and IS_NOT_NULL operators do not have a value
+                    or op
+                    in (
+                        FilterOperator.IS_NULL,
+                        FilterOperator.IS_NOT_NULL,
+                    )
+                )
             ):
                 if remove_filter:
                     if column not in self.removed_filters:
@@ -366,13 +675,53 @@ class ExtraCache:
                     self.applied_filters.append(column)
 
                 if op in (
-                    FilterOperator.IN.value,
-                    FilterOperator.NOT_IN.value,
+                    FilterOperator.IN,
+                    FilterOperator.NOT_IN,
                 ) and not isinstance(val, list):
                     val = [val]
 
-                filters.append({"op": op, "col": column, "val": val})
+                entry: Filter = {"op": op, "col": column, "val": val}
+                if self.dialect:
+                    entry["escaped_val"] = self._escape_value(val)
+                filters.append(entry)
 
+        # Drill-to-detail queries send filters in native {col, op, val} format
+        # rather than adhoc_filters, so get_form_data() above finds nothing.
+        # query_context_filters carries those native filters from
+        # template_kwargs["filter"], already available in the Jinja context.
+        # Only consult them when adhoc_filters produced no match to avoid
+        # duplicating entries for aggregated queries where both formats exist.
+        if not filters:
+            filters = self._get_filters_from_query_context(column, remove_filter)
+
+        return filters
+
+    def _get_filters_from_query_context(
+        self, column: str, remove_filter: bool
+    ) -> list[Filter]:
+        filters: list[Filter] = []
+        for flt in self.query_context_filters:
+            col = flt.get("col")
+            val = flt.get("val")
+            op = (flt.get("op") or FilterOperator.IN).upper()
+            if col != column or (
+                val is None
+                and op not in ("IS NULL", "IS NOT NULL", "IS_NULL", "IS_NOT_NULL")
+            ):
+                continue
+            if op in (
+                FilterOperator.IN,
+                FilterOperator.NOT_IN,
+            ) and not isinstance(val, list):
+                val = [val]
+            if remove_filter and column not in self.removed_filters:
+                self.removed_filters.append(column)
+            if column not in self.applied_filters:
+                self.applied_filters.append(column)
+            entry: Filter = {"op": op, "col": column, "val": val}
+            if self.dialect:
+                entry["escaped_val"] = self._escape_value(val)
+            filters.append(entry)
         return filters
 
     # pylint: disable=too-many-arguments
@@ -503,7 +852,7 @@ def validate_context_types(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_template_context(
-    engine: Optional[str], context: dict[str, Any]
+    engine: str | None, context: dict[str, Any]
 ) -> dict[str, Any]:
     if engine and engine in context:
         # validate engine context separately to allow for engine-specific methods
@@ -517,9 +866,18 @@ def validate_template_context(
 
 class WhereInMacro:  # pylint: disable=too-few-public-methods
     def __init__(self, dialect: Dialect):
+        # Without this, a PostgreSQL value like ``C:\Users`` would render as
+        # ``C:\\Users`` and silently fail to match the original value; see
+        # ``_normalize_postgresql_backslash_escapes`` for the full rationale.
+        _normalize_postgresql_backslash_escapes(dialect)
         self.dialect = dialect
 
-    def __call__(self, values: list[Any], mark: Optional[str] = None) -> str:
+    def __call__(
+        self,
+        values: list[Any],
+        mark: str | None = None,
+        default_to_none: bool = False,
+    ) -> str | None:
         """
         Given a list of values, build a parenthesis list suitable for an IN expression.
 
@@ -528,6 +886,10 @@ class WhereInMacro:  # pylint: disable=too-few-public-methods
             >>> where_in([1, "Joe's", 3])
             (1, 'Joe''s', 3)
 
+        The `default_to_none` parameter is used to determine the return value when the
+        list of values is empty:
+            - If `default_to_none` is `False` (default), the return value is ().
+            - If `default_to_none` is `True`, the return value is `None`.
         """
         binds = [bindparam(f"value_{i}", value) for i, value in enumerate(values)]
         string_representations = [
@@ -539,9 +901,16 @@ class WhereInMacro:  # pylint: disable=too-few-public-methods
             for bind in binds
         ]
         joined_values = ", ".join(string_representations)
-        result = f"({joined_values})"
+        # The macro returns literal SQL, not a DBAPI parameterized statement.
+        # Undo only the compiler's percent escaping, as compile_sqla_query does;
+        # SQL Lab executes the rendered query without a parameters object.
+        if self.dialect.identifier_preparer._double_percents:  # pylint: disable=protected-access
+            joined_values = joined_values.replace("%%", "%")
+        result = (
+            f"({joined_values})" if (joined_values or not default_to_none) else None
+        )
 
-        if mark:
+        if mark and result:
             result += (
                 "\n-- WARNING: the `mark` parameter was removed from the `where_in` "
                 "macro for security reasons\n"
@@ -550,22 +919,56 @@ class WhereInMacro:  # pylint: disable=too-few-public-methods
         return result
 
 
+def to_datetime(
+    value: str | None, format: str = "%Y-%m-%d %H:%M:%S"
+) -> datetime | None:
+    """
+    Parses a string into a datetime object.
+
+    :param value: the string to parse.
+    :param format: the format to parse the string with.
+    :returns: the parsed datetime object.
+    """
+    if not value:
+        return None
+
+    # This value might come from a macro that could be including wrapping quotes
+    value = value.strip("'\"")
+    return datetime.strptime(value, format)
+
+
+class SupersetSandboxedEnvironment(SandboxedEnvironment):
+    """
+    Sandbox that denies attribute access to the base environment/template
+    classes and to the internals of ``functools.partial`` objects, none of
+    which templates need. Calling such objects is unaffected; only attribute
+    access is denied.
+    """
+
+    def is_safe_attribute(self, obj: Any, attr: str, value: Any) -> bool:
+        if attr in {"environment_class", "template_class"}:
+            return False
+        if isinstance(obj, partial):
+            return False
+        return super().is_safe_attribute(obj, attr, value)
+
+
 class BaseTemplateProcessor:
     """
     Base class for database-specific jinja context
     """
 
-    engine: Optional[str] = None
+    engine: str | None = None
 
     # pylint: disable=too-many-arguments
     def __init__(
         self,
         database: "Database",
-        query: Optional["Query"] = None,
-        table: Optional["SqlaTable"] = None,
-        extra_cache_keys: Optional[list[Any]] = None,
-        removed_filters: Optional[list[str]] = None,
-        applied_filters: Optional[list[str]] = None,
+        query: "Query" | None = None,
+        table: "SqlaTable" | None = None,
+        extra_cache_keys: list[Any] | None = None,
+        removed_filters: list[str] | None = None,
+        applied_filters: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
         self._database = database
@@ -580,15 +983,34 @@ class BaseTemplateProcessor:
         self._applied_filters = applied_filters
         self._removed_filters = removed_filters
         self._context: dict[str, Any] = {}
-        self.env: Environment = SandboxedEnvironment(undefined=DebugUndefined)
+        self.env: Environment = SupersetSandboxedEnvironment(undefined=DebugUndefined)
         self.set_context(**kwargs)
 
         # custom filters
         self.env.filters["where_in"] = WhereInMacro(database.get_dialect())
+        self.env.filters["to_datetime"] = to_datetime
 
     def set_context(self, **kwargs: Any) -> None:
         self._context.update(kwargs)
         self._context.update(context_addons())
+
+    def get_context(self) -> dict[str, Any]:
+        """
+        Returns the current template context.
+        """
+        return self._context.copy()
+
+    def get_template_context(self, **kwargs: Any) -> dict[str, Any]:
+        """
+        Build the validated context used to render a template.
+
+        Split out from ``process_template`` so that validation paths which
+        render a pre-parsed template (``superset.sql.parse.process_jinja_sql``)
+        use exactly the same context as execution, keeping the validated SQL
+        identical to the executed SQL.
+        """
+        kwargs.update(self._context)
+        return validate_template_context(self.engine, kwargs)
 
     def process_template(self, sql: str, **kwargs: Any) -> str:
         """Processes a sql template
@@ -597,27 +1019,87 @@ class BaseTemplateProcessor:
         >>> process_template(sql)
         "SELECT '2017-01-01T00:00:00'"
         """
-        template = self.env.from_string(sql)
-        kwargs.update(self._context)
+        try:
+            template = self.env.from_string(sql)
+        except (
+            TemplateSyntaxError,
+            SecurityError,
+            UndefinedError,
+            UnicodeError,
+            UnicodeDecodeError,
+            UnicodeEncodeError,
+        ) as ex:
+            error_msg = str(ex)
+            exception_type = type(ex).__name__
 
-        context = validate_template_context(self.engine, kwargs)
-        return template.render(context)
+            message = f"Jinja2 template error ({exception_type}): {error_msg}"
+
+            line_number = getattr(ex, "lineno", None)
+
+            logger.warning(
+                "Jinja2 template client error",
+                extra={
+                    "error_message": error_msg,
+                    "template_snippet": sql[:200] if sql else None,
+                    "template_length": len(sql) if sql else 0,
+                    "line_number": line_number,
+                    "error_type": "CLIENT_TEMPLATE_ERROR",
+                    "exception_type": exception_type,
+                },
+                exc_info=False,
+            )
+
+            error = SupersetError(
+                message=message,
+                error_type=SupersetErrorType.GENERIC_COMMAND_ERROR,
+                level=ErrorLevel.ERROR,
+                extra={
+                    "template": sql[:500],
+                    "line": line_number,
+                    "exception_type": exception_type,
+                },
+            )
+
+            raise SupersetSyntaxErrorException([error]) from ex
+        except Exception as ex:
+            error_msg = str(ex)
+            exception_type = type(ex).__name__
+
+            message = f"Internal Jinja2 template error ({exception_type}): {error_msg}"
+
+            logger.error(
+                "Jinja2 template server error",
+                extra={
+                    "error_message": error_msg,
+                    "template_snippet": sql[:200] if sql else None,
+                    "template_length": len(sql) if sql else 0,
+                    "error_type": "SERVER_TEMPLATE_ERROR",
+                    "exception_type": exception_type,
+                },
+                exc_info=True,
+            )
+
+            raise SupersetTemplateException(message) from ex
+
+        context = self.get_template_context(**kwargs)
+
+        try:
+            return template.render(context)
+        except RecursionError as ex:
+            raise SupersetTemplateException(
+                "Infinite recursion detected in template"
+            ) from ex
+        except UndefinedError as ex:
+            match = re.search(r'["\']([^"\']+)["\']\s+is undefined', str(ex))
+            undefined_name = match.group(1) if match else None
+            if undefined_name and re.search(
+                r"\{\{\s*(?:[\w\.]*\.)?" + re.escape(undefined_name) + r"\s*\(", sql
+            ):
+                raise UndefinedTemplateFunctionException(str(ex)) from ex
+            raise
 
 
 class JinjaTemplateProcessor(BaseTemplateProcessor):
-    def _parse_datetime(self, dttm: str) -> Optional[datetime]:
-        """
-        Try to parse a datetime and default to None in the worst case.
-
-        Since this may have been rendered by different engines, the datetime may
-        vary slightly in format. We try to make it consistent, and if all else
-        fails, just return None.
-        """
-        try:
-            return dateutil.parser.parse(dttm)
-        except dateutil.parser.ParserError:
-            return None
-
     def set_context(self, **kwargs: Any) -> None:
         super().set_context(**kwargs)
         extra_cache = ExtraCache(
@@ -627,23 +1109,7 @@ class JinjaTemplateProcessor(BaseTemplateProcessor):
             database=self._database,
             dialect=self._database.get_dialect(),
             table=self._table,
-        )
-
-        from_dttm = (
-            self._parse_datetime(dttm)
-            if (dttm := self._context.get("from_dttm"))
-            else None
-        )
-        to_dttm = (
-            self._parse_datetime(dttm)
-            if (dttm := self._context.get("to_dttm"))
-            else None
-        )
-
-        dataset_macro_with_context = partial(
-            dataset_macro,
-            from_dttm=from_dttm,
-            to_dttm=to_dttm,
+            query_context_filters=self._context.get("filter") or [],
         )
 
         self._context.update(
@@ -654,14 +1120,31 @@ class JinjaTemplateProcessor(BaseTemplateProcessor):
                 "current_user_email": partial(
                     safe_proxy, extra_cache.current_user_email
                 ),
+                "current_user_roles": partial(
+                    safe_proxy, extra_cache.current_user_roles
+                ),
+                "current_user_rls_rules": partial(
+                    safe_proxy, extra_cache.current_user_rls_rules
+                ),
                 "cache_key_wrapper": partial(safe_proxy, extra_cache.cache_key_wrapper),
                 "filter_values": partial(safe_proxy, extra_cache.filter_values),
                 "get_filters": partial(safe_proxy, extra_cache.get_filters),
-                "dataset": partial(safe_proxy, dataset_macro_with_context),
-                "metric": partial(safe_proxy, metric_macro),
+                "dataset": partial(safe_proxy, dataset_macro),
                 "get_time_filter": partial(safe_proxy, extra_cache.get_time_filter),
+                "get_guest_user_attribute": partial(
+                    safe_proxy, extra_cache.get_guest_user_attribute
+                ),
             }
         )
+
+        # The `metric` filter needs the env and full context to expand other
+        # filters. Bind them through a closure rather than positional args so the
+        # template environment is not reachable via the macro's public
+        # ``partial.args`` from inside a template.
+        def metric_with_context(metric_key: str, dataset_id: int | None = None) -> str:
+            return metric_macro(self.env, self._context, metric_key, dataset_id)
+
+        self._context["metric"] = partial(safe_proxy, metric_with_context)
 
 
 class NoOpTemplateProcessor(BaseTemplateProcessor):
@@ -691,14 +1174,12 @@ class PrestoTemplateProcessor(JinjaTemplateProcessor):
         }
 
     @staticmethod
-    def _schema_table(
-        table_name: str, schema: Optional[str]
-    ) -> tuple[str, Optional[str]]:
+    def _schema_table(table_name: str, schema: str | None) -> tuple[str, str | None]:
         if "." in table_name:
             schema, table_name = table_name.split(".")
         return table_name, schema
 
-    def first_latest_partition(self, table_name: str) -> Optional[str]:
+    def first_latest_partition(self, table_name: str) -> str | None:
         """
         Gets the first value in the array of all latest partitions
 
@@ -710,7 +1191,7 @@ class PrestoTemplateProcessor(JinjaTemplateProcessor):
         latest_partitions = self.latest_partitions(table_name)
         return latest_partitions[0] if latest_partitions else None
 
-    def latest_partitions(self, table_name: str) -> Optional[list[str]]:
+    def latest_partitions(self, table_name: str) -> list[str] | None:
         """
         Gets the array of all latest partitions
 
@@ -748,27 +1229,21 @@ class HiveTemplateProcessor(PrestoTemplateProcessor):
 class SparkTemplateProcessor(HiveTemplateProcessor):
     engine = "spark"
 
-    def process_template(self, sql: str, **kwargs: Any) -> str:
-        template = self.env.from_string(sql)
-        kwargs.update(self._context)
-
+    def get_template_context(self, **kwargs: Any) -> dict[str, Any]:
+        context = super().get_template_context(**kwargs)
         # Backwards compatibility if migrating from Hive.
-        context = validate_template_context(self.engine, kwargs)
         context["hive"] = context["spark"]
-        return template.render(context)
+        return context
 
 
 class TrinoTemplateProcessor(PrestoTemplateProcessor):
     engine = "trino"
 
-    def process_template(self, sql: str, **kwargs: Any) -> str:
-        template = self.env.from_string(sql)
-        kwargs.update(self._context)
-
+    def get_template_context(self, **kwargs: Any) -> dict[str, Any]:
+        context = super().get_template_context(**kwargs)
         # Backwards compatibility if migrating from Presto.
-        context = validate_template_context(self.engine, kwargs)
         context["presto"] = context["trino"]
-        return template.render(context)
+        return context
 
 
 DEFAULT_PROCESSORS = {
@@ -792,8 +1267,8 @@ def get_template_processors() -> dict[str, Any]:
 
 def get_template_processor(
     database: "Database",
-    table: Optional["SqlaTable"] = None,
-    query: Optional["Query"] = None,
+    table: "SqlaTable" | None = None,
+    query: "Query" | None = None,
     **kwargs: Any,
 ) -> BaseTemplateProcessor:
     if feature_flag_manager.is_feature_enabled("ENABLE_TEMPLATE_PROCESSING"):
@@ -808,19 +1283,13 @@ def get_template_processor(
 def dataset_macro(
     dataset_id: int,
     include_metrics: bool = False,
-    columns: Optional[list[str]] = None,
-    from_dttm: Optional[datetime] = None,
-    to_dttm: Optional[datetime] = None,
+    columns: list[str] | None = None,
 ) -> str:
     """
     Given a dataset ID, return the SQL that represents it.
 
     The generated SQL includes all columns (including computed) by default. Optionally
     the user can also request metrics to be included, and columns to group by.
-
-    The from_dttm and to_dttm parameters are filled in from filter values in explore
-    views, and we take them to make those properties available to jinja templates in
-    the underlying dataset.
     """
     # pylint: disable=import-outside-toplevel
     from superset.daos.dataset import DatasetDAO
@@ -831,13 +1300,13 @@ def dataset_macro(
 
     columns = columns or [column.column_name for column in dataset.columns]
     metrics = [metric.metric_name for metric in dataset.metrics]
-    query_obj = {
+    query_obj: QueryObjectDict = {
         "is_timeseries": False,
         "filter": [],
         "metrics": metrics if include_metrics else None,
-        "columns": columns,
-        "from_dttm": from_dttm,
-        "to_dttm": to_dttm,
+        "columns": cast(list[Column], columns),
+        "from_dttm": None,
+        "to_dttm": None,
     }
     sqla_query = dataset.get_query_str_extended(query_obj, mutate=False)
     sql = sqla_query.sql
@@ -853,7 +1322,7 @@ def get_dataset_id_from_context(metric_key: str) -> int:
     """
     # pylint: disable=import-outside-toplevel
     from superset.daos.chart import ChartDAO
-    from superset.views.utils import loads_request_json
+    from superset.views.utils import get_request_json_body, loads_request_json
 
     form_data: dict[str, Any] = {}
     exc_message = _(
@@ -862,7 +1331,7 @@ def get_dataset_id_from_context(metric_key: str) -> int:
     )
 
     if has_request_context():
-        if payload := request.get_json(cache=True) if request.is_json else None:
+        if payload := get_request_json_body():
             if dataset_id := payload.get("datasource", {}).get("id"):
                 return dataset_id
             form_data.update(payload.get("form_data", {}))
@@ -888,7 +1357,40 @@ def get_dataset_id_from_context(metric_key: str) -> int:
     raise SupersetTemplateException(exc_message)
 
 
-def metric_macro(metric_key: str, dataset_id: Optional[int] = None) -> str:
+def guest_user_can_access_dataset(dataset: SqlaTable) -> bool:
+    """
+    Whether the current guest (embedded) user may read the given dataset.
+
+    Guest access is granted per dashboard, so the dataset must back at least
+    one chart on a dashboard the guest token covers; a ``datasets`` allowlist
+    on the token further restricts the reachable IDs.
+
+    :param dataset: a dataset resolved without the DAO base filter.
+    :returns: whether the guest user may read the dataset.
+    """
+    guest_user = security_manager.get_current_guest_user_if_guest()
+    if not guest_user:
+        return False
+
+    allowed_datasets: list[int] | None = guest_user.guest_token.get("datasets")
+    if allowed_datasets is not None and (
+        not isinstance(allowed_datasets, list) or dataset.id not in allowed_datasets
+    ):
+        return False
+
+    return any(
+        security_manager.has_guest_access(dashboard)
+        for slc in dataset.slices
+        for dashboard in slc.dashboards
+    )
+
+
+def metric_macro(
+    env: Environment,
+    context: dict[str, Any],
+    metric_key: str,
+    dataset_id: int | None = None,
+) -> str:
     """
     Given a metric key, returns its syntax.
 
@@ -905,19 +1407,35 @@ def metric_macro(metric_key: str, dataset_id: Optional[int] = None) -> str:
     if not dataset_id:
         dataset_id = get_dataset_id_from_context(metric_key)
 
-    dataset = DatasetDAO.find_by_id(dataset_id)
+    # Embedded (guest) user access is validated at the dashboard level, so the
+    # regular DAO filter is bypassed for them and dashboard-level scope is
+    # enforced explicitly below.
+    dataset = DatasetDAO.find_by_id(
+        dataset_id,
+        skip_base_filter=security_manager.is_guest_user(),
+    )
     if not dataset:
         raise DatasetNotFoundError(f"Dataset ID {dataset_id} not found.")
+
+    # With the base filter skipped, scope a guest to datasets reachable through
+    # a dashboard their token grants; reuse the not-found error for consistency.
+    if security_manager.is_guest_user() and not guest_user_can_access_dataset(dataset):
+        raise DatasetNotFoundError(f"Dataset ID {dataset_id} not found.")
+
     metrics: dict[str, str] = {
         metric.metric_name: metric.expression for metric in dataset.metrics
     }
-    dataset_name = dataset.table_name
-    if metric := metrics.get(metric_key):
-        return metric
-    raise SupersetTemplateException(
-        _(
-            "Metric ``%(metric_name)s`` not found in %(dataset_name)s.",
-            metric_name=metric_key,
-            dataset_name=dataset_name,
+    if metric_key not in metrics:
+        raise SupersetTemplateException(
+            _(
+                "Metric ``%(metric_name)s`` not found in %(dataset_name)s.",
+                metric_name=metric_key,
+                dataset_name=dataset.table_name,
+            )
         )
-    )
+
+    definition = metrics[metric_key]
+    template = env.from_string(definition)
+    definition = template.render(context)
+
+    return definition

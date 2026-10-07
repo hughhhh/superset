@@ -14,15 +14,25 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import re
 from typing import Any, Optional, Union
 
 from croniter import croniter
 from flask import current_app
 from flask_babel import gettext as _
-from marshmallow import fields, Schema, validate, validates, validates_schema
+from marshmallow import (
+    EXCLUDE,
+    fields,
+    pre_load,
+    Schema,
+    validate,
+    validates,
+    validates_schema,
+)
 from marshmallow.validate import Length, Range, ValidationError
 from pytz import all_timezones
 
+from superset import is_feature_enabled
 from superset.reports.models import (
     ReportCreationMethod,
     ReportDataFormat,
@@ -48,7 +58,11 @@ openapi_spec_methods_override = {
     "info": {"get": {"summary": "Get metadata information about this API resource"}},
 }
 
-get_delete_ids_schema = {"type": "array", "items": {"type": "integer"}}
+get_delete_ids_schema = {
+    "type": "array",
+    "items": {"type": "integer"},
+    "example": [1, 2, 3],
+}
 get_slack_channels_schema = {
     "type": "object",
     "properties": {
@@ -58,6 +72,9 @@ get_slack_channels_schema = {
             "items": {"type": "string", "enum": ["public_channel", "private_channel"]},
         },
         "exact_match": {"type": "boolean"},
+        "force": {"type": "boolean"},
+        "page": {"type": "integer", "minimum": 0},
+        "page_size": {"type": "integer", "minimum": 1},
     },
 }
 
@@ -66,6 +83,10 @@ name_description = "The report schedule name."
 # :)
 description_description = "Use a nice description to give context to this Alert/Report"
 email_subject_description = "The report schedule subject line"
+include_cta_description = (
+    "Whether to include the call-to-action link back to Superset "
+    "(e.g. 'Explore in Superset') in the delivered notifications"
+)
 context_markdown_description = "Markdown description"
 crontab_description = (
     "A CRON expression."
@@ -77,9 +98,8 @@ sql_description = (
     "A SQL statement that defines whether the alert should get triggered or "
     "not. The query is expected to return either NULL or a number value."
 )
-owners_description = (
-    "Owner are users ids allowed to delete or change this report. "
-    "If left empty you will be one of the owners of the report."
+editors_description = (
+    "A list of subject IDs (users, roles, or groups) that can alter the report."
 )
 validator_type_description = (
     "Determines when to trigger alert based off value from alert query. "
@@ -120,8 +140,12 @@ class ValidatorConfigJSONSchema(Schema):
     threshold = fields.Float()
 
 
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+# A Slack channel id: C public, G private, D direct message.
+SLACK_CHANNEL_ID_REGEX = re.compile(r"^[CGD][A-Z0-9]{6,}$")
+
+
 class ReportRecipientConfigJSONSchema(Schema):
-    # TODO if email check validity
     target = fields.String()
     ccTarget = fields.String()  # noqa: N815
     bccTarget = fields.String()  # noqa: N815
@@ -138,8 +162,102 @@ class ReportRecipientSchema(Schema):
     )
     recipient_config_json = fields.Nested(ReportRecipientConfigJSONSchema)
 
+    @validates_schema
+    def validate_email_recipients(self, data: dict[str, Any], **kwargs: Any) -> None:
+        if data.get("type") != ReportRecipientType.EMAIL.value:
+            return
 
-class ReportSchedulePostSchema(Schema):
+        config = data.get("recipient_config_json") or {}
+
+        def validate_addresses(field: str, value: str | None, required: bool) -> None:
+            if not value or not value.strip():
+                if required:
+                    raise ValidationError(
+                        {field: ["Email target is required for Email recipients"]}
+                    )
+                return
+            invalid = [
+                addr.strip()
+                for addr in re.split(r"[,;]", value)
+                if addr.strip() and not EMAIL_REGEX.match(addr.strip())
+            ]
+            if invalid:
+                raise ValidationError(
+                    {field: [f"Invalid email address(es): {', '.join(invalid)}"]}
+                )
+
+        validate_addresses("target", config.get("target"), required=True)
+        validate_addresses("ccTarget", config.get("ccTarget"), required=False)
+        validate_addresses("bccTarget", config.get("bccTarget"), required=False)
+
+    @validates_schema
+    def validate_slack_recipients(self, data: dict[str, Any], **kwargs: Any) -> None:
+        """SlackV2 recipients must be channel ids, because a name never delivers."""
+        # SlackV2 only. The deprecated Slack v1 path still accepts channel names:
+        # it sends with files_upload/chat_postMessage, which resolve a name, and
+        # existing v1 recipients are auto-upgraded to SlackV2 on first send by
+        # update_report_schedule_slack_v2. Rejecting names here would break that
+        # upgrade path and the v1 contract.
+        if data.get("type") != ReportRecipientType.SLACKV2.value:
+            return
+
+        target = ((data.get("recipient_config_json") or {}).get("target") or "").strip()
+        # Superset splits a target on commas, semicolons and whitespace, so each
+        # part has to be a channel id on its own.
+        channels = [channel for channel in re.split(r"[,;\s]+", target) if channel]
+        if not channels:
+            raise ValidationError(
+                {"target": [_("A Slack channel is required for Slack recipients")]}
+            )
+
+        invalid = [c for c in channels if not SLACK_CHANNEL_ID_REGEX.match(c)]
+        if invalid:
+            raise ValidationError(
+                {
+                    "target": [
+                        _(
+                            "Not a Slack channel id: %(invalid)s. Superset uploads "
+                            "report attachments with files_upload_v2, which accepts "
+                            "a channel id and rejects a channel name, so a name is "
+                            "saved successfully and then never delivers. Choose the "
+                            "channel from the dropdown, or copy its id from Slack "
+                            "(channel name, View channel details, the id is at the "
+                            "bottom).",
+                            invalid=", ".join(invalid),
+                        )
+                    ]
+                }
+            )
+
+
+_RETRY_FIELD_KEYS = (
+    "retry_on_failure",
+    "retry_max_attempts",
+    "send_failed_reports",
+    "retry_notify_owners",
+    "retry_notify_recipients",
+)
+
+
+class RetryFieldStripMixin:
+    """Strip retry fields from the raw payload before validation when the
+    feature is off.  Using ``@pre_load`` ensures that field-level validators
+    (e.g. ``Range`` on ``retry_max_attempts``) are never reached for values
+    that will be discarded anyway."""
+
+    @pre_load
+    def strip_retry_fields_if_disabled(
+        self,
+        data: dict[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not is_feature_enabled("ALERT_REPORTS_RETRY"):
+            for key in _RETRY_FIELD_KEYS:
+                data.pop(key, None)
+        return data
+
+
+class ReportSchedulePostSchema(RetryFieldStripMixin, Schema):
     type = fields.String(
         metadata={"description": type_description},
         allow_none=False,
@@ -199,9 +317,8 @@ class ReportSchedulePostSchema(Schema):
         metadata={"description": creation_method_description},
     )
     dashboard = fields.Integer(required=False, allow_none=True)
-    selected_tabs = fields.List(fields.Integer(), required=False, allow_none=True)
     database = fields.Integer(required=False)
-    owners = fields.List(fields.Integer(metadata={"description": owners_description}))
+    editors = fields.List(fields.Integer(metadata={"description": editors_description}))
     validator_type = fields.String(
         metadata={"description": validator_type_description},
         validate=validate.OneOf(
@@ -224,7 +341,7 @@ class ReportSchedulePostSchema(Schema):
         validate=[Range(min=1, error=_("Value must be greater than 0"))],
     )
 
-    recipients = fields.List(fields.Nested(ReportRecipientSchema))
+    recipients = fields.List(fields.Nested(ReportRecipientSchema), required=False)
     report_format = fields.String(
         dump_default=ReportDataFormat.PNG,
         validate=validate.OneOf(choices=tuple(key.value for key in ReportDataFormat)),
@@ -233,6 +350,11 @@ class ReportSchedulePostSchema(Schema):
         dump_default=None,
     )
     force_screenshot = fields.Boolean(dump_default=False)
+    include_cta = fields.Boolean(
+        dump_default=True,
+        allow_none=True,
+        metadata={"description": include_cta_description},
+    )
     custom_width = fields.Integer(
         metadata={
             "description": _("Custom width of the screenshot in pixels"),
@@ -240,13 +362,43 @@ class ReportSchedulePostSchema(Schema):
         },
         allow_none=True,
         required=False,
-        default=None,
+        dump_default=None,
+    )
+    retry_on_failure = fields.Boolean(
+        metadata={"description": _("Enable automatic retries on report failure")},
+        load_default=False,
+    )
+    retry_max_attempts = fields.Integer(
+        metadata={
+            "description": _("Maximum number of retry attempts (1–10)"),
+            "example": 3,
+        },
+        load_default=3,
+        required=False,
+        validate=[Range(min=1, max=10, error=_("Must be between 1 and 10"))],
+    )
+    send_failed_reports = fields.Boolean(
+        metadata={
+            "description": _(
+                "Send the failed report to all recipients after retries are exhausted"
+            )
+        },
+        load_default=False,
+    )
+    retry_notify_owners = fields.Boolean(
+        metadata={"description": _("Notify report owners on each retry attempt")},
+        load_default=True,
+    )
+    retry_notify_recipients = fields.Boolean(
+        metadata={"description": _("Notify report recipients on each retry attempt")},
+        load_default=False,
     )
 
     @validates("custom_width")
     def validate_custom_width(
         self,
         value: Optional[int],
+        **kwargs: Any,
     ) -> None:
         if value is None:
             return
@@ -274,8 +426,49 @@ class ReportSchedulePostSchema(Schema):
                     {"database": ["Database reference is not allowed on a report"]}
                 )
 
+    @validates_schema
+    def validate_retry_config(  # pylint: disable=unused-argument
+        self,
+        data: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        if not is_feature_enabled("ALERT_REPORTS_RETRY"):
+            return
+        if data.get("send_failed_reports") and not data.get("retry_on_failure"):
+            raise ValidationError(
+                {
+                    "send_failed_reports": [
+                        _("send_failed_reports requires retry_on_failure to be enabled")
+                    ]
+                }
+            )
 
-class ReportSchedulePutSchema(Schema):
+
+class ReportScheduleSubscribeSchema(ReportSchedulePostSchema):
+    """Schema for creating a chart/dashboard subscription.
+
+    ``recipients`` and ``creation_method`` are excluded — both are set
+    server-side: recipients are locked to the authenticated user's email,
+    and creation_method is derived from the presence of ``chart`` or
+    ``dashboard`` in the payload.
+
+    ``type`` is restricted to ``Report`` — alert schedules cannot be
+    created through the subscribe endpoint.
+    """
+
+    type = fields.String(
+        metadata={"description": type_description},
+        allow_none=False,
+        required=True,
+        validate=validate.OneOf(choices=[ReportScheduleType.REPORT.value]),
+    )
+
+    class Meta:
+        exclude = ("recipients", "creation_method", "editors")
+        unknown = EXCLUDE
+
+
+class ReportSchedulePutSchema(RetryFieldStripMixin, Schema):
     type = fields.String(
         metadata={"description": type_description},
         required=False,
@@ -334,9 +527,9 @@ class ReportSchedulePutSchema(Schema):
         metadata={"description": creation_method_description},
     )
     dashboard = fields.Integer(required=False, allow_none=True)
-    database = fields.Integer(required=False)
-    owners = fields.List(
-        fields.Integer(metadata={"description": owners_description}), required=False
+    database = fields.Integer(required=False, allow_none=True)
+    editors = fields.List(
+        fields.Integer(metadata={"description": editors_description}), required=False
     )
     validator_type = fields.String(
         metadata={"description": validator_type_description},
@@ -370,6 +563,11 @@ class ReportSchedulePutSchema(Schema):
     )
     extra = fields.Dict(dump_default=None)
     force_screenshot = fields.Boolean(dump_default=False)
+    include_cta = fields.Boolean(
+        dump_default=True,
+        allow_none=True,
+        metadata={"description": include_cta_description},
+    )
 
     custom_width = fields.Integer(
         metadata={
@@ -378,13 +576,42 @@ class ReportSchedulePutSchema(Schema):
         },
         allow_none=True,
         required=False,
-        default=None,
+        dump_default=None,
+    )
+    retry_on_failure = fields.Boolean(
+        metadata={"description": _("Enable automatic retries on report failure")},
+        required=False,
+    )
+    retry_max_attempts = fields.Integer(
+        metadata={
+            "description": _("Maximum number of retry attempts (1–10)"),
+            "example": 3,
+        },
+        required=False,
+        validate=[Range(min=1, max=10, error=_("Must be between 1 and 10"))],
+    )
+    send_failed_reports = fields.Boolean(
+        metadata={
+            "description": _(
+                "Send the failed report to all recipients after retries are exhausted"
+            )
+        },
+        required=False,
+    )
+    retry_notify_owners = fields.Boolean(
+        metadata={"description": _("Notify report owners on each retry attempt")},
+        required=False,
+    )
+    retry_notify_recipients = fields.Boolean(
+        metadata={"description": _("Notify report recipients on each retry attempt")},
+        required=False,
     )
 
     @validates("custom_width")
     def validate_custom_width(
         self,
         value: Optional[int],
+        **kwargs: Any,
     ) -> None:
         if value is None:
             return
@@ -399,3 +626,29 @@ class ReportSchedulePutSchema(Schema):
                     max=max_width,
                 )
             )
+
+
+class SlackChannelSchema(Schema):
+    """
+    Schema to load Slack channels, set to ignore any fields not used by Superset.
+    """
+
+    class Meta:
+        unknown = EXCLUDE
+
+    id = fields.String()
+    name = fields.String()
+    is_member = fields.Boolean()
+    is_private = fields.Boolean()
+
+
+class ReportScheduleExecuteResponseSchema(Schema):
+    """Schema for the response when executing a report schedule immediately."""
+
+    class Meta:
+        unknown = EXCLUDE
+
+    execution_id = fields.UUID(
+        metadata={"description": _("UUID to track the execution status")}
+    )
+    message = fields.String(metadata={"description": _("Success message")})

@@ -16,9 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { ensureIsArray, t } from '@superset-ui/core';
-import { cloneDeep } from 'lodash';
+import { t } from '@apache-superset/core/translation';
+import { ensureIsArray } from '@superset-ui/core';
+import { cloneDeep } from 'lodash-es';
 import {
+  ControlPanelsContainerProps,
   ControlPanelConfig,
   ControlPanelSectionConfig,
   ControlSetRow,
@@ -27,6 +29,8 @@ import {
   getStandardizedControls,
   sections,
   sharedControls,
+  DEFAULT_SORT_SERIES_DATA,
+  SORT_SERIES_CHOICES,
 } from '@superset-ui/chart-controls';
 
 import { DEFAULT_FORM_DATA } from './types';
@@ -34,10 +38,14 @@ import { EchartsTimeseriesSeriesType } from '../Timeseries/types';
 import {
   legendSection,
   minorTicks,
+  axisTicks,
+  gridlines,
   richTooltipSection,
   truncateXAxis,
   xAxisBounds,
   xAxisLabelRotation,
+  xAxisLabelInterval,
+  forceMaxInterval,
 } from '../controls';
 
 const {
@@ -54,7 +62,6 @@ const {
   stack,
   truncateYAxis,
   yAxisBounds,
-  zoomable,
   yAxisIndex,
 } = DEFAULT_FORM_DATA;
 
@@ -198,6 +205,48 @@ function createCustomizeSection(
     ],
     [
       {
+        name: `label_position${controlSuffix}`,
+        config: {
+          type: 'SelectControl',
+          freeForm: false,
+          label: t('Label Position'),
+          choices: [
+            ['auto', t('Auto')],
+            ['top', t('Top')],
+            ['inside', t('Inside')],
+            ['bottom', t('Bottom')],
+            ['left', t('Left')],
+            ['right', t('Right')],
+          ],
+          default: 'auto',
+          renderTrigger: true,
+          description: t(
+            'Position of the data label relative to the data point',
+          ),
+          visibility: ({ controls }: ControlPanelsContainerProps) =>
+            Boolean(controls?.[`show_value${controlSuffix}`]?.value),
+        },
+      },
+    ],
+    [
+      {
+        name: `only_total${controlSuffix}`,
+        config: {
+          type: 'CheckboxControl',
+          label: t('Only Total'),
+          default: true,
+          renderTrigger: true,
+          description: t(
+            'Only show the total value on the stacked chart, and not show on the selected category',
+          ),
+          visibility: ({ controls }: ControlPanelsContainerProps) =>
+            Boolean(controls?.show_value?.value) &&
+            Boolean(controls?.stack?.value),
+        },
+      },
+    ],
+    [
+      {
         name: `opacity${controlSuffix}`,
         config: {
           type: 'SliderControl',
@@ -258,6 +307,35 @@ function createCustomizeSection(
         },
       },
     ],
+    [<ControlSubSectionHeader>{t('Series Order')}</ControlSubSectionHeader>],
+    [
+      {
+        name: `sort_series_type${controlSuffix}`,
+        config: {
+          type: 'SelectControl',
+          freeForm: false,
+          label: t('Sort Series By'),
+          choices: SORT_SERIES_CHOICES,
+          default: DEFAULT_SORT_SERIES_DATA.sort_series_type,
+          renderTrigger: true,
+          description: t(
+            'Based on what should series be ordered on the chart and legend',
+          ),
+        },
+      },
+    ],
+    [
+      {
+        name: `sort_series_ascending${controlSuffix}`,
+        config: {
+          type: 'CheckboxControl',
+          label: t('Sort Series Ascending'),
+          default: DEFAULT_SORT_SERIES_DATA.sort_series_ascending,
+          renderTrigger: true,
+          description: t('Sort series in ascending order'),
+        },
+      },
+    ],
   ];
 }
 
@@ -267,14 +345,25 @@ function createAdvancedAnalyticsSection(
 ): ControlPanelSectionConfig {
   const aaWithSuffix = cloneDeep(sections.advancedAnalyticsControls);
   aaWithSuffix.label = label;
+  // `time_compare_full_range` is only wired into the regular timeseries query
+  // builder, not the mixed-timeseries one, so drop it here to avoid showing a
+  // control that has no effect.
+  aaWithSuffix.controlSetRows = aaWithSuffix.controlSetRows
+    .map(row =>
+      row.filter(
+        control =>
+          (control as CustomControlItem)?.name !== 'time_compare_full_range',
+      ),
+    )
+    .filter(row => row.length > 0);
   if (!controlSuffix) {
     return aaWithSuffix;
   }
   aaWithSuffix.controlSetRows.forEach(row =>
-    row.forEach((control: CustomControlItem) => {
-      if (control?.name) {
-        // eslint-disable-next-line no-param-reassign
-        control.name = `${control.name}${controlSuffix}`;
+    row.forEach(control => {
+      const item = control as CustomControlItem;
+      if (item?.name) {
+        item.name = `${item.name}${controlSuffix}`;
       }
     }),
   );
@@ -302,24 +391,32 @@ const config: ControlPanelConfig = {
         ['time_shift_color'],
         ...createCustomizeSection(t('Query A'), ''),
         ...createCustomizeSection(t('Query B'), 'B'),
-        [
-          {
-            name: 'zoomable',
-            config: {
-              type: 'CheckboxControl',
-              label: t('Data Zoom'),
-              default: zoomable,
-              renderTrigger: true,
-              description: t('Enable data zooming controls'),
-            },
-          },
-        ],
+        ['zoomable'],
         [minorTicks],
+        [axisTicks],
+        [gridlines],
         ...legendSection,
         [<ControlSubSectionHeader>{t('X Axis')}</ControlSubSectionHeader>],
         ['x_axis_time_format'],
         [xAxisLabelRotation],
-        ...richTooltipSection,
+        [xAxisLabelInterval],
+        [forceMaxInterval],
+        [<ControlSubSectionHeader>{t('Tooltip')}</ControlSubSectionHeader>],
+        [
+          {
+            name: 'show_query_identifiers',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Show query identifiers'),
+              description: t(
+                'Add Query A and Query B identifiers to tooltips to help differentiate series',
+              ),
+              default: false,
+              renderTrigger: true,
+            },
+          },
+        ],
+        ...richTooltipSection.slice(1), // Skip the tooltip header since we added our own
         // eslint-disable-next-line react/jsx-key
         [<ControlSubSectionHeader>{t('Y Axis')}</ControlSubSectionHeader>],
         [
@@ -448,6 +545,7 @@ const config: ControlPanelConfig = {
             },
           },
         ],
+        ['echart_options'],
       ],
     },
   ],

@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+/* eslint-disable import/no-extraneous-dependencies */
 import {
   useCallback,
   useRef,
@@ -24,8 +25,11 @@ import {
   MutableRefObject,
   CSSProperties,
   DragEvent,
+  useEffect,
+  useMemo,
 } from 'react';
-
+import { typedMemo, usePrevious } from '@superset-ui/core';
+import { t } from '@apache-superset/core/translation';
 import {
   useTable,
   usePagination,
@@ -39,8 +43,8 @@ import {
   Row,
 } from 'react-table';
 import { matchSorter, rankings } from 'match-sorter';
-import { typedMemo, usePrevious } from '@superset-ui/core';
-import { isEqual } from 'lodash';
+import { isEqual } from 'lodash-es';
+import { Flex, Space } from '@superset-ui/core/components';
 import GlobalFilter, { GlobalFilterProps } from './components/GlobalFilter';
 import SelectPageSize, {
   SelectPageSizeProps,
@@ -50,6 +54,9 @@ import SimplePagination from './components/Pagination';
 import useSticky from './hooks/useSticky';
 import { PAGE_SIZE_OPTIONS } from '../consts';
 import { sortAlphanumericCaseInsensitive } from './utils/sortAlphanumericCaseInsensitive';
+import { SearchOption, SortByItem } from '../types';
+import SearchSelectDropdown from './components/SearchSelectDropdown';
+import { SupersetTheme, css } from '@apache-superset/core/theme';
 
 export interface DataTableProps<D extends object> extends TableOptions<D> {
   tableClassName?: string;
@@ -62,15 +69,31 @@ export interface DataTableProps<D extends object> extends TableOptions<D> {
   height?: string | number;
   serverPagination?: boolean;
   onServerPaginationChange: (pageNumber: number, pageSize: number) => void;
-  serverPaginationData: { pageSize?: number; currentPage?: number };
+  serverPaginationData: {
+    pageSize?: number;
+    currentPage?: number;
+    sortBy?: SortByItem[];
+    searchColumn?: string;
+  };
   pageSize?: number;
   noResults?: string | ((filterString: string) => ReactNode);
   sticky?: boolean;
   rowCount: number;
   wrapperRef?: MutableRefObject<HTMLDivElement>;
-  onColumnOrderChange: () => void;
-  renderGroupingHeaders?: () => JSX.Element;
+  onColumnOrderChange?: () => void;
+  resetColumnOrder?: boolean;
+  renderGroupingHeaders?: () => ReactNode;
   renderTimeComparisonDropdown?: () => JSX.Element;
+  handleSortByChange: (sortBy: SortByItem[]) => void;
+  sortByFromParent: SortByItem[];
+  manualSearch?: boolean;
+  onSearchChange?: (searchText: string) => void;
+  initialSearchText?: string;
+  searchInputId?: string;
+  onSearchColChange: (searchCol: string) => void;
+  searchOptions: SearchOption[];
+  onFilteredDataChange?: (rows: Row<D>[], filterValue?: string) => void;
+  onFilteredRowsChange?: (rows: D[]) => void;
 }
 
 export interface RenderHTMLCellProps extends HTMLProps<HTMLTableCellElement> {
@@ -80,6 +103,42 @@ export interface RenderHTMLCellProps extends HTMLProps<HTMLTableCellElement> {
 const sortTypes = {
   alphanumeric: sortAlphanumericCaseInsensitive,
 };
+
+// Prefer a stable identifier from original row data; otherwise use a deterministic
+// concatenation of visible values (keys sorted so the result does not depend on
+// column order).
+function stableRowKey<D extends object>(r: Row<D>): string {
+  const orig = r.original as Record<string, unknown> | undefined;
+  if (orig) {
+    const idLike = orig.id ?? orig.ID ?? orig.key ?? orig.uuid;
+    if (idLike != null) return String(idLike);
+  }
+
+  // Fallback: derive from row.values, sorting the keys so that reordering the
+  // columns does not change the key.
+  const v = r.values as Record<string, unknown>;
+  const keys = Object.keys(v).sort();
+  return keys.map(k => String(v[k] ?? '')).join('|');
+}
+
+// Very small, fast hash for strings (no crypto dependency).
+function hashString(s: string): string {
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    // oxlint-disable-next-line unicorn/prefer-math-trunc -- | 0 is intentional for 32-bit integer wrapping in hash
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return String(h);
+}
+
+function signatureOfRows<D extends object>(rs: Row<D>[]): string {
+  const keys = rs.map(stableRowKey);
+  const len = keys.length;
+  const first = keys[0] ?? '';
+  const last = keys[len - 1] ?? '';
+  const digest = hashString(keys.join('\u0001')); // non-printable separator to avoid collisions
+  return `${len}|${first}|${last}|${digest}`;
+}
 
 // Be sure to pass our updateMyData and the skipReset option
 export default typedMemo(function DataTable<D extends object>({
@@ -98,13 +157,24 @@ export default typedMemo(function DataTable<D extends object>({
   onServerPaginationChange,
   rowCount,
   selectPageSize,
-  noResults: noResultsText = 'No data found',
+  noResults: noResultsText = t('No data found'),
   hooks,
   serverPagination,
   wrapperRef: userWrapperRef,
   onColumnOrderChange,
+  resetColumnOrder = false,
   renderGroupingHeaders,
   renderTimeComparisonDropdown,
+  handleSortByChange,
+  sortByFromParent = [],
+  manualSearch = false,
+  onSearchChange,
+  initialSearchText,
+  searchInputId,
+  onSearchColChange,
+  searchOptions,
+  onFilteredDataChange,
+  onFilteredRowsChange,
   ...moreUseTableOptions
 }: DataTableProps<D>): JSX.Element {
   const tableHooks: PluginHook<D>[] = [
@@ -115,7 +185,26 @@ export default typedMemo(function DataTable<D extends object>({
     doSticky ? useSticky : [],
     hooks || [],
   ].flat();
-  const columnNames = Object.keys(data?.[0] || {});
+
+  const columnNames = columns.map((column, index) => {
+    const normalizedColumn = column as typeof column & {
+      accessor?: string | ((row: D) => unknown);
+      columnKey?: string;
+      id?: string;
+    };
+
+    const accessorName =
+      typeof normalizedColumn.accessor === 'string'
+        ? normalizedColumn.accessor
+        : undefined;
+
+    return (
+      normalizedColumn.columnKey ??
+      normalizedColumn.id ??
+      accessorName ??
+      String(index)
+    );
+  });
   const previousColumnNames = usePrevious(columnNames);
   const resultsSize = serverPagination ? rowCount : data.length;
   const sortByRef = useRef([]); // cache initial `sortby` so sorting doesn't trigger page reset
@@ -127,7 +216,8 @@ export default typedMemo(function DataTable<D extends object>({
     ...initialState_,
     // zero length means all pages, the `usePagination` plugin does not
     // understand pageSize = 0
-    sortBy: sortByRef.current,
+    // sortBy: sortByRef.current,
+    sortBy: serverPagination ? sortByFromParent : sortByRef.current,
     pageSize: initialPageSize > 0 ? initialPageSize : resultsSize || 10,
   };
   const defaultWrapperRef = useRef<HTMLDivElement>(null);
@@ -174,6 +264,7 @@ export default typedMemo(function DataTable<D extends object>({
   );
 
   const {
+    rows, // filtered/sorted rows before pagination
     getTableProps,
     getTableBodyProps,
     prepareRow,
@@ -188,7 +279,13 @@ export default typedMemo(function DataTable<D extends object>({
     wrapStickyTable,
     setColumnOrder,
     allColumns,
-    state: { pageIndex, pageSize, globalFilter: filterValue, sticky = {} },
+    state: {
+      pageIndex,
+      pageSize,
+      globalFilter: filterValue,
+      sticky = {},
+      sortBy,
+    },
   } = useTable<D>(
     {
       columns,
@@ -197,11 +294,120 @@ export default typedMemo(function DataTable<D extends object>({
       getTableSize: defaultGetTableSize,
       globalFilter: defaultGlobalFilter,
       sortTypes,
+      autoResetGlobalFilter: !isEqual(columnNames, previousColumnNames),
       autoResetSortBy: !isEqual(columnNames, previousColumnNames),
+      autoResetPage: !isEqual(columnNames, previousColumnNames),
+      manualSortBy: !!serverPagination,
       ...moreUseTableOptions,
     },
     ...tableHooks,
   );
+
+  const columnOrderKey = columnNames.join('\0');
+  useEffect(() => {
+    if (resetColumnOrder) {
+      setColumnOrder(columnOrderKey ? columnOrderKey.split('\0') : []);
+    }
+  }, [columnOrderKey, resetColumnOrder, setColumnOrder]);
+
+  const rowSignature = useMemo(
+    // sort the rows by id to ensure the total is not recalculated when the rows are only reordered
+    () =>
+      rows
+        .map((row, index) => row.id ?? index)
+        .sort()
+        .join('|'),
+    [rows],
+  );
+
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  useEffect(() => {
+    if (!onFilteredDataChange) {
+      return;
+    }
+
+    const searchText =
+      typeof filterValue === 'string' ? filterValue : undefined;
+
+    onFilteredDataChange(rowsRef.current, searchText);
+  }, [filterValue, onFilteredDataChange, rowSignature]);
+
+  // Emit filtered rows to parent in client-side mode (debounced via RAF)
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const rafRef = useRef<number | null>(null);
+  const lastSigRef = useRef<string>('');
+
+  useEffect(() => {
+    if (serverPagination || typeof onFilteredRowsChange !== 'function') {
+      return;
+    }
+
+    const sig = signatureOfRows(rows);
+
+    if (sig !== lastSigRef.current) {
+      lastSigRef.current = sig;
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+      }
+      rafRef.current = requestAnimationFrame(() => {
+        if (isMountedRef.current) {
+          // Only emit originals when the signature truly changed
+          onFilteredRowsChange(rows.map(r => r.original as D));
+        }
+      });
+    }
+
+    return () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [rows, serverPagination, onFilteredRowsChange]);
+
+  const handleSearchChange = useCallback(
+    (query: string) => {
+      if (manualSearch && onSearchChange) {
+        onSearchChange(query);
+      } else {
+        setGlobalFilter(query);
+      }
+    },
+    [manualSearch, onSearchChange, setGlobalFilter],
+  );
+
+  // updating the sort by to the own State of table viz
+  useEffect(() => {
+    const serverSortBy = serverPaginationData?.sortBy || [];
+
+    if (serverPagination && !isEqual(sortBy, serverSortBy)) {
+      if (Array.isArray(sortBy) && sortBy.length > 0) {
+        const [sortByItem] = sortBy;
+        const matchingColumn = columns.find(col => col?.id === sortByItem?.id);
+
+        if (matchingColumn && 'columnKey' in matchingColumn) {
+          const sortByWithColumnKey: SortByItem = {
+            ...sortByItem,
+            key: (matchingColumn as { columnKey: string }).columnKey,
+          };
+
+          handleSortByChange([sortByWithColumnKey]);
+        }
+      } else {
+        handleSortByChange([]);
+      }
+    }
+  }, [sortBy]);
+
   // make setPageSize accept 0
   const setPageSize = (size: number) => {
     if (serverPagination) {
@@ -249,8 +455,7 @@ export default typedMemo(function DataTable<D extends object>({
       const colToBeMoved = currentCols.splice(columnBeingDragged, 1);
       currentCols.splice(newPosition, 0, colToBeMoved[0]);
       setColumnOrder(currentCols);
-      // toggle value in TableChart to trigger column width recalc
-      onColumnOrderChange();
+      onColumnOrderChange?.();
     }
     e.preventDefault();
   };
@@ -282,7 +487,7 @@ export default typedMemo(function DataTable<D extends object>({
             prepareRow(row);
             const { key: rowKey, ...rowProps } = row.getRowProps();
             return (
-              <tr key={rowKey || row.id} {...rowProps} role="row">
+              <tr key={rowKey || row.id} {...rowProps}>
                 {row.cells.map(cell =>
                   cell.render('Cell', { key: cell.column.id }),
                 )}
@@ -303,11 +508,7 @@ export default typedMemo(function DataTable<D extends object>({
             const { key: footerGroupKey, ...footerGroupProps } =
               footerGroup.getHeaderGroupProps();
             return (
-              <tr
-                key={footerGroupKey || footerGroup.id}
-                {...footerGroupProps}
-                role="row"
-              >
+              <tr key={footerGroupKey || footerGroup.id} {...footerGroupProps}>
                 {footerGroup.headers.map(column =>
                   column.render('Footer', { key: column.id }),
                 )}
@@ -340,21 +541,34 @@ export default typedMemo(function DataTable<D extends object>({
   let resultOnPageChange: (page: number) => void = gotoPage;
   if (serverPagination) {
     const serverPageSize = serverPaginationData?.pageSize ?? initialPageSize;
-    resultPageCount = Math.ceil(rowCount / serverPageSize);
+    resultCurrentPageSize = serverPageSize;
+    const exactMatch = pageSizeOptions.some(
+      ([option]) => option === resultCurrentPageSize,
+    );
+    if (!exactMatch) {
+      const nearestOption = pageSizeOptions.find(
+        ([option]) => option >= resultCurrentPageSize,
+      );
+      if (nearestOption) {
+        resultCurrentPageSize = nearestOption[0];
+      } else if (pageSizeOptions.length > 0) {
+        resultCurrentPageSize = pageSizeOptions[pageSizeOptions.length - 1][0];
+      } else {
+        resultCurrentPageSize = 0;
+      }
+    }
+    // Use the fallback-adjusted page size (not the raw, possibly invalid
+    // serverPageSize) so the page count and the server callback stay in
+    // sync with what the selector actually displays.
+    resultPageCount = Math.ceil(rowCount / resultCurrentPageSize);
     if (!Number.isFinite(resultPageCount)) {
       resultPageCount = 0;
     }
-    resultCurrentPageSize = serverPageSize;
-    const foundPageSizeIndex = pageSizeOptions.findIndex(
-      ([option]) => option >= resultCurrentPageSize,
-    );
-    if (foundPageSizeIndex === -1) {
-      resultCurrentPageSize = 0;
-    }
     resultCurrentPage = serverPaginationData?.currentPage ?? 0;
     resultOnPageChange = (pageNumber: number) =>
-      onServerPaginationChange(pageNumber, serverPageSize);
+      onServerPaginationChange(pageNumber, resultCurrentPageSize);
   }
+
   return (
     <div
       ref={wrapperRef}
@@ -362,45 +576,62 @@ export default typedMemo(function DataTable<D extends object>({
     >
       {hasGlobalControl ? (
         <div ref={globalControlRef} className="form-inline dt-controls">
-          <div className="row">
-            <div
-              className={renderTimeComparisonDropdown ? 'col-sm-5' : 'col-sm-6'}
-            >
-              {hasPagination ? (
-                <SelectPageSize
-                  total={resultsSize}
-                  current={resultCurrentPageSize}
-                  options={pageSizeOptions}
-                  selectRenderer={
-                    typeof selectPageSize === 'boolean'
-                      ? undefined
-                      : selectPageSize
-                  }
-                  onChange={setPageSize}
-                />
-              ) : null}
-            </div>
-            {searchInput ? (
-              <div className="col-sm-6">
-                <GlobalFilter<D>
-                  searchInput={
-                    typeof searchInput === 'boolean' ? undefined : searchInput
-                  }
-                  preGlobalFilteredRows={preGlobalFilteredRows}
-                  setGlobalFilter={setGlobalFilter}
-                  filterValue={filterValue}
-                />
-              </div>
+          <Flex
+            wrap
+            className="row"
+            align="center"
+            justify="space-between"
+            gap="middle"
+            css={(theme: SupersetTheme) => css`
+              font-size: ${theme.fontSizeSM}px;
+            `}
+          >
+            {hasPagination ? (
+              <SelectPageSize
+                total={resultsSize}
+                current={resultCurrentPageSize}
+                options={pageSizeOptions}
+                selectRenderer={
+                  typeof selectPageSize === 'boolean'
+                    ? undefined
+                    : selectPageSize
+                }
+                onChange={setPageSize}
+              />
             ) : null}
-            {renderTimeComparisonDropdown ? (
-              <div
-                className="col-sm-1"
-                style={{ float: 'right', marginTop: '6px' }}
-              >
-                {renderTimeComparisonDropdown()}
-              </div>
-            ) : null}
-          </div>
+            <Flex wrap align="center" gap="middle">
+              {searchInput && (
+                <>
+                  {serverPagination && searchOptions?.length > 0 && (
+                    <Space direction="vertical" size={4}>
+                      {t('Search by')}
+                      <SearchSelectDropdown
+                        searchOptions={searchOptions}
+                        value={serverPaginationData?.searchColumn || ''}
+                        onChange={onSearchColChange}
+                      />
+                    </Space>
+                  )}
+                  <GlobalFilter<D>
+                    searchInput={
+                      typeof searchInput === 'boolean' ? undefined : searchInput
+                    }
+                    preGlobalFilteredRows={preGlobalFilteredRows}
+                    setGlobalFilter={
+                      manualSearch ? handleSearchChange : setGlobalFilter
+                    }
+                    filterValue={manualSearch ? initialSearchText : filterValue}
+                    id={searchInputId}
+                    serverPagination={!!serverPagination}
+                    rowCount={rowCount}
+                  />
+                </>
+              )}
+              {renderTimeComparisonDropdown
+                ? renderTimeComparisonDropdown()
+                : null}
+            </Flex>
+          </Flex>
         </div>
       ) : null}
       {wrapStickyTable ? wrapStickyTable(renderTable) : renderTable()}

@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Any, cast, TYPE_CHECKING
 
 from superset.common.chart_data import ChartDataResultType
-from superset.common.query_object import QueryObject
+from superset.common.query_object import DEPRECATED_FIELDS, QueryObject
 from superset.common.utils.time_range_utils import get_since_until_from_time_range
 from superset.constants import NO_TIME_RANGE
 from superset.superset_typing import Column
@@ -57,14 +57,30 @@ class QueryObjectFactory:  # pylint: disable=too-few-public-methods
         row_limit: int | None = None,
         time_range: str | None = None,
         time_shift: str | None = None,
+        server_pagination: bool | None = None,
+        datasource_model_instance: BaseDatasource | None = None,
+        preserve_null_row_limit: bool = False,
         **kwargs: Any,
     ) -> QueryObject:
-        datasource_model_instance = None
-        if datasource:
+        if datasource_model_instance is None and datasource:
             datasource_model_instance = self._convert_to_model(datasource)
         processed_extras = self._process_extras(extras)
         result_type = kwargs.setdefault("result_type", parent_result_type)
-        row_limit = self._process_row_limit(row_limit, result_type)
+
+        # Rename deprecated kwargs before any processing so that downstream code
+        # (time-range resolution, QueryObject) only ever sees the canonical names.
+        for field in DEPRECATED_FIELDS:
+            if old_val := kwargs.pop(field.old_name, None):
+                kwargs.setdefault(field.new_name, old_val)
+
+        # Process row limit taking server pagination into account
+        row_limit = self._process_row_limit(
+            row_limit,
+            result_type,
+            server_pagination=server_pagination,
+            preserve_null_row_limit=preserve_null_row_limit,
+        )
+
         processed_time_range = self._process_time_range(
             time_range, kwargs.get("filters"), kwargs.get("columns")
         )
@@ -85,7 +101,7 @@ class QueryObjectFactory:  # pylint: disable=too-few-public-methods
     def _convert_to_model(self, datasource: DatasourceDict) -> BaseDatasource:
         return self._datasource_dao.get_datasource(
             datasource_type=DatasourceType(datasource["type"]),
-            datasource_id=int(datasource["id"]),
+            database_id_or_uuid=datasource["id"],
         )
 
     def _process_extras(
@@ -96,14 +112,32 @@ class QueryObjectFactory:  # pylint: disable=too-few-public-methods
         return extras
 
     def _process_row_limit(
-        self, row_limit: int | None, result_type: ChartDataResultType
-    ) -> int:
+        self,
+        row_limit: int | None,
+        result_type: ChartDataResultType,
+        server_pagination: bool | None = None,
+        preserve_null_row_limit: bool = False,
+    ) -> int | None:
+        """Process row limit taking into account server pagination.
+
+        :param row_limit: The requested row limit
+        :param result_type: The type of result being processed
+        :param server_pagination: Whether server-side pagination is enabled
+        :param preserve_null_row_limit: Whether explicit null means no limit
+        :return: The processed row limit
+        """
+        if row_limit is None and preserve_null_row_limit:
+            return None
+
         default_row_limit = (
             self._config["SAMPLES_ROW_LIMIT"]
             if result_type == ChartDataResultType.SAMPLES
             else self._config["ROW_LIMIT"]
         )
-        return apply_max_row_limit(row_limit or default_row_limit)
+        return apply_max_row_limit(
+            row_limit or default_row_limit,
+            server_pagination=server_pagination,
+        )
 
     @staticmethod
     def _process_time_range(

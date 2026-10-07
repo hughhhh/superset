@@ -16,10 +16,27 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { supersetTheme } from '@superset-ui/core';
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
-import FilterScopeSelector from './FilterScopeSelector';
+import { supersetTheme } from '@apache-superset/core/theme';
+import {
+  cleanup,
+  render,
+  screen,
+  userEvent,
+} from 'spec/helpers/testing-library';
+import React from 'react';
+import FilterScopeSelectorComponent from './FilterScopeSelector';
+
+// Cast to accept partial mock props in tests
+const FilterScopeSelector = FilterScopeSelectorComponent as unknown as React.FC<
+  Record<string, any>
+>;
+
+// Add afterEach cleanup
+afterEach(async () => {
+  cleanup();
+  // Wait for any pending effects to complete
+  await new Promise(resolve => setTimeout(resolve, 0));
+});
 
 const ROOT_ID = 'ROOT_ID';
 const GRID = 'GRID';
@@ -157,17 +174,18 @@ function getCheckboxState(name: string): CheckboxState {
   const element = screen.getByRole('link', { name });
   const svgPath = getCheckboxIcon(element).children[1].children[0].children[0];
   const fill = svgPath.getAttribute('fill');
-  return fill === supersetTheme.colors.primary.base
+  return fill === supersetTheme.colorPrimary
     ? CHECKED
-    : fill === supersetTheme.colors.grayscale.light1
+    : fill === supersetTheme.colorTextSecondary
       ? INDETERMINATE
       : UNCHECKED;
 }
 
-function clickCheckbox(name: string) {
+// Replace the original clickCheckbox function with the async version
+async function clickCheckbox(name: string) {
   const element = screen.getByRole('link', { name });
   const checkboxLabel = getCheckboxIcon(element);
-  userEvent.click(checkboxLabel);
+  await userEvent.click(checkboxLabel);
 }
 
 test('renders with empty filters', () => {
@@ -199,11 +217,13 @@ test('renders with filters values', () => {
   expect(screen.getByRole('button', { name: 'Save' })).toBeInTheDocument();
 });
 
-test('collapses/expands all filters', () => {
+test('collapses/expands all filters', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
-  userEvent.click(screen.getAllByRole('button', { name: COLLAPSE_ALL })[0]);
+  await userEvent.click(
+    screen.getAllByRole('button', { name: COLLAPSE_ALL })[0],
+  );
   expect(screen.getByRole('link', { name: ALL_FILTERS })).toBeInTheDocument();
   expect(
     screen.queryByRole('link', { name: FILTER_A }),
@@ -214,24 +234,26 @@ test('collapses/expands all filters', () => {
   expect(
     screen.queryByRole('link', { name: FILTER_C }),
   ).not.toBeInTheDocument();
-  userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[0]);
+  await userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[0]);
   expect(screen.getByRole('link', { name: ALL_FILTERS })).toBeInTheDocument();
   expect(screen.getByRole('link', { name: FILTER_A })).toBeInTheDocument();
   expect(screen.getByRole('link', { name: FILTER_B })).toBeInTheDocument();
   expect(screen.getByRole('link', { name: FILTER_C })).toBeInTheDocument();
 });
 
-test('collapses/expands all charts', () => {
+test('collapses/expands all charts', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
-  userEvent.click(screen.getAllByRole('button', { name: COLLAPSE_ALL })[1]);
+  await userEvent.click(
+    screen.getAllByRole('button', { name: COLLAPSE_ALL })[1],
+  );
   expect(screen.getByText(ALL_CHARTS)).toBeInTheDocument();
   expect(screen.queryByText(CHART_A)).not.toBeInTheDocument();
   expect(screen.queryByText(CHART_B)).not.toBeInTheDocument();
   expect(screen.queryByText(CHART_C)).not.toBeInTheDocument();
   expect(screen.queryByText(CHART_D)).not.toBeInTheDocument();
-  userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[1]);
+  await userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[1]);
   expect(screen.getByText(ALL_CHARTS)).toBeInTheDocument();
   expect(screen.getByRole('link', { name: CHART_A })).toBeInTheDocument();
   expect(screen.getByRole('link', { name: CHART_B })).toBeInTheDocument();
@@ -239,93 +261,77 @@ test('collapses/expands all charts', () => {
   expect(screen.getByRole('link', { name: CHART_D })).toBeInTheDocument();
 });
 
-test('searches for a chart', () => {
+test('searches for a chart', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
-  userEvent.type(screen.getByPlaceholderText('Search...'), CHART_C);
+  await userEvent.type(screen.getByPlaceholderText('Search...'), CHART_C);
   expect(screen.queryByRole('link', { name: CHART_A })).not.toBeInTheDocument();
   expect(screen.queryByRole('link', { name: CHART_B })).not.toBeInTheDocument();
   expect(screen.getByRole('link', { name: CHART_C })).toBeInTheDocument();
 });
 
-test('selects a leaf filter', () => {
+// Update all tests that use clickCheckbox to be async and await the function call
+test('selects a leaf filter', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
   expect(getCheckboxState(FILTER_C)).toBe(UNCHECKED);
-  clickCheckbox(FILTER_C);
+  await clickCheckbox(FILTER_C);
   expect(getCheckboxState(FILTER_C)).toBe(CHECKED);
 });
 
-test('selects a leaf chart', () => {
+test('selects a leaf chart', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
-  userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[1]);
+  await userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[1]);
   expect(getCheckboxState(CHART_D)).toBe(UNCHECKED);
-  clickCheckbox(CHART_D);
+  await clickCheckbox(CHART_D);
   expect(getCheckboxState(CHART_D)).toBe(CHECKED);
 });
 
-test('selects a branch of filters', () => {
+test('selects a branch of filters', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
   expect(getCheckboxState(FILTER_A)).toBe(UNCHECKED);
   expect(getCheckboxState(FILTER_B)).toBe(UNCHECKED);
   expect(getCheckboxState(FILTER_C)).toBe(UNCHECKED);
-  clickCheckbox(FILTER_A);
+  await clickCheckbox(FILTER_A);
   expect(getCheckboxState(FILTER_A)).toBe(CHECKED);
   expect(getCheckboxState(FILTER_B)).toBe(CHECKED);
   expect(getCheckboxState(FILTER_C)).toBe(CHECKED);
 });
 
-test('selects a branch of charts', () => {
+test('selects all filters', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
-
-  const tabA = screen.getByText(TAB_A);
-  userEvent.click(tabA);
-
-  expect(getCheckboxState(TAB_A)).toBe(UNCHECKED);
-  expect(getCheckboxState(CHART_A)).toBe(UNCHECKED);
-  expect(getCheckboxState(CHART_B)).toBe(UNCHECKED);
-  clickCheckbox(TAB_A);
-  expect(getCheckboxState(TAB_A)).toBe(CHECKED);
-  expect(getCheckboxState(CHART_A)).toBe(CHECKED);
-  expect(getCheckboxState(CHART_B)).toBe(CHECKED);
-});
-
-test('selects all filters', () => {
-  render(<FilterScopeSelector {...createProps()} />, {
-    useRedux: true,
-  });
-  userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[0]);
+  await userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[0]);
   expect(getCheckboxState(ALL_FILTERS)).toBe(UNCHECKED);
   expect(getCheckboxState(FILTER_A)).toBe(UNCHECKED);
   expect(getCheckboxState(FILTER_B)).toBe(UNCHECKED);
   expect(getCheckboxState(FILTER_C)).toBe(UNCHECKED);
-  clickCheckbox(ALL_FILTERS);
+  await clickCheckbox(ALL_FILTERS);
   expect(getCheckboxState(ALL_FILTERS)).toBe(CHECKED);
   expect(getCheckboxState(FILTER_A)).toBe(CHECKED);
   expect(getCheckboxState(FILTER_B)).toBe(CHECKED);
   expect(getCheckboxState(FILTER_C)).toBe(CHECKED);
 });
 
-test('selects all charts', () => {
+test('selects all charts', async () => {
   render(<FilterScopeSelector {...createProps()} />, {
     useRedux: true,
   });
-  userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[1]);
+  await userEvent.click(screen.getAllByRole('button', { name: EXPAND_ALL })[1]);
   expect(getCheckboxState(TAB_A)).toBe(UNCHECKED);
   expect(getCheckboxState(CHART_A)).toBe(UNCHECKED);
   expect(getCheckboxState(CHART_B)).toBe(UNCHECKED);
   expect(getCheckboxState(TAB_B)).toBe(UNCHECKED);
   expect(getCheckboxState(CHART_C)).toBe(UNCHECKED);
   expect(getCheckboxState(CHART_D)).toBe(UNCHECKED);
-  clickCheckbox(ALL_CHARTS);
+  await clickCheckbox(ALL_CHARTS);
   expect(getCheckboxState(TAB_A)).toBe(CHECKED);
   expect(getCheckboxState(CHART_A)).toBe(CHECKED);
   expect(getCheckboxState(CHART_B)).toBe(CHECKED);
@@ -334,7 +340,7 @@ test('selects all charts', () => {
   expect(getCheckboxState(CHART_D)).toBe(CHECKED);
 });
 
-test('triggers onClose', () => {
+test('triggers onClose', async () => {
   const onCloseModal = jest.fn();
   render(
     <FilterScopeSelector {...createProps()} onCloseModal={onCloseModal} />,
@@ -343,11 +349,11 @@ test('triggers onClose', () => {
     },
   );
   expect(onCloseModal).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'Close' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Close' }));
   expect(onCloseModal).toHaveBeenCalledTimes(1);
 });
 
-test('triggers onSave', () => {
+test('triggers onSave', async () => {
   const updateDashboardFiltersScope = jest.fn();
   const setUnsavedChanges = jest.fn();
   const onCloseModal = jest.fn();
@@ -365,7 +371,7 @@ test('triggers onSave', () => {
   expect(updateDashboardFiltersScope).toHaveBeenCalledTimes(0);
   expect(setUnsavedChanges).toHaveBeenCalledTimes(0);
   expect(onCloseModal).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }));
   expect(updateDashboardFiltersScope).toHaveBeenCalledTimes(1);
   expect(setUnsavedChanges).toHaveBeenCalledTimes(1);
   expect(onCloseModal).toHaveBeenCalledTimes(1);

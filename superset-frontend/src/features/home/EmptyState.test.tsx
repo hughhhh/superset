@@ -16,11 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { styledMount as mount } from 'spec/helpers/theming';
 import { TableTab } from 'src/views/CRUD/types';
+import { render, screen } from 'spec/helpers/testing-library';
+import {
+  enableMobileConsumptionFlag,
+  mockMobileMatchMedia,
+} from 'spec/helpers/mobileTestUtils';
 import EmptyState, { EmptyStateProps } from './EmptyState';
 import { WelcomeTable } from './types';
 
+// eslint-disable-next-line no-restricted-globals -- TODO: Migrate from describe blocks
 describe('EmptyState', () => {
   const variants: EmptyStateProps[] = [
     {
@@ -62,32 +67,68 @@ describe('EmptyState', () => {
       tableName: WelcomeTable.Recents,
     },
   ];
+
   variants.forEach(variant => {
-    it(`it renders an ${variant.tab} ${variant.tableName} empty state`, () => {
-      const wrapper = mount(<EmptyState {...variant} />);
-      expect(wrapper).toExist();
-      const textContainer = wrapper.find('.ant-empty-description');
-      expect(textContainer.text()).toEqual(
-        variant.tab === TableTab.Favorite
-          ? "You don't have any favorites yet!"
-          : `No ${
-              variant.tableName === WelcomeTable.SavedQueries
-                ? 'saved queries'
-                : variant.tableName.toLowerCase()
-            } yet`,
-      );
-      expect(wrapper.find('button')).toHaveLength(1);
+    test(`renders an ${variant.tab} ${variant.tableName} empty state`, () => {
+      const { container } = render(<EmptyState {...variant} />);
+
+      // Select the first description node
+      expect(
+        container.querySelector('.ant-empty-description'),
+      ).toHaveTextContent('Nothing here yet');
+      expect(screen.getAllByRole('button')).toHaveLength(1);
     });
   });
+
   recents.forEach(recent => {
-    it(`it renders a ${recent.tab} ${recent.tableName} empty state`, () => {
-      const wrapper = mount(<EmptyState {...recent} />);
-      expect(wrapper).toExist();
-      const textContainer = wrapper.find('.ant-empty-description');
-      expect(wrapper.find('.ant-empty-image').children()).toHaveLength(1);
-      expect(textContainer.text()).toContain(
-        `Recently ${recent.tab?.toLowerCase()} charts, dashboards, and saved queries will appear here`,
+    test(`renders a ${recent.tab} ${recent.tableName} empty state`, () => {
+      const { container } = render(<EmptyState {...recent} />);
+
+      // Select the first description node
+      // Check the correct text is displayed
+      expect(
+        container.querySelector('.ant-empty-description'),
+      ).toHaveTextContent('Nothing here yet');
+
+      // Validate the image
+      expect(
+        container.querySelector('.ant-empty-image')?.children,
+      ).toHaveLength(1);
+    });
+  });
+
+  // eslint-disable-next-line no-restricted-globals -- TODO: Migrate from describe blocks
+  describe('mobile consumption mode', () => {
+    let restoreMatchMedia: () => void;
+    let restoreFlag: () => void;
+
+    beforeEach(() => {
+      restoreMatchMedia = mockMobileMatchMedia();
+      restoreFlag = enableMobileConsumptionFlag();
+    });
+
+    afterEach(() => {
+      restoreMatchMedia();
+      restoreFlag();
+    });
+
+    test('withholds the creation action for a non-favorite tab', () => {
+      render(
+        <EmptyState tab={TableTab.Mine} tableName={WelcomeTable.Dashboards} />,
       );
+
+      expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    });
+
+    test('still offers the "See all ..." action for the favorite tab', () => {
+      render(
+        <EmptyState
+          tab={TableTab.Favorite}
+          tableName={WelcomeTable.Dashboards}
+        />,
+      );
+
+      expect(screen.getAllByRole('button')).toHaveLength(1);
     });
   });
 });

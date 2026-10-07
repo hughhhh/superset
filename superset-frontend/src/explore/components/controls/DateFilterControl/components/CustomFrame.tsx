@@ -16,14 +16,19 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { isInteger } from 'lodash';
-import { t, customTimeRangeDecode } from '@superset-ui/core';
-import { InfoTooltipWithTrigger } from '@superset-ui/chart-controls';
-import { Col, Row } from 'src/components';
-import { InputNumber } from 'src/components/Input';
-import { DatePicker } from 'src/components/DatePicker';
-import { Radio } from 'src/components/Radio';
-import Select from 'src/components/Select/Select';
+import { t } from '@apache-superset/core/translation';
+import { customTimeRangeDecode } from '@superset-ui/core';
+import {
+  InfoTooltip,
+  DatePicker,
+  Select,
+  Radio,
+  AntdThemeProvider,
+  Col,
+  Row,
+  InputNumber,
+  Loading,
+} from '@superset-ui/core/components';
 import {
   SINCE_GRAIN_OPTIONS,
   SINCE_MODE_OPTIONS,
@@ -38,9 +43,7 @@ import {
   CustomRangeKey,
   FrameComponentProps,
 } from 'src/explore/components/controls/DateFilterControl/types';
-import Loading from 'src/components/Loading';
 import { Dayjs } from 'dayjs';
-import { AntdThemeProvider } from 'src/components/AntdThemeProvider';
 import { useLocale } from 'src/hooks/useLocale';
 
 export function CustomFrame(props: FrameComponentProps) {
@@ -76,7 +79,7 @@ export function CustomFrame(props: FrameComponentProps) {
     value: string | number,
   ) {
     // only positive values in grainValue controls
-    if (isInteger(value) && value > 0) {
+    if (typeof value === 'number' && Number.isInteger(value) && value > 0) {
       props.onChange(
         customTimeRangeEncode({
           ...customRange,
@@ -118,14 +121,14 @@ export function CustomFrame(props: FrameComponentProps) {
         <Row gutter={24}>
           <Col span={12}>
             <div className="control-label">
-              {t('START (INCLUSIVE)')}{' '}
-              <InfoTooltipWithTrigger
+              {t('Start (inclusive)')}{' '}
+              <InfoTooltip
                 tooltip={t('Start date included in time range')}
                 placement="right"
               />
             </div>
             <Select
-              ariaLabel={t('START (INCLUSIVE)')}
+              ariaLabel={t('Start (inclusive)')}
               options={SINCE_MODE_OPTIONS}
               value={sinceMode}
               onChange={(value: string) => onChange('sinceMode', value)}
@@ -139,11 +142,7 @@ export function CustomFrame(props: FrameComponentProps) {
                     onChange('sinceDatetime', datetime.format(DAYJS_FORMAT))
                   }
                   allowClear={false}
-                  getPopupContainer={(triggerNode: HTMLElement) =>
-                    props.isOverflowingFilterBar
-                      ? (triggerNode.parentNode as HTMLElement)
-                      : document.body
-                  }
+                  getPopupContainer={() => document.body}
                 />
               </Row>
             )}
@@ -177,14 +176,14 @@ export function CustomFrame(props: FrameComponentProps) {
           </Col>
           <Col span={12}>
             <div className="control-label">
-              {t('END (EXCLUSIVE)')}{' '}
-              <InfoTooltipWithTrigger
+              {t('End (exclusive)')}{' '}
+              <InfoTooltip
                 tooltip={t('End date excluded from time range')}
                 placement="right"
               />
             </div>
             <Select
-              ariaLabel={t('END (EXCLUSIVE)')}
+              ariaLabel={t('End (exclusive)')}
               options={UNTIL_MODE_OPTIONS}
               value={untilMode}
               onChange={(value: string) => onChange('untilMode', value)}
@@ -198,11 +197,7 @@ export function CustomFrame(props: FrameComponentProps) {
                     onChange('untilDatetime', datetime.format(DAYJS_FORMAT))
                   }
                   allowClear={false}
-                  getPopupContainer={(triggerNode: HTMLElement) =>
-                    props.isOverflowingFilterBar
-                      ? (triggerNode.parentNode as HTMLElement)
-                      : document.body
-                  }
+                  getPopupContainer={() => document.body}
                 />
               </Row>
             )}
@@ -239,18 +234,15 @@ export function CustomFrame(props: FrameComponentProps) {
             <div className="control-label">{t('Anchor to')}</div>
             <Row align="middle">
               <Col>
-                <Radio.Group
+                <Radio.GroupWrapper
+                  options={[
+                    { value: 'now', label: t('Now') },
+                    { value: 'specific', label: t('Date/Time') },
+                  ]}
                   onChange={onAnchorMode}
                   defaultValue="now"
                   value={anchorMode}
-                >
-                  <Radio key="now" value="now">
-                    {t('NOW')}
-                  </Radio>
-                  <Radio key="specific" value="specific">
-                    {t('Date/Time')}
-                  </Radio>
-                </Radio.Group>
+                />
               </Col>
               {anchorMode !== 'now' && (
                 <Col>
@@ -262,11 +254,7 @@ export function CustomFrame(props: FrameComponentProps) {
                     }
                     allowClear={false}
                     className="control-anchor-to-datetime"
-                    getPopupContainer={(triggerNode: HTMLElement) =>
-                      props.isOverflowingFilterBar
-                        ? (triggerNode.parentNode as HTMLElement)
-                        : document.body
-                    }
+                    getPopupContainer={() => document.body}
                   />
                 </Col>
               )}

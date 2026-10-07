@@ -35,8 +35,11 @@ test('LRU operations', () => {
   expect(cache.size).toBe(3);
   expect(cache.has('1')).toBeFalsy();
   expect(cache.get('1')).toBeUndefined();
+  expect(cache.values()).toEqual(['b', 'c', 'd']);
   cache.get('2');
+  expect(cache.values()).toEqual(['c', 'd', 'b']);
   cache.set('5', 'e');
+  expect(cache.values()).toEqual(['d', 'b', 'e']);
   expect(cache.has('2')).toBeTruthy();
   expect(cache.has('3')).toBeFalsy();
   // @ts-expect-error
@@ -44,9 +47,31 @@ test('LRU operations', () => {
   // @ts-expect-error
   expect(() => cache.get(0)).toThrow(TypeError);
   expect(cache.size).toBe(3);
+  expect(cache.values()).toEqual(['d', 'b', 'e']);
   cache.clear();
   expect(cache.size).toBe(0);
   expect(cache.capacity).toBe(3);
+});
+
+test('overwriting an existing key does not evict another entry', () => {
+  const cache = lruCache<string>(2);
+  cache.set('a', 'a');
+  cache.set('b', 'b');
+  cache.set('b', 'b2');
+  expect(cache.size).toBe(2);
+  expect(cache.has('a')).toBe(true);
+  expect(cache.get('b')).toBe('b2');
+});
+
+test('overwriting an existing key refreshes its recency', () => {
+  const cache = lruCache<string>(2);
+  cache.set('a', 'a');
+  cache.set('b', 'b');
+  // `a` becomes the most recently used, so `b` is evicted next
+  cache.set('a', 'a2');
+  cache.set('c', 'c');
+  expect(cache.has('b')).toBe(false);
+  expect(cache.values()).toEqual(['a2', 'c']);
 });
 
 test('LRU handle null and undefined', () => {

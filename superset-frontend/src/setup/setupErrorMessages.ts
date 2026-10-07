@@ -17,14 +17,19 @@
  * under the License.
  */
 import { ErrorTypeEnum } from '@superset-ui/core';
-import getErrorMessageComponentRegistry from 'src/components/ErrorMessage/getErrorMessageComponentRegistry';
-import TimeoutErrorMessage from 'src/components/ErrorMessage/TimeoutErrorMessage';
-import DatabaseErrorMessage from 'src/components/ErrorMessage/DatabaseErrorMessage';
-import MarshmallowErrorMessage from 'src/components/ErrorMessage/MarshmallowErrorMessage';
-import ParameterErrorMessage from 'src/components/ErrorMessage/ParameterErrorMessage';
-import DatasetNotFoundErrorMessage from 'src/components/ErrorMessage/DatasetNotFoundErrorMessage';
-import InvalidSQLErrorMessage from 'src/components/ErrorMessage/InvalidSQLErrorMessage';
-import OAuth2RedirectMessage from 'src/components/ErrorMessage/OAuth2RedirectMessage';
+import {
+  getErrorMessageComponentRegistry,
+  TimeoutErrorMessage,
+  DatabaseErrorMessage,
+  MarshmallowErrorMessage,
+  ParameterErrorMessage,
+  DatasetNotFoundErrorMessage,
+  DatasourceSecurityAccessErrorMessage,
+  InvalidSQLErrorMessage,
+  OAuth2RedirectMessage,
+  FrontendNetworkErrorMessage,
+  CsrfErrorMessage,
+} from 'src/components';
 
 import setupErrorMessagesExtra from './setupErrorMessagesExtra';
 
@@ -34,6 +39,14 @@ export default function setupErrorMessages() {
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.FRONTEND_TIMEOUT_ERROR,
     TimeoutErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.FRONTEND_NETWORK_ERROR,
+    FrontendNetworkErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.CSRF_ERROR,
+    CsrfErrorMessage,
   );
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.BACKEND_TIMEOUT_ERROR,
@@ -86,6 +99,14 @@ export default function setupErrorMessages() {
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.QUERY_SECURITY_ACCESS_ERROR,
     DatabaseErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.DATASOURCE_SECURITY_ACCESS_ERROR,
+    DatasourceSecurityAccessErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.TABLE_SECURITY_ACCESS_ERROR,
+    DatasourceSecurityAccessErrorMessage,
   );
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.CONNECTION_INVALID_HOSTNAME_ERROR,

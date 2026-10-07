@@ -16,9 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import sinon, { SinonStub } from 'sinon';
-import { Behavior, FeatureFlag } from '@superset-ui/core';
-import * as core from '@superset-ui/core';
+import { Behavior, getChartMetadataRegistry, VizType } from '@superset-ui/core';
 import { getCrossFiltersConfiguration } from './crossFilters';
 import { DEFAULT_CROSS_FILTER_SCOPING } from '../constants';
 
@@ -56,7 +54,7 @@ const CHARTS = {
     id: 1,
     form_data: {
       datasource: '2__table',
-      viz_type: core.VizType.Line,
+      viz_type: VizType.Line,
       slice_id: 1,
       color_scheme: 'supersetColors',
     },
@@ -68,7 +66,7 @@ const CHARTS = {
     latestQueryFormData: {},
     sliceFormData: {
       datasource: '2__table',
-      viz_type: core.VizType.Line,
+      viz_type: VizType.Line,
     },
     queryController: null,
     queriesResponse: [{}],
@@ -79,7 +77,7 @@ const CHARTS = {
     form_data: {
       color_scheme: 'supersetColors',
       datasource: '2__table',
-      viz_type: core.VizType.Line,
+      viz_type: VizType.Line,
       slice_id: 2,
     },
     chartAlert: null,
@@ -90,7 +88,7 @@ const CHARTS = {
     latestQueryFormData: {},
     sliceFormData: {
       datasource: '2__table',
-      viz_type: core.VizType.Line,
+      viz_type: VizType.Line,
     },
     queryController: null,
     queriesResponse: [{}],
@@ -128,30 +126,27 @@ const CHART_CONFIG_METADATA = {
   global_chart_configuration: GLOBAL_CHART_CONFIG,
 };
 
-let metadataRegistryStub: SinonStub;
+jest.mock('@superset-ui/core', () => ({
+  ...jest.requireActual('@superset-ui/core'),
+  getChartMetadataRegistry: jest.fn(),
+}));
+
+const mockedGetChartMetadataRegistry = getChartMetadataRegistry as jest.Mock;
 
 beforeEach(() => {
-  metadataRegistryStub = sinon
-    .stub(core, 'getChartMetadataRegistry')
-    .callsFake(() => ({
-      // @ts-ignore
-      get: () => ({
-        behaviors: [Behavior.InteractiveChart],
-      }),
-    }));
+  mockedGetChartMetadataRegistry.mockImplementation(() => ({
+    get: () => ({
+      behaviors: [Behavior.InteractiveChart],
+    }),
+  }));
 });
 
 afterEach(() => {
-  metadataRegistryStub.restore();
+  mockedGetChartMetadataRegistry.mockRestore();
 });
 
 test('Generate correct cross filters configuration without initial configuration', () => {
-  // @ts-ignore
-  global.featureFlags = {
-    [FeatureFlag.DashboardCrossFilters]: true,
-  };
-
-  // @ts-ignore
+  // @ts-expect-error
   expect(getCrossFiltersConfiguration(DASHBOARD_LAYOUT, {}, CHARTS)).toEqual({
     chartConfiguration: {
       '1': {
@@ -180,11 +175,6 @@ test('Generate correct cross filters configuration without initial configuration
 });
 
 test('Generate correct cross filters configuration with initial configuration', () => {
-  // @ts-ignore
-  global.featureFlags = {
-    [FeatureFlag.DashboardCrossFilters]: true,
-  };
-
   expect(
     getCrossFiltersConfiguration(
       DASHBOARD_LAYOUT,
@@ -221,25 +211,7 @@ test('Generate correct cross filters configuration with initial configuration', 
   });
 });
 
-test('Return undefined if DASHBOARD_CROSS_FILTERS feature flag is disabled', () => {
-  // @ts-ignore
-  global.featureFlags = {
-    [FeatureFlag.DashboardCrossFilters]: false,
-  };
-  expect(
-    getCrossFiltersConfiguration(
-      DASHBOARD_LAYOUT,
-      CHART_CONFIG_METADATA,
-      CHARTS,
-    ),
-  ).toEqual(undefined);
-});
-
 test('Recalculate charts in global filter scope when charts change', () => {
-  // @ts-ignore
-  global.featureFlags = {
-    [FeatureFlag.DashboardCrossFilters]: true,
-  };
   expect(
     getCrossFiltersConfiguration(
       {
@@ -266,7 +238,7 @@ test('Recalculate charts in global filter scope when charts change', () => {
           form_data: {
             slice_id: 3,
             datasource: '3__table',
-            viz_type: core.VizType.Line,
+            viz_type: VizType.Line,
             color_scheme: 'supersetColors',
           },
           chartAlert: null,
@@ -277,7 +249,7 @@ test('Recalculate charts in global filter scope when charts change', () => {
           latestQueryFormData: {},
           sliceFormData: {
             datasource: '3__table',
-            viz_type: core.VizType.Line,
+            viz_type: VizType.Line,
           },
           queryController: null,
           queriesResponse: [{}],
@@ -317,4 +289,79 @@ test('Recalculate charts in global filter scope when charts change', () => {
       chartsInScope: [1, 2, 3],
     },
   });
+});
+
+test('Global cross-filter scope includes charts from other tabs (#37665)', () => {
+  // Both charts sit under a different TAB, several layers down from ROOT_ID.
+  // A global-scope cross filter must still see across the tab boundary.
+  const TABBED_LAYOUT = {
+    ROOT_ID: {
+      children: ['TABS-1'],
+      id: 'ROOT_ID',
+      type: 'ROOT',
+    },
+    'TABS-1': {
+      children: ['TAB-1', 'TAB-2'],
+      id: 'TABS-1',
+      type: 'TABS',
+    },
+    'TAB-1': {
+      children: ['ROW-1'],
+      id: 'TAB-1',
+      type: 'TAB',
+    },
+    'TAB-2': {
+      children: ['ROW-2'],
+      id: 'TAB-2',
+      type: 'TAB',
+    },
+    'ROW-1': {
+      children: ['CHART-1'],
+      id: 'ROW-1',
+      type: 'ROW',
+    },
+    'ROW-2': {
+      children: ['CHART-2'],
+      id: 'ROW-2',
+      type: 'ROW',
+    },
+    'CHART-1': {
+      children: [],
+      id: 'CHART-1',
+      meta: {
+        chartId: 1,
+        sliceName: 'Tab 1 chart',
+        height: 1,
+        width: 1,
+        uuid: '1',
+      },
+      parents: ['ROOT_ID', 'TABS-1', 'TAB-1', 'ROW-1'],
+      type: 'CHART',
+    },
+    'CHART-2': {
+      children: [],
+      id: 'CHART-2',
+      meta: {
+        chartId: 2,
+        sliceName: 'Tab 2 chart',
+        height: 1,
+        width: 1,
+        uuid: '2',
+      },
+      parents: ['ROOT_ID', 'TABS-1', 'TAB-2', 'ROW-2'],
+      type: 'CHART',
+    },
+  };
+
+  const { chartConfiguration } = getCrossFiltersConfiguration(
+    // @ts-expect-error
+    TABBED_LAYOUT,
+    {},
+    CHARTS,
+  );
+
+  // Chart 1 (tab 1)'s global-scope config includes chart 2, in tab 2.
+  expect(chartConfiguration['1'].crossFilters.chartsInScope).toEqual([2]);
+  // ...and vice versa, proving the scope resolution isn't tab-local either way.
+  expect(chartConfiguration['2'].crossFilters.chartsInScope).toEqual([1]);
 });

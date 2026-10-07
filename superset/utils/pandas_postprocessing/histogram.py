@@ -17,7 +17,16 @@
 from __future__ import annotations
 
 import numpy as np
+from flask_babel import gettext as _
 from pandas import DataFrame, Series, to_numeric
+
+from superset.exceptions import InvalidPostProcessingError
+
+# Upper bound on the number of histogram bins. ``bins`` arrives through the
+# post-processing ``options`` dict, which is not schema-validated, so the cap
+# must be enforced here: numpy allocates a bin-edge array proportional to
+# ``bins`` (e.g. bins=2e9 attempts a ~16 GB allocation in a single request).
+MAX_HISTOGRAM_BINS = 1000
 
 
 # pylint: disable=too-many-arguments
@@ -45,11 +54,28 @@ def histogram(
                and each column corresponds to a histogram bin. The values are the counts in each bin.
     """  # noqa: E501
 
+    if (
+        not isinstance(bins, int)
+        or isinstance(bins, bool)
+        or not 1 <= bins <= MAX_HISTOGRAM_BINS
+    ):
+        raise InvalidPostProcessingError(
+            _(
+                "`bins` must be an integer between 1 and %(max)s",
+                max=MAX_HISTOGRAM_BINS,
+            )
+        )
+
     if groupby is None:
         groupby = []
 
+    # drop empty values from the target column
+    df = df.dropna(subset=[column])
+    if df.empty:
+        return df
+
     # convert to numeric, coercing errors to NaN
-    df[column] = to_numeric(df[column], errors="coerce")
+    df.loc[:, column] = to_numeric(df[column], errors="coerce")
 
     # check if the column contains non-numeric values
     if df[column].isna().any():
@@ -60,8 +86,7 @@ def histogram(
 
     # convert the bin edges to strings
     bin_edges_str = [
-        f"{int(bin_edges[i])} - {int(bin_edges[i+1])}"
-        for i in range(len(bin_edges) - 1)
+        f"{bin_edges[i]} - {bin_edges[i + 1]}" for i in range(len(bin_edges) - 1)
     ]
 
     def hist_values(series: Series) -> np.ndarray:
@@ -71,7 +96,7 @@ def histogram(
 
     if len(groupby) == 0:
         # without grouping
-        hist_dict = dict(zip(bin_edges_str, hist_values(df[column])))
+        hist_dict = dict(zip(bin_edges_str, hist_values(df[column]), strict=False))
         histogram_df = DataFrame(hist_dict, index=[0])
     else:
         # with grouping

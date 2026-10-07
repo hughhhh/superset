@@ -1,0 +1,153 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import logging
+from datetime import datetime, timedelta
+from functools import partial
+from typing import cast
+from uuid import UUID
+
+import jwt
+from marshmallow import ValidationError
+
+from superset import db, security_manager
+from superset.commands.base import BaseCommand
+from superset.commands.database.exceptions import DatabaseNotFoundError
+from superset.daos.database import DatabaseUserOAuth2TokensDAO
+from superset.daos.key_value import KeyValueDAO
+from superset.databases.schemas import OAuth2ProviderResponseSchema
+from superset.exceptions import OAuth2Error, OAuth2RejectedError
+from superset.key_value.types import JsonKeyValueCodec, KeyValueResource
+from superset.models.core import Database, DatabaseUserOAuth2Tokens
+from superset.superset_typing import OAuth2State
+from superset.utils.core import get_user_id
+from superset.utils.decorators import on_error, transaction
+from superset.utils.oauth2 import decode_oauth2_state
+
+logger = logging.getLogger(__name__)
+
+
+class OAuth2StoreTokenCommand(BaseCommand):
+    """
+    Command to store OAuth2 tokens in the database.
+    """
+
+    def __init__(self, parameters: OAuth2ProviderResponseSchema):
+        self._parameters = parameters
+        self._state: OAuth2State | None = None
+        self._database: Database | None = None
+
+    @transaction(on_error=partial(on_error, reraise=OAuth2Error))
+    def run(self) -> DatabaseUserOAuth2Tokens:
+        self.validate()
+        self._database = cast(Database, self._database)
+        self._state = cast(OAuth2State, self._state)
+
+        oauth2_config = self._database.get_oauth2_config()
+        if oauth2_config is None:
+            raise OAuth2Error("No configuration found for OAuth2")
+
+        # Look up PKCE code_verifier from KV store (RFC 7636)
+        code_verifier = None
+        tab_id = self._state["tab_id"]
+        try:
+            tab_uuid = UUID(tab_id)
+        except ValueError:
+            tab_uuid = None
+
+        if tab_uuid:
+            kv_value = KeyValueDAO.get_value(
+                resource=KeyValueResource.PKCE_CODE_VERIFIER,
+                key=tab_uuid,
+                codec=JsonKeyValueCodec(),
+            )
+            if kv_value:
+                code_verifier = kv_value.get("code_verifier")
+                KeyValueDAO.delete_entry(KeyValueResource.PKCE_CODE_VERIFIER, tab_uuid)
+
+        engine_spec = self._database.db_engine_spec
+        try:
+            token_response = engine_spec.get_oauth2_token(
+                oauth2_config,
+                self._parameters["code"],
+                code_verifier=code_verifier,
+            )
+        except Exception as ex:
+            logger.error(
+                "OAuth2 token exchange failed: database_id=%s engine=%s error_type=%s",
+                self._database.id,
+                engine_spec.engine,
+                type(ex).__name__,
+            )
+            raise OAuth2Error("Token exchange failed") from None
+
+        # delete old tokens
+        if existing := DatabaseUserOAuth2TokensDAO.find_one_or_none(
+            user_id=self._state["user_id"],
+            database_id=self._state["database_id"],
+        ):
+            DatabaseUserOAuth2TokensDAO.delete([existing])
+            # flush the delete before inserting the replacement -- the unit
+            # of work otherwise emits INSERTs before DELETEs within a single
+            # flush, which would trip the (user_id, database_id) unique
+            # index below on the old row.
+            db.session.flush()
+
+        # store tokens
+        expiration = datetime.now() + timedelta(seconds=token_response["expires_in"])
+        return DatabaseUserOAuth2TokensDAO.create(
+            attributes={
+                "user_id": self._state["user_id"],
+                "database_id": self._state["database_id"],
+                "access_token": token_response["access_token"],
+                "access_token_expiration": expiration,
+                "refresh_token": token_response.get("refresh_token"),
+            },
+        )
+
+    def validate(self) -> None:
+        if self._parameters.get("error"):
+            raise OAuth2RejectedError("The OAuth2 provider denied the request")
+
+        try:
+            state = self._parameters["state"]
+        except KeyError:
+            raise OAuth2RejectedError(
+                "The OAuth2 callback is missing the state parameter"
+            ) from None
+
+        try:
+            self._state = decode_oauth2_state(state)
+        except (jwt.PyJWTError, ValidationError):
+            raise OAuth2RejectedError("The OAuth2 state parameter is invalid") from None
+
+        # Bind the callback to the current session: require an authenticated,
+        # non-guest user whose id matches the one carried in the state.
+        user_id = get_user_id()
+        if user_id is None or security_manager.is_guest_user():
+            raise OAuth2RejectedError(
+                "The OAuth2 callback requires an authenticated user"
+            )
+        if user_id != self._state["user_id"]:
+            raise OAuth2RejectedError("The OAuth2 state belongs to a different user")
+
+        if database := DatabaseUserOAuth2TokensDAO.get_database(
+            self._state["database_id"]
+        ):
+            self._database = database
+        else:
+            raise DatabaseNotFoundError("Database not found")

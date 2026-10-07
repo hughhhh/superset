@@ -17,11 +17,11 @@
  * under the License.
  */
 import rison from 'rison';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { t } from '@apache-superset/core/translation';
 import {
   makeApi,
   SupersetClient,
-  t,
   JsonObject,
   getClientErrorObject,
 } from '@superset-ui/core';
@@ -34,14 +34,30 @@ import {
   getSSHPasswordsNeeded,
   getSSHPrivateKeysNeeded,
   getSSHPrivateKeyPasswordsNeeded,
+  getEncryptedExtraFieldsNeeded,
 } from 'src/views/CRUD/utils';
-import { FetchDataConfig } from 'src/components/ListView';
-import { FilterValue } from 'src/components/ListView/types';
+import type {
+  ListViewFetchDataConfig as FetchDataConfig,
+  ListViewFilterValue as FilterValue,
+} from 'src/components';
 import Chart, { Slice } from 'src/types/Chart';
 import copyTextToClipboard from 'src/utils/copy';
+import { getShareableUrl } from 'src/utils/navigationUtils';
 import SupersetText from 'src/utils/textUtils';
 import { DatabaseObject } from 'src/features/databases/types';
-import { FavoriteStatus, ImportResourceName } from './types';
+import {
+  subscribeRealtime,
+  subscribeRealtimeOpen,
+} from 'src/middleware/realtime';
+import {
+  FavoriteStatus,
+  FileEncryptedExtraFields,
+  ImportResourceName,
+} from './types';
+
+// Realtime list views coalesce a burst of entity-change nudges into at most one
+// batched row fetch per this window, bounding backend load under heavy churn.
+export const REALTIME_REFETCH_DEBOUNCE_MS = 1000;
 
 interface ListViewResourceState<D extends object = any> {
   loading: boolean;
@@ -52,6 +68,15 @@ interface ListViewResourceState<D extends object = any> {
   bulkSelectEnabled: boolean;
   lastFetched?: string;
 }
+
+const reservedListQueryParams = new Set([
+  'filters',
+  'order_column',
+  'order_direction',
+  'page',
+  'page_size',
+  'select_columns',
+]);
 
 const parsedErrorMessage = (
   errorMessage: Record<string, string[] | string> | string,
@@ -78,6 +103,10 @@ export function useListViewResource<D extends object = any>(
   baseFilters?: FilterValue[], // must be memoized
   initialLoadingState = true,
   selectColumns?: string[],
+  // Realtime: when enabled, the list subscribes to the entity-change nudge
+  // channel and live-patches only its currently-displayed rows (see the
+  // realtime effect below).
+  enableRealtime = false,
 ) {
   const [state, setState] = useState<ListViewResourceState<D>>({
     count: 0,
@@ -88,13 +117,21 @@ export function useListViewResource<D extends object = any>(
     bulkSelectEnabled: false,
   });
 
-  function updateState(update: Partial<ListViewResourceState<D>>) {
-    setState(currentState => ({ ...currentState, ...update }));
-  }
+  const updateState = useCallback(
+    (update: Partial<ListViewResourceState<D>>) => {
+      setState(currentState => ({ ...currentState, ...update }));
+    },
+    [],
+  );
 
   function toggleBulkSelect() {
     updateState({ bulkSelectEnabled: !state.bulkSelectEnabled });
   }
+
+  const handleErrorMsgRef = useRef(handleErrorMsg);
+  useEffect(() => {
+    handleErrorMsgRef.current = handleErrorMsg;
+  });
 
   useEffect(() => {
     if (!infoEnable) return;
@@ -109,7 +146,7 @@ export function useListViewResource<D extends object = any>(
         });
       },
       createErrorHandler(errMsg =>
-        handleErrorMsg(
+        handleErrorMsgRef.current(
           t(
             'An error occurred while fetching %s info: %s',
             resourceLabel,
@@ -118,15 +155,21 @@ export function useListViewResource<D extends object = any>(
         ),
       ),
     );
-  }, []);
+  }, [infoEnable, resource, resourceLabel, updateState]);
 
-  function hasPerm(perm: string) {
-    if (!state.permissions.length) {
-      return false;
-    }
+  const hasPerm = useCallback(
+    (perm: string) => {
+      if (!state.permissions.length) {
+        return false;
+      }
 
-    return Boolean(state.permissions.find(p => p === perm));
-  }
+      return Boolean(state.permissions.some(p => p === perm));
+    },
+    [state.permissions],
+  );
+
+  const lastFetchDataConfigRef = useRef<FetchDataConfig | null>(null);
+  const latestRequestIdRef = useRef(0);
 
   const fetchData = useCallback(
     ({
@@ -134,20 +177,29 @@ export function useListViewResource<D extends object = any>(
       pageSize,
       sortBy,
       filters: filterValues,
+      extraQueryParams,
     }: FetchDataConfig) => {
+      const requestId = latestRequestIdRef.current + 1;
+      latestRequestIdRef.current = requestId;
+      const isLatest = () => latestRequestIdRef.current === requestId;
+      const config: FetchDataConfig = {
+        filters: filterValues,
+        pageIndex,
+        pageSize,
+        sortBy,
+        extraQueryParams,
+      };
+      lastFetchDataConfigRef.current = config;
       // set loading state, cache the last config for refreshing data.
       updateState({
-        lastFetchDataConfig: {
-          filters: filterValues,
-          pageIndex,
-          pageSize,
-          sortBy,
-        },
+        lastFetchDataConfig: config,
         loading: true,
       });
-
       const filterExps = (baseFilters || [])
         .concat(filterValues)
+        .filter(
+          ({ value }) => value !== '' && value !== null && value !== undefined,
+        )
         .map(({ id, operator: opr, value }) => ({
           col: id,
           opr,
@@ -157,7 +209,13 @@ export function useListViewResource<D extends object = any>(
               : value,
         }));
 
+      const safeExtraQueryParams = Object.fromEntries(
+        Object.entries(extraQueryParams ?? {}).filter(
+          ([key]) => !reservedListQueryParams.has(key),
+        ),
+      );
       const queryParams = rison.encode_uri({
+        ...safeExtraQueryParams,
         order_column: sortBy[0].id,
         order_direction: sortBy[0].desc ? 'desc' : 'asc',
         page: pageIndex,
@@ -171,28 +229,155 @@ export function useListViewResource<D extends object = any>(
       })
         .then(
           ({ json = {} }) => {
+            if (!isLatest()) {
+              return;
+            }
             updateState({
               collection: json.result,
               count: json.count,
               lastFetched: new Date().toISOString(),
             });
           },
-          createErrorHandler(errMsg =>
-            handleErrorMsg(
-              t(
-                'An error occurred while fetching %ss: %s',
-                resourceLabel,
-                errMsg,
-              ),
-            ),
-          ),
+          createErrorHandler(errMsg => {
+            if (isLatest()) {
+              handleErrorMsg(
+                t(
+                  'An error occurred while fetching %ss: %s',
+                  resourceLabel,
+                  errMsg,
+                ),
+              );
+            }
+          }),
         )
         .finally(() => {
-          updateState({ loading: false });
+          if (isLatest()) {
+            updateState({ loading: false });
+          }
         });
     },
-    [baseFilters],
+    [
+      baseFilters,
+      handleErrorMsg,
+      resource,
+      resourceLabel,
+      selectColumns,
+      updateState,
+    ],
   );
+
+  const refreshData = useCallback(
+    (provideConfig?: FetchDataConfig) => {
+      if (lastFetchDataConfigRef.current) {
+        return fetchData(lastFetchDataConfigRef.current);
+      }
+      if (provideConfig) {
+        return fetchData(provideConfig);
+      }
+      return null;
+    },
+    [fetchData],
+  );
+
+  // Realtime list updates: on an entity-change nudge for a row currently on
+  // screen, debounce-collect the ids and batch-refetch just those rows through
+  // the normal authorized list endpoint (authz/RLS still apply), merging them in
+  // place. Update-only — no new-row insertion — and best-effort, so a downed
+  // socket just defers the update to the next normal fetch.
+  const collectionRef = useRef(state.collection);
+  collectionRef.current = state.collection;
+
+  useEffect(() => {
+    if (!enableRealtime) return undefined;
+
+    const pendingIds = new Set<string>();
+    let debounceId: ReturnType<typeof setTimeout> | undefined;
+
+    // Nudges carry the row's integer primary key (see superset/tasks/manager.py),
+    // which is also what the list endpoint filters on.
+    const rowId = (row: D): string =>
+      String((row as Record<string, unknown>).id);
+    const isDisplayed = (id: string): boolean =>
+      collectionRef.current.some(row => rowId(row) === id);
+
+    // Batch-fetch the given displayed rows and merge them in place (keep order,
+    // count, and untouched row references so React re-renders only changed rows).
+    const patchRows = (ids: string[]) => {
+      if (!ids.length) return;
+      // Snapshot the latest full-fetch request id; if a newer page/filter/refresh
+      // (fetchData) lands before this background patch resolves, discard the patch
+      // so a stale reconcile snapshot can't overwrite fresher rows by id.
+      const requestId = latestRequestIdRef.current;
+      const query = rison.encode_uri({
+        filters: [{ col: 'id', opr: 'in', value: ids }],
+        page: 0,
+        page_size: ids.length,
+      });
+      SupersetClient.get({ endpoint: `/api/v1/${resource}/?q=${query}` })
+        .then(({ json = {} }) => {
+          if (latestRequestIdRef.current !== requestId) return;
+          const fetched: D[] = json.result ?? [];
+          if (!fetched.length) return;
+          const byId = new Map(fetched.map(row => [rowId(row), row]));
+          setState(current => ({
+            ...current,
+            collection: current.collection.map(
+              row => byId.get(rowId(row)) ?? row,
+            ),
+          }));
+        })
+        .catch(() => {
+          // Best-effort: a failed patch just leaves the stale rows until the
+          // next normal fetch; never surface a toast for a background refresh.
+        });
+    };
+
+    const flush = () => {
+      debounceId = undefined;
+      // Re-check membership: the collection may have changed (paged/filtered)
+      // since the nudges arrived, so only fetch rows still on screen.
+      const ids = [...pendingIds].filter(isDisplayed);
+      pendingIds.clear();
+      patchRows(ids);
+    };
+
+    // `entity.changed` nudges are broadcast for every entity type; filter to this
+    // list's resource by the payload's entity_type before matching rows.
+    const unsubscribe = subscribeRealtime(
+      'entity.changed',
+      (payload: unknown) => {
+        if (!payload || typeof payload !== 'object') return;
+        const { entity_type: entityType, id } = payload as {
+          entity_type?: unknown;
+          id?: unknown;
+        };
+        if (entityType !== resource || id == null) return;
+        const idStr = String(id);
+        if (!isDisplayed(idStr)) return;
+        pendingIds.add(idStr);
+        if (debounceId === undefined) {
+          debounceId = setTimeout(flush, REALTIME_REFETCH_DEBOUNCE_MS);
+        }
+      },
+    );
+
+    // Nudges are lossy and not replayed, so after recovering from a dropped
+    // socket refetch the currently-displayed rows once to reconcile anything
+    // missed while disconnected. Only on a real `reconnect` — not the initial
+    // connect (rows were just fetched) or a seamless `keepalive` token refresh —
+    // so a healthy socket doesn't trigger a full re-fetch every keepalive cycle.
+    // In-place merge, no full-list redraw.
+    const unsubscribeOpen = subscribeRealtimeOpen(reason => {
+      if (reason !== 'reconnect') return;
+      patchRows(collectionRef.current.map(rowId));
+    });
+
+    return () => {
+      unsubscribe();
+      unsubscribeOpen();
+      if (debounceId !== undefined) clearTimeout(debounceId);
+    };
+  }, [enableRealtime, resource]);
 
   return {
     state: {
@@ -209,15 +394,7 @@ export function useListViewResource<D extends object = any>(
     hasPerm,
     fetchData,
     toggleBulkSelect,
-    refreshData: (provideConfig?: FetchDataConfig) => {
-      if (state.lastFetchDataConfig) {
-        return fetchData(state.lastFetchDataConfig);
-      }
-      if (provideConfig) {
-        return fetchData(provideConfig);
-      }
-      return null;
-    },
+    refreshData,
   };
 }
 
@@ -228,11 +405,14 @@ interface SingleViewResourceState<D extends object = any> {
   error: any | null;
 }
 
-export function useSingleViewResource<D extends object = any>(
+export function useSingleViewResource<
+  D extends object = any,
+  P extends object = D,
+>(
   resourceName: string,
   resourceLabel: string, // resourceLabel for translations
   handleErrorMsg: (errorMsg: string) => void,
-  path_suffix = '',
+  pathSuffix = '',
 ) {
   const [state, setState] = useState<SingleViewResourceState<D>>({
     loading: false,
@@ -240,9 +420,12 @@ export function useSingleViewResource<D extends object = any>(
     error: null,
   });
 
-  function updateState(update: Partial<SingleViewResourceState<D>>) {
-    setState(currentState => ({ ...currentState, ...update }));
-  }
+  const updateState = useCallback(
+    (update: Partial<SingleViewResourceState<D>>) => {
+      setState(currentState => ({ ...currentState, ...update }));
+    },
+    [],
+  );
 
   const fetchResource = useCallback(
     (resourceID: number) => {
@@ -253,7 +436,7 @@ export function useSingleViewResource<D extends object = any>(
 
       const baseEndpoint = `/api/v1/${resourceName}/${resourceID}`;
       const endpoint =
-        path_suffix !== '' ? `${baseEndpoint}/${path_suffix}` : baseEndpoint;
+        pathSuffix !== '' ? `${baseEndpoint}/${pathSuffix}` : baseEndpoint;
       return SupersetClient.get({
         endpoint,
       })
@@ -283,11 +466,11 @@ export function useSingleViewResource<D extends object = any>(
           updateState({ loading: false });
         });
     },
-    [handleErrorMsg, resourceName, resourceLabel],
+    [handleErrorMsg, pathSuffix, resourceName, resourceLabel, updateState],
   );
 
   const createResource = useCallback(
-    (resource: D, hideToast = false) => {
+    (resource: P, hideToast = false) => {
       // Set loading state
       updateState({
         loading: true,
@@ -327,11 +510,11 @@ export function useSingleViewResource<D extends object = any>(
           updateState({ loading: false });
         });
     },
-    [handleErrorMsg, resourceName, resourceLabel],
+    [handleErrorMsg, resourceName, resourceLabel, updateState],
   );
 
   const updateResource = useCallback(
-    (resourceID: number, resource: D, hideToast = false, setLoading = true) => {
+    (resourceID: number, resource: P, hideToast = false, setLoading = true) => {
       // Set loading state
       if (setLoading) {
         updateState({
@@ -376,7 +559,7 @@ export function useSingleViewResource<D extends object = any>(
           }
         });
     },
-    [handleErrorMsg, resourceName, resourceLabel],
+    [handleErrorMsg, resourceName, resourceLabel, updateState],
   );
 
   const clearError = () =>
@@ -404,6 +587,7 @@ interface ImportResourceState {
   sshPasswordNeeded: string[];
   sshPrivateKeyNeeded: string[];
   sshPrivateKeyPasswordNeeded: string[];
+  encryptedExtraFieldsNeeded: FileEncryptedExtraFields[];
   failed: boolean;
 }
 
@@ -419,21 +603,24 @@ export function useImportResource(
     sshPasswordNeeded: [],
     sshPrivateKeyNeeded: [],
     sshPrivateKeyPasswordNeeded: [],
+    encryptedExtraFieldsNeeded: [],
     failed: false,
   });
 
-  function updateState(update: Partial<ImportResourceState>) {
+  const updateState = useCallback((update: Partial<ImportResourceState>) => {
     setState(currentState => ({ ...currentState, ...update }));
-  }
+  }, []);
 
   const importResource = useCallback(
-    (
+    async (
       bundle: File,
       databasePasswords: Record<string, string> = {},
       sshTunnelPasswords: Record<string, string> = {},
       sshTunnelPrivateKey: Record<string, string> = {},
       sshTunnelPrivateKeyPasswords: Record<string, string> = {},
+      encryptedExtraSecrets: Record<string, Record<string, string>> = {},
       overwrite = false,
+      overwriteAll = false,
     ) => {
       // Set loading state
       updateState({
@@ -459,6 +646,9 @@ export function useImportResource(
        */
       if (overwrite) {
         formData.append('overwrite', 'true');
+        // this will be rechecked in the backend
+        // but no harm to only send it if overwrite is true
+        formData.append('overwrite_all', overwriteAll ? 'true' : 'false');
       }
       /* The import bundle may contain ssh tunnel passwords; if required
        * they should be provided by the user during import.
@@ -487,6 +677,18 @@ export function useImportResource(
           JSON.stringify(sshTunnelPrivateKeyPasswords),
         );
       }
+      /* The import bundle may contain masked_encrypted_extra; if required
+       * the secrets should be provided by the user during import.
+       */
+      if (
+        encryptedExtraSecrets &&
+        Object.keys(encryptedExtraSecrets).length > 0
+      ) {
+        formData.append(
+          'encrypted_extra_secrets',
+          JSON.stringify(encryptedExtraSecrets),
+        );
+      }
 
       return SupersetClient.post({
         endpoint: `/api/v1/${resourceName}/import/`,
@@ -500,6 +702,7 @@ export function useImportResource(
             sshPasswordNeeded: [],
             sshPrivateKeyNeeded: [],
             sshPrivateKeyPasswordNeeded: [],
+            encryptedExtraFieldsNeeded: [],
             failed: false,
           });
           return true;
@@ -538,6 +741,9 @@ export function useImportResource(
                 sshPrivateKeyPasswordNeeded: getSSHPrivateKeyPasswordsNeeded(
                   error.errors,
                 ),
+                encryptedExtraFieldsNeeded: getEncryptedExtraFieldsNeeded(
+                  error.errors,
+                ),
                 alreadyExists: getAlreadyExists(error.errors),
               });
             }
@@ -548,7 +754,7 @@ export function useImportResource(
           updateState({ loading: false });
         });
     },
-    [],
+    [handleErrorMsg, resourceLabel, resourceName, updateState],
   );
 
   return { state, importResource };
@@ -586,8 +792,11 @@ export function useFavoriteStatus(
 ) {
   const [favoriteStatus, setFavoriteStatus] = useState<FavoriteStatus>({});
 
-  const updateFavoriteStatus = (update: FavoriteStatus) =>
-    setFavoriteStatus(currentState => ({ ...currentState, ...update }));
+  const updateFavoriteStatus = useCallback(
+    (update: FavoriteStatus) =>
+      setFavoriteStatus(currentState => ({ ...currentState, ...update })),
+    [],
+  );
 
   useEffect(() => {
     if (!ids.length) {
@@ -595,10 +804,13 @@ export function useFavoriteStatus(
     }
     favoriteApis[type](ids).then(
       ({ result }) => {
-        const update = result.reduce((acc, element) => {
-          acc[element.id] = element.value;
-          return acc;
-        }, {});
+        const update = result.reduce<Record<string, boolean>>(
+          (acc, element) => {
+            acc[element.id] = element.value;
+            return acc;
+          },
+          {},
+        );
         updateFavoriteStatus(update);
       },
       createErrorHandler(errMsg =>
@@ -607,7 +819,7 @@ export function useFavoriteStatus(
         ),
       ),
     );
-  }, [ids, type, handleErrorMsg]);
+  }, [ids, type, handleErrorMsg, updateFavoriteStatus]);
 
   const saveFaveStar = useCallback(
     (id: number, isStarred: boolean) => {
@@ -631,7 +843,7 @@ export function useFavoriteStatus(
         ),
       );
     },
-    [type],
+    [handleErrorMsg, type, updateFavoriteStatus],
   );
 
   return [saveFaveStar, favoriteStatus] as const;
@@ -644,7 +856,7 @@ export const useChartEditModal = (
   const [sliceCurrentlyEditing, setSliceCurrentlyEditing] =
     useState<Slice | null>(null);
 
-  function openChartEditModal(chart: Chart) {
+  const openChartEditModal = useCallback((chart: Chart) => {
     setSliceCurrentlyEditing({
       slice_id: chart.id,
       slice_name: chart.slice_name,
@@ -654,11 +866,11 @@ export const useChartEditModal = (
       certification_details: chart.certification_details,
       is_managed_externally: chart.is_managed_externally,
     });
-  }
+  }, []);
 
-  function closeChartEditModal() {
+  const closeChartEditModal = useCallback(() => {
     setSliceCurrentlyEditing(null);
-  }
+  }, []);
 
   function handleChartUpdated(edits: Chart) {
     // update the chart in our state with the edited info
@@ -682,7 +894,7 @@ export const copyQueryLink = (
   addSuccessToast: (arg0: string) => void,
 ) => {
   copyTextToClipboard(() =>
-    Promise.resolve(`${window.location.origin}/sqllab?savedQueryId=${id}`),
+    Promise.resolve(getShareableUrl(`/sqllab?savedQueryId=${id}`)),
   )
     .then(() => {
       addSuccessToast(t('Link Copied!'));
@@ -692,9 +904,9 @@ export const copyQueryLink = (
     });
 };
 
-export const getDatabaseImages = () => SupersetText.DB_IMAGES;
+export const getDatabaseImages = () => SupersetText?.DB_IMAGES;
 
-export const getConnectionAlert = () => SupersetText.DB_CONNECTION_ALERTS;
+export const getConnectionAlert = () => SupersetText?.DB_CONNECTION_ALERTS;
 export const getDatabaseDocumentationLinks = () =>
   SupersetText.DB_CONNECTION_DOC_LINKS;
 
@@ -750,137 +962,134 @@ export function useDatabaseValidation() {
   const [validationErrors, setValidationErrors] = useState<JsonObject | null>(
     null,
   );
-  const getValidation = useCallback(
-    (database: Partial<DatabaseObject> | null, onCreate = false) => {
-      if (database?.parameters?.ssh) {
-        // TODO: /validate_parameters/ and related utils should support ssh tunnel
-        setValidationErrors(null);
-        return [];
-      }
+  const [isValidating, setIsValidating] = useState(false);
+  const [hasValidated, setHasValidated] = useState(false);
+  const latestRequestIdRef = useRef(0);
 
-      return (
-        SupersetClient.post({
+  const getValidation = useCallback(
+    async (database: Partial<DatabaseObject> | null, onCreate = false) => {
+      const requestId = latestRequestIdRef.current + 1;
+      latestRequestIdRef.current = requestId;
+      const isLatest = () => latestRequestIdRef.current === requestId;
+      setIsValidating(true);
+
+      try {
+        await SupersetClient.post({
           endpoint: '/api/v1/database/validate_parameters/',
           body: JSON.stringify(transformDB(database)),
           headers: { 'Content-Type': 'application/json' },
-        })
-          .then(() => {
-            setValidationErrors(null);
-          })
-          // eslint-disable-next-line consistent-return
-          .catch(e => {
-            if (typeof e.json === 'function') {
-              return e.json().then(({ errors = [] }: JsonObject) => {
-                const parsedErrors = errors
-                  .filter((error: { error_type: string }) => {
-                    const skipValidationError = ![
-                      'CONNECTION_MISSING_PARAMETERS_ERROR',
-                      'CONNECTION_ACCESS_DENIED_ERROR',
-                    ].includes(error.error_type);
-                    return skipValidationError || onCreate;
-                  })
-                  .reduce(
-                    (
-                      obj: {},
-                      {
-                        error_type,
-                        extra,
-                        message,
-                      }: {
-                        error_type: string;
-                        extra: {
-                          invalid?: string[];
-                          missing?: string[];
-                          name: string;
-                          catalog: {
-                            name: string;
-                            url: string;
-                            idx: number;
-                          };
-                          issue_codes?: {
-                            code?: number;
-                            message?: string;
-                          }[];
-                        };
-                        message: string;
-                      },
-                    ) => {
-                      if (extra.catalog) {
-                        if (extra.catalog.name) {
-                          return {
-                            ...obj,
-                            error_type,
-                            [extra.catalog.idx]: {
-                              name: message,
-                            },
-                          };
-                        }
-                        if (extra.catalog.url) {
-                          return {
-                            ...obj,
-                            error_type,
-                            [extra.catalog.idx]: {
-                              url: message,
-                            },
-                          };
-                        }
+        });
+        // Stale responses return ``null`` so callers can tell the result
+        // apart from a real, current outcome and skip caching it.
+        if (!isLatest()) return null;
+        setValidationErrors(null);
+        setIsValidating(false);
+        setHasValidated(true);
+        return [];
+      } catch (error) {
+        if (typeof error.json === 'function') {
+          return error.json().then(({ errors = [] }) => {
+            const parsedErrors = errors
+              .filter((err: { error_type: string; extra?: JsonObject }) => {
+                const allowed = [
+                  'CONNECTION_MISSING_PARAMETERS_ERROR',
+                  'CONNECTION_ACCESS_DENIED_ERROR',
+                  'INVALID_PAYLOAD_SCHEMA_ERROR',
+                ];
+                // SSH-tunnel section errors carry their own ``ssh_tunnel``
+                // marker and need to surface during blur validation too,
+                // otherwise feature-gate failures become invisible
+                // blockers (the save guard would still trip but with no
+                // hint about why).
+                if (err.extra?.ssh_tunnel) return true;
+                return allowed.includes(err.error_type) || onCreate;
+              })
+              .reduce((acc: JsonObject, err2: any) => {
+                const { message, extra } = err2;
 
-                        return {
-                          ...obj,
-                          error_type,
-                          [extra.catalog.idx]: {
-                            name: message,
-                            url: message,
-                          },
-                        };
-                      }
-                      // if extra.invalid doesn't exist then the
-                      // error can't be mapped to a parameter
-                      // so leave it alone
-                      if (extra.invalid) {
-                        return {
-                          ...obj,
-                          [extra.invalid[0]]: message,
-                          error_type,
-                        };
-                      }
-                      if (extra.missing) {
-                        return {
-                          ...obj,
-                          error_type,
-                          ...Object.assign(
-                            {},
-                            ...extra.missing.map(field => ({
-                              [field]: 'This is a required field',
-                            })),
-                          ),
-                        };
-                      }
-                      if (extra.issue_codes?.length) {
-                        return {
-                          ...obj,
-                          error_type,
-                          description: message || extra.issue_codes[0]?.message,
-                        };
-                      }
+                if (extra?.catalog) {
+                  const { idx } = extra.catalog;
+                  acc[idx] = {
+                    ...acc[idx],
+                    ...(extra.catalog.name ? { name: message } : {}),
+                    ...(extra.catalog.url ? { url: message } : {}),
+                  };
+                  return acc;
+                }
 
-                      return obj;
-                    },
-                    {},
-                  );
-                setValidationErrors(parsedErrors);
-                return parsedErrors;
-              });
-            }
-            // eslint-disable-next-line no-console
-            console.error(e);
-          })
-      );
+                if (extra?.ssh_tunnel) {
+                  // Field-level errors come in via ``extra.missing``;
+                  // section-level errors (e.g. feature flag disabled) do
+                  // not name a specific field, so preserve the server
+                  // message under a reserved ``_error`` key so the SSH
+                  // form can render it instead of silently dropping it.
+                  const missingFields = extra.missing ?? [];
+                  acc.ssh_tunnel = {
+                    ...acc.ssh_tunnel,
+                    ...Object.fromEntries(
+                      missingFields.map((field: string) => [
+                        field,
+                        'This is a required field',
+                      ]),
+                    ),
+                    ...(missingFields.length === 0 && message
+                      ? { _error: message }
+                      : {}),
+                  };
+                  return acc;
+                }
+
+                if (extra?.invalid) {
+                  extra.invalid.forEach((field: string) => {
+                    acc[field] = message;
+                  });
+                }
+
+                if (extra?.missing) {
+                  extra.missing.forEach((field1: string) => {
+                    acc[field1] = 'This is a required field';
+                  });
+                }
+
+                if (extra?.issue_codes?.length) {
+                  acc.description = message || extra.issue_codes[0]?.message;
+                }
+
+                return acc;
+              }, {});
+
+            if (!isLatest()) return null;
+            setValidationErrors(parsedErrors);
+            setIsValidating(false);
+            setHasValidated(true);
+            return parsedErrors;
+          });
+        }
+
+        console.error('Unexpected error during validation:', error);
+        // A request that produced no usable response (network drop, no JSON
+        // body) is not a completed validation cycle, so ``hasValidated``
+        // must stay false: otherwise the Connect button would enable
+        // without any real result. The blur snapshot is not cached for
+        // ``null`` results, so the next blur retries.
+        if (isLatest()) {
+          setIsValidating(false);
+          setHasValidated(false);
+        }
+        return null;
+      }
     },
     [setValidationErrors],
   );
 
-  return [validationErrors, getValidation, setValidationErrors] as const;
+  return [
+    validationErrors,
+    getValidation,
+    setValidationErrors,
+    isValidating,
+    hasValidated,
+    setHasValidated,
+  ] as const;
 }
 
 export const reportSelector = (

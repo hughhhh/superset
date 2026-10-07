@@ -17,7 +17,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Maybe, QueryFormMetric } from '../../types';
+import { Currency, Maybe, QueryFormMetric } from '../../types';
 import { Column } from './Column';
 
 export type Aggregate =
@@ -25,8 +25,11 @@ export type Aggregate =
   | 'COUNT'
   | 'COUNT_DISTINCT'
   | 'MAX'
+  | 'MEDIAN'
   | 'MIN'
-  | 'SUM';
+  | 'STDDEV_SAMP'
+  | 'SUM'
+  | 'VAR_SAMP';
 
 export interface AdhocMetricBase {
   hasCustomLabel?: boolean;
@@ -60,12 +63,13 @@ export type SavedMetric = string;
  */
 export interface Metric {
   id?: number;
+  uuid: string;
   metric_name: string;
   expression?: Maybe<string>;
   certification_details?: Maybe<string>;
   certified_by?: Maybe<string>;
   d3format?: Maybe<string>;
-  currency?: Maybe<string>;
+  currency?: Maybe<Currency>;
   description?: Maybe<string>;
   is_certified?: boolean;
   verbose_name?: string;
@@ -93,5 +97,3 @@ export function isQueryFormMetric(metric: any): metric is QueryFormMetric {
     isAdhocMetricSQL(metric)
   );
 }
-
-export default {};

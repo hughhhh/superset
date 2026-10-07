@@ -16,8 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import AdhocFilter from 'src/explore/components/controls/FilterControl/AdhocFilter';
 import AdhocFilterPopoverTrigger from '.';
 import { Clauses, ExpressionTypes } from '../types';
@@ -46,14 +45,14 @@ test('should render', () => {
   expect(container).toBeInTheDocument();
 });
 
-test('should render the Popover on click when uncontrolled', () => {
+test('should render the Popover on click when uncontrolled', async () => {
   render(
     <AdhocFilterPopoverTrigger {...mockedProps}>
       Click
     </AdhocFilterPopoverTrigger>,
   );
   expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
-  userEvent.click(screen.getByText('Click'));
+  await userEvent.click(screen.getByText('Click'));
   expect(screen.getByRole('tooltip')).toBeInTheDocument();
 });
 

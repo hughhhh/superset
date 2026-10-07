@@ -27,12 +27,12 @@ from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
 from superset.models.sql_lab import Query
 from superset.utils.core import backend
 from superset.utils.database import get_example_database
-from tests.integration_tests.db_engine_specs.base_tests import TestDbEngineSpec
+from tests.integration_tests.base_tests import SupersetTestCase
 from tests.integration_tests.fixtures.certificates import ssl_certificate
 from tests.integration_tests.fixtures.database import default_db_extra
 
 
-class TestPostgresDbEngineSpec(TestDbEngineSpec):
+class TestPostgresDbEngineSpec(SupersetTestCase):
     def test_get_table_names(self):
         """
         DB Eng Specs (postgres): Test get table names
@@ -491,6 +491,7 @@ def test_base_parameters_mixin():
                 "minimum": 0,
                 "maximum": 65536,
                 "description": "Database port",
+                "nullable": True,
             },
             "password": {"type": "string", "nullable": True, "description": "Password"},
             "username": {"type": "string", "nullable": True, "description": "Username"},
@@ -504,7 +505,9 @@ def test_base_parameters_mixin():
                 "type": "boolean",
             },
         },
-        "required": ["database", "host", "port", "username"],
+        # ``port`` is intentionally not required: a blank port falls back to
+        # Postgres's own default (5432) in ``PostgresEngineSpec.build_sqlalchemy_uri``.
+        "required": ["database", "host", "username"],
     }
 
 

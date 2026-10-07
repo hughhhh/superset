@@ -23,8 +23,13 @@ from superset.commands.dashboard.filter_state.create import CreateFilterStateCom
 from superset.commands.dashboard.filter_state.delete import DeleteFilterStateCommand
 from superset.commands.dashboard.filter_state.get import GetFilterStateCommand
 from superset.commands.dashboard.filter_state.update import UpdateFilterStateCommand
+from superset.commands.temporary_cache.exceptions import (
+    TemporaryCacheAccessDeniedError,
+    TemporaryCacheResourceNotFoundError,
+)
+from superset.commands.temporary_cache.parameters import CommandParameters
 from superset.extensions import event_logger
-from superset.temporary_cache.api import TemporaryCacheRestApi
+from superset.temporary_cache.api import CODEC, TemporaryCacheRestApi
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,80 @@ class DashboardFilterStateRestApi(TemporaryCacheRestApi):
               application/json:
                 schema:
                   $ref: '#/components/schemas/TemporaryCachePostSchema'
+                examples:
+                  time_grain_filter:
+                    summary: "Time Grain Filter"
+                    description: "**This body should be stringified and put into the
+                    value field.**"
+                    value:
+                      id: NATIVE_FILTER_ID
+                      extraFormData:
+                        time_grain_sqla: "P1W/1970-01-03T00:00:00Z"
+                      filterState:
+                        label: "Week ending Saturday"
+                        value:
+                          - "P1W/1970-01-03T00:00:00Z"
+                  timecolumn_filter:
+                    summary: "Time Column Filter"
+                    description: "**This body should be stringified and put into the
+                    value field.**"
+                    value:
+                      id: NATIVE_FILTER_ID
+                      extraFormData:
+                        granularity_sqla: "order_date"
+                      filterState:
+                        value:
+                          - "order_date"
+                  time_range_filter:
+                    summary: "Time Range Filter"
+                    description: "**This body should be stringified and put into the
+                    value field.**"
+                    value:
+                      id: NATIVE_FILTER_ID
+                      extraFormData:
+                        time_range: >-
+                          DATEADD(DATETIME('2025-01-16T00:00:00'), -7, day)
+                          : 2025-01-16T00:00:00
+                      filterState:
+                        value: >-
+                          DATEADD(DATETIME('2025-01-16T00:00:00'), -7, day)
+                          : 2025-01-16T00:00:00
+                  numerical_range_filter:
+                    summary: "Numerical Range Filter"
+                    description: "**This body should be stringified and put into the
+                    value field.**"
+                    value:
+                      id: NATIVE_FILTER_ID
+                      extraFormData:
+                        filters:
+                          - col: "tz_offset"
+                            op: ">="
+                            val:
+                              - 1000
+                          - col: "tz_offset"
+                            op: "<="
+                            val:
+                              - 2000
+                      filterState:
+                        value:
+                          - 1000
+                          - 2000
+                        label: "1000 <= x <= 2000"
+                  value_filter:
+                    summary: "Value Filter"
+                    description: "**This body should be stringified and put into the
+                    value field.**"
+                    value:
+                      id: NATIVE_FILTER_ID
+                      extraFormData:
+                        filters:
+                          - col: "real_name"
+                            op: "IN"
+                            val:
+                              - "John Doe"
+                      filterState:
+                        value:
+                          - "John Doe"
           responses:
             201:
               description: The value was stored successfully.
@@ -182,6 +261,14 @@ class DashboardFilterStateRestApi(TemporaryCacheRestApi):
                       value:
                         type: string
                         description: The stored value
+                      names:
+                        type: object
+                        description: >-
+                          A map of native filter id to that filter's
+                          human-readable label, for the filter ids present in
+                          `value`. Cross-referenced from the dashboard's
+                          native filter configuration, since the cached
+                          `value` itself has no notion of a filter's label.
             400:
               $ref: '#/components/responses/400'
             401:
@@ -193,7 +280,18 @@ class DashboardFilterStateRestApi(TemporaryCacheRestApi):
             500:
               $ref: '#/components/responses/500'
         """
-        return super().get(pk, key)
+        try:
+            args = CommandParameters(resource_id=pk, key=key, codec=CODEC)
+            command = self.get_get_command()(args)
+            value = command.run()
+            if not value:
+                return self.response_404()
+            names = command.get_filter_names(pk, value)
+            return self.response(200, value=value, names=names)
+        except TemporaryCacheAccessDeniedError as ex:
+            return self.response(403, message=str(ex))
+        except TemporaryCacheResourceNotFoundError as ex:
+            return self.response(404, message=str(ex))
 
     @expose("/<int:pk>/filter_state/<string:key>", methods=("DELETE",))
     @protect()
@@ -217,6 +315,10 @@ class DashboardFilterStateRestApi(TemporaryCacheRestApi):
               type: string
             name: key
             description: The value key.
+          - in: query
+            schema:
+              type: integer
+            name: tab_id
           responses:
             200:
               description: Deleted the stored value.

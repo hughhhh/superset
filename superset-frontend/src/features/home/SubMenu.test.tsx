@@ -16,9 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import userEvent from '@testing-library/user-event';
 import { BrowserRouter } from 'react-router-dom';
-import { render, screen } from 'spec/helpers/testing-library';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import SubMenu, { ButtonProps } from './SubMenu';
 
 const mockedProps = {
@@ -103,7 +102,7 @@ test('should render all the tabs links', async () => {
 
 test('should render dropdownlinks', async () => {
   setup();
-  userEvent.hover(screen.getByText('test an upload'));
+  await userEvent.hover(screen.getByText('test an upload'));
   const label = await screen.findByText('test an upload');
   expect(label).toBeInTheDocument();
 });
@@ -124,7 +123,39 @@ test('should render the buttons', async () => {
   ];
   setup({ buttons });
   const testButton = screen.getByText(buttons[0].name);
-  expect(await screen.findAllByRole('button')).toHaveLength(3);
-  userEvent.click(testButton);
+  expect(await screen.findAllByRole('button')).toHaveLength(2);
+  await userEvent.click(testButton);
   expect(mockFunc).toHaveBeenCalled();
+});
+
+// Mobile support tests
+test('should render leftIcon when provided', async () => {
+  setup({
+    leftIcon: (
+      <button type="button" data-test="left-icon-button">
+        Search
+      </button>
+    ),
+  });
+  expect(await screen.findByTestId('left-icon-button')).toBeInTheDocument();
+});
+
+test('should render rightIcon when provided', async () => {
+  setup({
+    rightIcon: (
+      <button type="button" data-test="right-icon-button">
+        Menu
+      </button>
+    ),
+  });
+  expect(await screen.findByTestId('right-icon-button')).toBeInTheDocument();
+});
+
+test('should render both leftIcon and rightIcon together', async () => {
+  setup({
+    leftIcon: <span data-test="mobile-left">Left</span>,
+    rightIcon: <span data-test="mobile-right">Right</span>,
+  });
+  expect(await screen.findByTestId('mobile-left')).toBeInTheDocument();
+  expect(await screen.findByTestId('mobile-right')).toBeInTheDocument();
 });

@@ -1,0 +1,1669 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from typing import Any, cast
+from unittest.mock import MagicMock
+
+import pytest
+from marshmallow import ValidationError
+from pytest_mock import MockerFixture
+
+from superset.commands.dataset.exceptions import (
+    DatabaseNotFoundValidationError,
+    DatasetExistsValidationError,
+    DatasetForbiddenError,
+    DatasetInvalidError,
+    DatasetNotFoundError,
+    MultiCatalogDisabledValidationError,
+)
+from superset.commands.dataset.update import (
+    DEFAULT_COLUMNS_FOLDER_UUID,
+    DEFAULT_METRICS_FOLDER_UUID,
+    UpdateDatasetCommand,
+    validate_folders,
+)
+from superset.datasets.schemas import FolderSchema
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+from superset.exceptions import SupersetSecurityException
+from superset.models.core import Database
+from superset.sql.parse import Table
+from superset.subjects.exceptions import SubjectsNotFoundValidationError
+from tests.unit_tests.conftest import with_feature_flags
+
+
+def test_update_dataset_not_found(mocker: MockerFixture) -> None:
+    """
+    Test updating an unexisting ID raises a `DatasetNotFoundError`.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mock_dataset_dao.find_by_id.return_value = None
+
+    with pytest.raises(DatasetNotFoundError):
+        UpdateDatasetCommand(1, {"name": "test"}).run()
+
+
+def test_update_dataset_forbidden(mocker: MockerFixture) -> None:
+    """
+    Test try updating a dataset without permission raises a `DatasetForbiddenError`.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mock_dataset_dao.find_by_id.return_value = mocker.MagicMock(
+        is_managed_externally=False
+    )
+
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+        side_effect=SupersetSecurityException(
+            SupersetError(
+                error_type=SupersetErrorType.MISSING_OWNERSHIP_ERROR,
+                message="Sample message",
+                level=ErrorLevel.ERROR,
+            )
+        ),
+    )
+
+    with pytest.raises(DatasetForbiddenError):
+        UpdateDatasetCommand(1, {"name": "test"}).run()
+
+
+def test_update_dataset_sql_authorized_schema(mocker: MockerFixture) -> None:
+    """
+    Test that updating a dataset with SQL works when user has schema access.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_database.allow_multi_catalog = False
+
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = "public"
+    mock_dataset.table_name = "test_table"
+    mock_dataset.editors = []  # No editors to avoid computation issues
+    mock_dataset.partition_column = None  # No partition filter mapping
+
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+    mock_dataset_dao.update.return_value = mock_dataset
+
+    # Mock successful editorship check
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+
+    # Mock security manager methods for editor computation
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+
+    # Mock security manager to allow access to the schema
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_access",
+    )
+
+    # Update dataset with SQL - should work when user has access
+    result = UpdateDatasetCommand(
+        1, {"sql": "SELECT * FROM public.allowed_table"}
+    ).run()
+
+    # Verify the update was called
+    assert result == mock_dataset
+    mock_dataset_dao.update.assert_called_once()
+
+
+def test_update_dataset_sql_unauthorized_schema(mocker: MockerFixture) -> None:
+    """
+    Test that updating a dataset with SQL to an unauthorized schema raises an error.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_database.allow_multi_catalog = False
+
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = "public"
+    mock_dataset.table_name = "test_table"
+    mock_dataset.editors = []  # No editors to avoid computation issues
+    mock_dataset.partition_column = None  # No partition filter mapping
+
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+
+    # Mock successful editorship check
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+
+    # Mock security manager methods for editor computation
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+
+    # Mock security manager to raise error for SQL schema access
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_access",
+        side_effect=SupersetSecurityException(
+            SupersetError(
+                error_type=SupersetErrorType.MISSING_OWNERSHIP_ERROR,
+                message="You don't have access to the 'restricted_schema' schema",
+                level=ErrorLevel.ERROR,
+            )
+        ),
+    )
+
+    # Try to update dataset with SQL querying an unauthorized schema
+    with pytest.raises(DatasetInvalidError) as excinfo:
+        UpdateDatasetCommand(
+            1, {"sql": "SELECT * FROM restricted_schema.sensitive_table"}
+        ).run()
+
+    # Check that the appropriate error message is in the exceptions
+    assert any(
+        "You don't have access to the 'restricted_schema' schema" in str(exc)
+        for exc in excinfo.value._exceptions
+    )
+
+
+def test_update_dataset_database_id_change_checks_new_database_access(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Changing ``database_id`` alone (with no ``sql`` in the payload) must
+    still be authorised against the new database connection: ownership of
+    the dataset (``raise_for_editorship``) is not enough. When the caller
+    isn't authorised for the new database, the update is rejected and the
+    dataset is not repointed.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mock_current_database = mocker.MagicMock()
+    mock_current_database.id = 1
+
+    mock_new_database = mocker.MagicMock()
+    mock_new_database.id = 2
+    mock_new_database.get_default_catalog.return_value = "catalog"
+    mock_new_database.allow_multi_catalog = False
+
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_current_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = "public"
+    mock_dataset.table_name = "test_table"
+    mock_dataset.editors = []  # No editors to avoid computation issues
+    mock_dataset.partition_column = None  # No partition filter mapping
+
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_new_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+
+    mock_raise_for_access = mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_access",
+        side_effect=SupersetSecurityException(
+            SupersetError(
+                error_type=SupersetErrorType.MISSING_OWNERSHIP_ERROR,
+                message="You don't have access to that database",
+                level=ErrorLevel.ERROR,
+            )
+        ),
+    )
+
+    with pytest.raises(DatasetInvalidError) as excinfo:
+        UpdateDatasetCommand(1, {"database_id": 2}).run()
+
+    mock_raise_for_access.assert_called_once()
+    assert mock_raise_for_access.call_args.kwargs["database"] is mock_new_database
+    assert any(
+        "You don't have access to that database" in str(exc)
+        for exc in excinfo.value._exceptions
+    )
+    # The update never runs, so the dataset is never repointed.
+    mock_dataset_dao.update.assert_not_called()
+
+
+def test_update_dataset_database_id_change_allowed_with_access(
+    mocker: MockerFixture,
+) -> None:
+    """
+    When the caller is authorised for the new database, changing
+    ``database_id`` alone succeeds and the dataset is repointed to it.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mock_current_database = mocker.MagicMock()
+    mock_current_database.id = 1
+
+    mock_new_database = mocker.MagicMock()
+    mock_new_database.id = 2
+    mock_new_database.get_default_catalog.return_value = "catalog"
+    mock_new_database.allow_multi_catalog = False
+
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_current_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = "public"
+    mock_dataset.table_name = "test_table"
+    mock_dataset.editors = []  # No editors to avoid computation issues
+    mock_dataset.partition_column = None  # No partition filter mapping
+
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_new_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+    mock_dataset_dao.update.return_value = mock_dataset
+
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mock_raise_for_access = mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_access",
+    )
+
+    result = UpdateDatasetCommand(1, {"database_id": 2}).run()
+
+    mock_raise_for_access.assert_called_once()
+    assert mock_raise_for_access.call_args.kwargs["database"] is mock_new_database
+    assert result == mock_dataset
+    _, update_kwargs = mock_dataset_dao.update.call_args
+    assert update_kwargs["attributes"]["database"] is mock_new_database
+
+
+def test_update_dataset_physical_repoint_requires_table_access(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Repointing a physical dataset at a different table must pass the same
+    ``raise_for_access(database=..., table=...)`` gate the create path
+    enforces; editorship alone must not grant access to the new table.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_database.allow_multi_catalog = False
+
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = "public"
+    mock_dataset.table_name = "allowed_table"
+    mock_dataset.sql = None  # physical dataset
+    mock_dataset.editors = []
+    mock_dataset.partition_column = None
+
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+
+    raise_for_access = mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_access",
+        side_effect=SupersetSecurityException(
+            SupersetError(
+                error_type=SupersetErrorType.DATASOURCE_SECURITY_ACCESS_ERROR,
+                message="You don't have access to the table 'restricted_table'",
+                level=ErrorLevel.ERROR,
+            )
+        ),
+    )
+
+    with pytest.raises(DatasetInvalidError) as excinfo:
+        UpdateDatasetCommand(1, {"table_name": "restricted_table"}).run()
+
+    raise_for_access.assert_called_once_with(
+        database=mock_database,
+        table=Table("restricted_table", "public", "catalog"),
+    )
+    assert any(
+        "You don't have access to the table" in str(exc)
+        for exc in excinfo.value._exceptions
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload, exception, error_msg"),
+    [
+        (
+            {"database_id": 2},
+            DatabaseNotFoundValidationError,
+            "Database does not exist",
+        ),
+        (
+            {"catalog": "test"},
+            MultiCatalogDisabledValidationError,
+            "Only the default catalog is supported for this connection",
+        ),
+        (
+            {"table_name": "table", "schema": "schema"},
+            DatasetExistsValidationError,
+            "Dataset catalog.schema.table already exists",
+        ),
+        (
+            {"editors": [999]},
+            SubjectsNotFoundValidationError,
+            "Subjects are invalid",
+        ),
+    ],
+)
+def test_update_dataset_validation_errors(
+    payload: dict[str, Any],
+    exception: Exception,
+    error_msg: str,
+    mocker: MockerFixture,
+) -> None:
+    """
+    Test validation errors for the `UpdateDatasetCommand`.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mocker.patch(
+        "superset.commands.utils.security_manager.get_user_by_id", return_value=None
+    )
+    mocker.patch("superset.commands.utils.get_subject", return_value=None)
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_database.allow_multi_catalog = False
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+
+    if exception == DatabaseNotFoundValidationError:
+        mock_dataset_dao.get_database_by_id.return_value = None
+    else:
+        mock_dataset_dao.get_database_by_id.return_value = mock_database
+
+    if exception == DatasetExistsValidationError:
+        mock_dataset_dao.validate_update_uniqueness.return_value = False
+        # No hidden twin: a bare MagicMock attribute is truthy and would
+        # divert into the soft-deleted-twin guidance branch.
+        mock_dataset_dao.find_soft_deleted_logical_duplicate.return_value = None
+    else:
+        mock_dataset_dao.validate_update_uniqueness.return_value = True
+
+    with pytest.raises(DatasetInvalidError) as excinfo:
+        UpdateDatasetCommand(1, payload).run()
+    assert any(error_msg in str(exc) for exc in excinfo.value._exceptions)
+
+
+def test_update_dataset_soft_deleted_twin_gets_guidance(
+    mocker: MockerFixture,
+) -> None:
+    """sc-107581: the update path mirrors create's hidden-twin 422.
+
+    When the uniqueness blocker is a SOFT-DELETED dataset (invisible in the
+    caller's list), the targeted error names the twin's uuid and the restore
+    endpoint instead of the opaque "already exists".
+    """
+    from superset.commands.dataset.exceptions import (
+        DatasetSoftDeletedTwinExistsError,
+    )
+
+    mock_dataset_dao: MagicMock = mocker.patch(
+        "superset.commands.dataset.update.DatasetDAO"
+    )
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mock_database: MagicMock = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_database.allow_multi_catalog = False
+    mock_dataset: MagicMock = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = False
+    twin: MagicMock = mocker.MagicMock()
+    twin.uuid = "twin-uuid-123"
+    mock_dataset_dao.find_soft_deleted_logical_duplicate.return_value = twin
+
+    with pytest.raises(DatasetSoftDeletedTwinExistsError) as excinfo:
+        UpdateDatasetCommand(1, {"table_name": "table", "schema": "schema"}).run()
+
+    assert "twin-uuid-123" in str(excinfo.value)
+    assert "/restore" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("payload", "field"),
+    [
+        (
+            {
+                "columns": [
+                    {
+                        "column_name": "evil_col",
+                        "expression": "1; DROP TABLE users",
+                    }
+                ]
+            },
+            "columns.0.expression",
+        ),
+        (
+            {
+                "metrics": [
+                    {
+                        "metric_name": "evil_metric",
+                        "expression": "1 UNION SELECT password FROM ab_user",
+                    }
+                ]
+            },
+            "metrics.0.expression",
+        ),
+    ],
+)
+def test_update_dataset_rejects_malicious_expression(
+    payload: dict[str, Any],
+    field: str,
+    mocker: MockerFixture,
+) -> None:
+    """
+    Stored column and metric ``expression`` strings are routed through the
+    same validator as adhoc SQL fields, and command-level validation
+    surfaces the parser's verdict as a field-level ``ValidationError``.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mocker.patch(
+        "superset.commands.utils.security_manager.get_user_by_id", return_value=None
+    )
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.backend = "sqlite"
+    mock_database.allow_multi_catalog = False
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = None
+    mock_dataset.partition_column = None  # No partition filter mapping
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+    mock_dataset_dao.validate_columns_exist.return_value = True
+    mock_dataset_dao.validate_columns_uniqueness.return_value = True
+    mock_dataset_dao.validate_metrics_exist.return_value = True
+    mock_dataset_dao.validate_metrics_uniqueness.return_value = True
+
+    with pytest.raises(DatasetInvalidError) as excinfo:
+        UpdateDatasetCommand(1, payload).run()
+    expression_errors = [
+        exc
+        for exc in excinfo.value._exceptions
+        if isinstance(exc, ValidationError) and field in (exc.field_name or "")
+    ]
+    assert expression_errors, (
+        f"Expected a field-level ValidationError on '{field}'. Got: "
+        f"{[(type(e).__name__, getattr(e, 'field_name', None), str(e)) for e in excinfo.value._exceptions]}"  # noqa: E501
+    )
+    # `messages` must stay a list even though the underlying message is a
+    # `LazyString`, which marshmallow does not treat as `str`/`bytes` and so
+    # would otherwise store bare instead of wrapping it.
+    assert isinstance(expression_errors[0].messages, list)
+
+
+def test_update_dataset_accepts_benign_expression(mocker: MockerFixture) -> None:
+    """
+    A well-formed stored expression (e.g. CASE) passes the validator: the
+    command's ``validate()`` collects no expression-level errors. We
+    invoke ``validate()`` directly to isolate the validator from the
+    rest of the run-path (commit, audit, etc.).
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mocker.patch(
+        "superset.commands.utils.security_manager.get_user_by_id", return_value=None
+    )
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.backend = "sqlite"
+    mock_database.allow_multi_catalog = False
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = None
+    mock_dataset.partition_column = None  # No partition filter mapping
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+    mock_dataset_dao.validate_columns_exist.return_value = True
+    mock_dataset_dao.validate_columns_uniqueness.return_value = True
+
+    payload = {
+        "columns": [
+            {
+                "column_name": "case_col",
+                "expression": "CASE WHEN amount > 0 THEN 'a' ELSE 'b' END",
+            }
+        ]
+    }
+    UpdateDatasetCommand(1, payload).validate()
+
+
+def test_update_dataset_accepts_jinja_expression(mocker: MockerFixture) -> None:
+    """
+    Stored column/metric expressions can use Jinja templating (e.g.
+    ``{{ current_username() }}``). At save time there is no template
+    context, so the parser-based gate is bypassed; the same validator
+    re-runs on the rendered SQL at query time.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mocker.patch(
+        "superset.commands.utils.security_manager.get_user_by_id", return_value=None
+    )
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.backend = "sqlite"
+    mock_database.allow_multi_catalog = False
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = None
+    mock_dataset.partition_column = None  # No partition filter mapping
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+    mock_dataset_dao.validate_columns_exist.return_value = True
+    mock_dataset_dao.validate_columns_uniqueness.return_value = True
+
+    payload = {
+        "columns": [
+            {
+                "column_name": "user_match",
+                "expression": (
+                    "case when '{{ current_username() }}' = 'abc' "
+                    "then 'yes' else 'no' end"
+                ),
+            }
+        ]
+    }
+    UpdateDatasetCommand(1, payload).validate()
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders(mocker: MockerFixture) -> None:
+    """
+    Test the folder validation.
+    """
+    from uuid import UUID
+
+    metric_uuid = UUID("11111111-1111-1111-1111-111111111111")
+    column_uuid1 = UUID("22222222-2222-2222-2222-222222222222")
+    column_uuid2 = UUID("33333333-3333-3333-3333-333333333333")
+    folder_uuid = UUID("44444444-4444-4444-4444-444444444444")
+
+    metrics = [mocker.MagicMock(metric_name="metric1", uuid=metric_uuid)]
+    columns = [
+        mocker.MagicMock(column_name="column1", uuid=column_uuid1),
+        mocker.MagicMock(column_name="column2", uuid=column_uuid2),
+    ]
+
+    # Create valid UUIDs set from metrics and columns
+    valid_uuids = {metric.uuid for metric in metrics} | {
+        column.uuid for column in columns
+    }
+    validate_folders(folders=[], valid_uuids=valid_uuids)
+
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(folder_uuid),
+                "type": "folder",
+                "name": "My folder",
+                "children": [
+                    {
+                        "uuid": str(metric_uuid),
+                        "type": "metric",
+                        "name": "metric1",
+                    },
+                    {
+                        "uuid": str(column_uuid1),
+                        "type": "column",
+                        "name": "column1",
+                    },
+                    {
+                        "uuid": str(column_uuid2),
+                        "type": "column",
+                        "name": "column2",
+                    },
+                ],
+            },
+        ],
+    )
+    validate_folders(folders=folders, valid_uuids=valid_uuids)
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_cycle(mocker: MockerFixture) -> None:
+    """
+    Test that we can detect cycles in the folder structure.
+    """
+    from uuid import UUID
+
+    folder_uuid1 = UUID("11111111-1111-1111-1111-111111111111")
+    folder_uuid2 = UUID("22222222-2222-2222-2222-222222222222")
+
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(folder_uuid1),
+                "type": "folder",
+                "name": "My folder",
+                "children": [
+                    {
+                        "uuid": str(folder_uuid2),
+                        "type": "folder",
+                        "name": "My other folder",
+                        "children": [
+                            {
+                                "uuid": str(folder_uuid1),
+                                "type": "folder",
+                                "name": "My folder",
+                                "children": [],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_folders(folders=folders, valid_uuids=set())
+    assert (
+        str(excinfo.value) == f"Cycle detected: {folder_uuid1} appears in its ancestry"
+    )
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_inter_cycle(mocker: MockerFixture) -> None:
+    """
+    Test that we can detect cycles between folders.
+    """
+    from uuid import UUID
+
+    folder_uuid1 = UUID("11111111-1111-1111-1111-111111111111")
+    folder_uuid2 = UUID("22222222-2222-2222-2222-222222222222")
+
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(folder_uuid1),
+                "type": "folder",
+                "name": "My folder",
+                "children": [
+                    {
+                        "uuid": str(folder_uuid2),
+                        "type": "folder",
+                        "name": "My other folder",
+                        "children": [],
+                    },
+                ],
+            },
+            {
+                "uuid": str(folder_uuid2),
+                "type": "folder",
+                "name": "My other folder",
+                "children": [
+                    {
+                        "uuid": str(folder_uuid1),
+                        "type": "folder",
+                        "name": "My folder",
+                        "children": [],
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_folders(folders=folders, valid_uuids=set())
+    assert str(excinfo.value) == f"Duplicate UUID in folder structure: {folder_uuid2}"
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_duplicates(mocker: MockerFixture) -> None:
+    """
+    Test that metrics and columns belong to a single folder.
+    """
+    from uuid import UUID
+
+    metric_uuid = UUID("22222222-2222-2222-2222-222222222222")
+    folder_uuid1 = UUID("11111111-1111-1111-1111-111111111111")
+    metrics = [mocker.MagicMock(metric_name="count", uuid=metric_uuid)]
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(folder_uuid1),
+                "type": "folder",
+                "name": "My folder",
+                "children": [
+                    {
+                        "uuid": str(metric_uuid),
+                        "type": "metric",
+                        "name": "count",
+                    },
+                ],
+            },
+            {
+                "uuid": str(metric_uuid),
+                "type": "folder",
+                "name": "My other folder",
+                "children": [
+                    {
+                        "uuid": str(metric_uuid),
+                        "type": "metric",
+                        "name": "count",
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_folders(
+            folders=folders, valid_uuids={metric.uuid for metric in metrics}
+        )
+    assert str(excinfo.value) == f"Duplicate UUID in folder structure: {metric_uuid}"
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_duplicate_name_not_siblings(mocker: MockerFixture) -> None:
+    """
+    Duplicate folder names are allowed if folders are not siblings.
+    """
+    from uuid import UUID
+
+    uuid1 = UUID("11111111-1111-1111-1111-111111111111")
+    uuid2 = UUID("22222222-2222-2222-2222-222222222222")
+    uuid3 = UUID("33333333-3333-3333-3333-333333333333")
+    uuid4 = UUID("44444444-4444-4444-4444-444444444444")
+
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(uuid1),
+                "type": "folder",
+                "name": "Sales",
+                "children": [
+                    {
+                        "uuid": str(uuid2),
+                        "type": "folder",
+                        "name": "Core",
+                        "children": [],
+                    },
+                ],
+            },
+            {
+                "uuid": str(uuid3),
+                "type": "folder",
+                "name": "Engineering",
+                "children": [
+                    {
+                        "uuid": str(uuid4),
+                        "type": "folder",
+                        "name": "Core",
+                        "children": [],
+                    },
+                ],
+            },
+        ],
+    )
+
+    validate_folders(folders=folders, valid_uuids=set())
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_duplicate_name_siblings(mocker: MockerFixture) -> None:
+    """
+    Duplicate folder names are not allowed if folders are siblings.
+    """
+    from uuid import UUID
+
+    uuid1 = UUID("11111111-1111-1111-1111-111111111111")
+    uuid2 = UUID("22222222-2222-2222-2222-222222222222")
+    uuid3 = UUID("33333333-3333-3333-3333-333333333333")
+    uuid4 = UUID("44444444-4444-4444-4444-444444444444")
+
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(uuid1),
+                "type": "folder",
+                "name": "Sales",
+                "children": [
+                    {
+                        "uuid": str(uuid2),
+                        "type": "folder",
+                        "name": "Core",
+                        "children": [],
+                    },
+                ],
+            },
+            {
+                "uuid": str(uuid3),
+                "type": "folder",
+                "name": "Sales",
+                "children": [
+                    {
+                        "uuid": str(uuid4),
+                        "type": "folder",
+                        "name": "Other",
+                        "children": [],
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_folders(folders=folders, valid_uuids=set())
+    assert str(excinfo.value) == "Duplicate folder name: Sales"
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_invalid_names(mocker: MockerFixture) -> None:
+    """
+    Test that we can detect reserved folder names.
+    """
+    from uuid import UUID
+
+    uuid1 = UUID("11111111-1111-1111-1111-111111111111")
+    uuid2 = UUID("22222222-2222-2222-2222-222222222222")
+
+    folders_with_metrics = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(uuid1),
+                "type": "folder",
+                "name": "Metrics",
+                "children": [],
+            },
+        ],
+    )
+    folders_with_columns = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": str(uuid2),
+                "type": "folder",
+                "name": "Columns",
+                "children": [],
+            },
+        ],
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_folders(folders=folders_with_metrics, valid_uuids=set())
+    assert str(excinfo.value) == "Folder cannot have name 'Metrics'"
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_folders(folders=folders_with_columns, valid_uuids=set())
+    assert str(excinfo.value) == "Folder cannot have name 'Columns'"
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_allows_default_folders(mocker: MockerFixture) -> None:
+    """
+    Test that default system folders (Metrics/Columns) are allowed when using
+    the well-known default folder UUIDs, so their position can be persisted.
+    """
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": DEFAULT_METRICS_FOLDER_UUID,
+                "type": "folder",
+                "name": "Metrics",
+                "children": [],
+            },
+            {
+                "uuid": DEFAULT_COLUMNS_FOLDER_UUID,
+                "type": "folder",
+                "name": "Columns",
+                "children": [],
+            },
+        ],
+    )
+
+    # Should not raise - default folders are allowed to use reserved names
+    validate_folders(folders=folders, valid_uuids=set())
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_invalid_uuid(mocker: MockerFixture) -> None:
+    """
+    Test that we can detect invalid UUIDs.
+    """
+    folders = cast(
+        list[FolderSchema],
+        [
+            {
+                "uuid": "uuid4",
+                "type": "folder",
+                "name": "My folder",
+                "children": [
+                    {
+                        "uuid": "uuid2",
+                        "type": "metric",
+                        "name": "metric1",
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(ValidationError):
+        FolderSchema(many=True).load(folders)
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_with_new_metrics_only_uses_new_uuids(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Test that when new metrics are provided, validation uses only the new metric UUIDs.
+    """
+    from uuid import UUID
+
+    # Mock existing metrics on the model
+    existing_metric_uuid = UUID("11111111-2222-3333-4444-555555555555")
+    existing_metrics = [mocker.MagicMock(uuid=existing_metric_uuid)]
+
+    # New metrics in the payload
+    new_metric_uuid = UUID("99999999-8888-7777-6666-555555555555")
+    new_metrics = [{"uuid": str(new_metric_uuid), "metric_name": "new_metric"}]
+
+    # Folder referencing the new metric (should work)
+    folder_uuid_1 = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    folders_with_new = [
+        {
+            "uuid": str(folder_uuid_1),
+            "type": "folder",
+            "name": "Test Folder",
+            "children": [
+                {
+                    "uuid": str(new_metric_uuid),
+                    "type": "metric",
+                    "name": "new_metric",
+                }
+            ],
+        }
+    ]
+
+    # Create mock model with existing metrics
+    mock_model = mocker.MagicMock()
+    mock_model.metrics = existing_metrics
+    mock_model.columns = []
+
+    # Test with new metrics - should work
+    command = UpdateDatasetCommand(
+        1, {"metrics": new_metrics, "folders": folders_with_new}
+    )
+    command._model = mock_model
+
+    # This should not raise an error
+    try:
+        command._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should not have raised an error: {e}")
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_no_new_metrics_uses_existing(mocker: MockerFixture) -> None:
+    """
+    Test that when no new metrics are provided, existing metrics are used.
+    """
+    from uuid import UUID
+
+    # Mock existing metrics on the model
+    existing_metric_uuid = UUID("11111111-2222-3333-4444-555555555555")
+    existing_metrics = [mocker.MagicMock(uuid=existing_metric_uuid)]
+
+    # Folder referencing the existing metric
+    folder_uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    folders = [
+        {
+            "uuid": str(folder_uuid),
+            "type": "folder",
+            "name": "Test Folder",
+            "children": [
+                {
+                    "uuid": str(existing_metric_uuid),
+                    "type": "metric",
+                    "name": "existing_metric",
+                }
+            ],
+        }
+    ]
+
+    # Create mock model
+    mock_model = mocker.MagicMock()
+    mock_model.metrics = existing_metrics
+    mock_model.columns = []
+
+    # Test without providing new metrics - should use existing ones
+    command = UpdateDatasetCommand(1, {"folders": folders})  # No metrics key
+    command._model = mock_model
+
+    # This should not raise an error since existing metrics are used
+    try:
+        command._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should not have raised an error: {e}")
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_mixed_metrics_and_columns(mocker: MockerFixture) -> None:
+    """
+    Test validation with both new metrics and new columns.
+    """
+    from uuid import UUID
+
+    # Mock existing data
+    existing_metric_uuid = UUID("11111111-1111-1111-1111-111111111111")
+    existing_column_uuid = UUID("22222222-2222-2222-2222-222222222222")
+    existing_metrics = [mocker.MagicMock(uuid=existing_metric_uuid)]
+    existing_columns = [mocker.MagicMock(uuid=existing_column_uuid)]
+
+    # New data in payload
+    new_metric_uuid = UUID("99999999-9999-9999-9999-999999999999")
+    new_column_uuid = UUID("88888888-8888-8888-8888-888888888888")
+    new_metrics = [{"uuid": str(new_metric_uuid), "metric_name": "new_metric"}]
+    new_columns = [{"uuid": str(new_column_uuid), "column_name": "new_column"}]
+
+    # Folders referencing the new data
+    folder_uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    folders = [
+        {
+            "uuid": str(folder_uuid),
+            "type": "folder",
+            "name": "Mixed Folder",
+            "children": [
+                {
+                    "uuid": str(new_metric_uuid),
+                    "type": "metric",
+                    "name": "new_metric",
+                },
+                {
+                    "uuid": str(new_column_uuid),
+                    "type": "column",
+                    "name": "new_column",
+                },
+            ],
+        }
+    ]
+
+    # Create mock model
+    mock_model = mocker.MagicMock()
+    mock_model.metrics = existing_metrics
+    mock_model.columns = existing_columns
+
+    # Test with both new metrics and columns
+    command = UpdateDatasetCommand(
+        1, {"metrics": new_metrics, "columns": new_columns, "folders": folders}
+    )
+    command._model = mock_model
+
+    # Should work since folders reference the new UUIDs
+    try:
+        command._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should not have raised an error: {e}")
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_partial_override(mocker: MockerFixture) -> None:
+    """
+    Test that providing only new metrics uses new metrics + existing columns,
+    and vice versa.
+    """
+    from uuid import UUID
+
+    # Mock existing data
+    existing_metric_uuid = UUID("11111111-1111-1111-1111-111111111111")
+    existing_column_uuid = UUID("22222222-2222-2222-2222-222222222222")
+    existing_metrics = [mocker.MagicMock(uuid=existing_metric_uuid)]
+    existing_columns = [mocker.MagicMock(uuid=existing_column_uuid)]
+
+    # Only new metrics, no new columns
+    new_metric_uuid = UUID("99999999-9999-9999-9999-999999999999")
+    new_metrics = [{"uuid": str(new_metric_uuid), "metric_name": "new_metric"}]
+
+    # Folders referencing new metric + existing column
+    folder_uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    folders = [
+        {
+            "uuid": str(folder_uuid),
+            "type": "folder",
+            "name": "Partial Override Folder",
+            "children": [
+                {
+                    "uuid": str(new_metric_uuid),
+                    "type": "metric",
+                    "name": "new_metric",
+                },
+                {
+                    "uuid": str(existing_column_uuid),
+                    "type": "column",
+                    "name": "existing_column",
+                },
+            ],
+        }
+    ]
+
+    # Create mock model
+    mock_model = mocker.MagicMock()
+    mock_model.metrics = existing_metrics
+    mock_model.columns = existing_columns
+
+    # Test with only new metrics (columns should use existing)
+    command = UpdateDatasetCommand(
+        1,
+        {
+            "metrics": new_metrics,  # Override metrics
+            # No columns key - should use existing columns
+            "folders": folders,
+        },
+    )
+    command._model = mock_model
+
+    # Should work: new metric + existing column
+    try:
+        command._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should not have raised an error: {e}")
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_uuid_types_enforced(mocker: MockerFixture) -> None:
+    """
+    Test that the new implementation enforces proper UUID types.
+    """
+    from uuid import UUID
+
+    # Valid UUID for folders
+    folder_uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    metric_uuid = UUID("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
+
+    # Test with proper UUID - should work
+    folders = [
+        {
+            "uuid": str(folder_uuid),
+            "type": "folder",
+            "name": "Test Folder",
+            "children": [
+                {
+                    "uuid": str(metric_uuid),
+                    "type": "metric",
+                    "name": "test_metric",
+                }
+            ],
+        }
+    ]
+
+    mock_model = mocker.MagicMock()
+    mock_model.metrics = [mocker.MagicMock(uuid=metric_uuid)]
+    mock_model.columns = []
+
+    command = UpdateDatasetCommand(1, {"folders": folders})
+    command._model = mock_model
+
+    # Should work with proper UUIDs
+    try:
+        command._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should not have raised an error with proper UUIDs: {e}")
+
+
+@with_feature_flags(DATASET_FOLDERS=True)
+def test_validate_folders_metrics_vs_columns_behavior(mocker: MockerFixture) -> None:
+    """
+    Test the specific behavior when providing metrics vs columns in payload.
+    """
+    from uuid import UUID
+
+    # UUIDs
+    folder_uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    existing_metric_uuid = UUID("11111111-1111-1111-1111-111111111111")
+    existing_column_uuid = UUID("22222222-2222-2222-2222-222222222222")
+    new_metric_uuid = UUID("33333333-3333-3333-3333-333333333333")
+
+    # Mock model
+    mock_model = mocker.MagicMock()
+    mock_model.metrics = [mocker.MagicMock(uuid=existing_metric_uuid)]
+    mock_model.columns = [mocker.MagicMock(uuid=existing_column_uuid)]
+
+    # Test 1: No new metrics/columns provided - should use existing ones
+    folders_existing = [
+        {
+            "uuid": str(folder_uuid),
+            "type": "folder",
+            "name": "Test Folder",
+            "children": [
+                {
+                    "uuid": str(existing_metric_uuid),
+                    "type": "metric",
+                    "name": "existing_metric",
+                },
+                {
+                    "uuid": str(existing_column_uuid),
+                    "type": "column",
+                    "name": "existing_column",
+                },
+            ],
+        }
+    ]
+
+    command1 = UpdateDatasetCommand(1, {"folders": folders_existing})
+    command1._model = mock_model
+
+    try:
+        command1._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should work with existing UUIDs when no new metrics/columns: {e}")
+
+    # Test 2: New metrics provided - test behavior
+    new_metrics = [{"uuid": str(new_metric_uuid), "metric_name": "new_metric"}]
+    folders_new = [
+        {
+            "uuid": str(folder_uuid),
+            "type": "folder",
+            "name": "Test Folder",
+            "children": [
+                {
+                    "uuid": str(new_metric_uuid),
+                    "type": "metric",
+                    "name": "new_metric",
+                }
+            ],
+        }
+    ]
+
+    command2 = UpdateDatasetCommand(1, {"metrics": new_metrics, "folders": folders_new})
+    command2._model = mock_model
+
+    try:
+        command2._validate_semantics([])
+    except Exception as e:
+        pytest.fail(f"Should work with new metric UUIDs when new metrics provided: {e}")
+
+
+def test_update_dataset_rejects_malicious_fetch_values_predicate(
+    mocker: MockerFixture,
+) -> None:
+    """
+    ``fetch_values_predicate`` is wrapped verbatim into a raw WHERE clause at
+    query time, so the command routes it through the stored-expression
+    validator; a UNION-based predicate is rejected at save time.
+    """
+    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
+    mocker.patch(
+        "superset.commands.dataset.update.security_manager.raise_for_editorship",
+    )
+    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
+    mocker.patch(
+        "superset.commands.utils.security_manager.get_user_by_id", return_value=None
+    )
+    mock_database = mocker.MagicMock()
+    mock_database.id = 1
+    mock_database.backend = "sqlite"
+    mock_database.allow_multi_catalog = False
+    mock_database.get_default_catalog.return_value = "catalog"
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    mock_dataset.database = mock_database
+    mock_dataset.catalog = "catalog"
+    mock_dataset.schema = None
+    mock_dataset.partition_column = None  # No partition filter mapping
+    mock_dataset_dao.find_by_id.return_value = mock_dataset
+    mock_dataset_dao.get_database_by_id.return_value = mock_database
+    mock_dataset_dao.validate_update_uniqueness.return_value = True
+
+    payload = {
+        "fetch_values_predicate": "1=0 UNION SELECT card_number FROM billing.cards"
+    }
+    with pytest.raises(DatasetInvalidError) as excinfo:
+        UpdateDatasetCommand(1, payload).run()
+    assert any(
+        isinstance(exc, ValidationError)
+        and "fetch_values_predicate" in (exc.field_name or "")
+        for exc in excinfo.value._exceptions
+    )
+
+
+def _mapping_command(
+    mocker: MockerFixture,
+    transform: str | None,
+    *,
+    partition_mapped_column: str | None = None,
+    main_dttm_col: str = "event_time",
+    database: Database | None = None,
+) -> UpdateDatasetCommand:
+    """
+    A command whose stored dataset maps `event_time` onto `dt_epoch`.
+
+    `database` takes a real one, for the gates that read more of it than
+    `backend` -- the function denylist is keyed on the engine spec's own name,
+    which a mock cannot supply.
+    """
+    mapped_column = mocker.MagicMock()
+    mapped_column.column_name = "event_time"
+    mapped_column.partition_value_transform = transform
+    partition_column = mocker.MagicMock()
+    partition_column.column_name = "dt_epoch"
+    # The partition column is the target of a mapping, never the source of one.
+    partition_column.partition_value_transform = None
+
+    mock_dataset = mocker.MagicMock(is_managed_externally=False)
+    if database is not None:
+        mock_dataset.database = database
+    else:
+        mock_dataset.database.backend = "sqlite"
+    mock_dataset.catalog = None
+    mock_dataset.schema = "main"
+    mock_dataset.columns = [mapped_column, partition_column]
+    mock_dataset.main_dttm_col = main_dttm_col
+    mock_dataset.partition_column = "dt_epoch"
+    mock_dataset.partition_mapped_column = partition_mapped_column
+
+    command = UpdateDatasetCommand(1, {})
+    command._model = mock_dataset
+    return command
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_an_unparseable_transform_does_not_block_the_save(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An unparseable transform is a Tier-2 issue: the mapping saves and stays
+    inactive. `validate_stored_expression` rejects anything it cannot parse, so
+    running it here would turn that into a blocking error and cost the owner the
+    rest of their edits.
+    """
+    gate = mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(mocker, "unix_timestamp(:value")
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert exceptions == []
+    gate.assert_not_called()
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_parseable_transform_still_goes_through_the_stored_expression_gate(
+    mocker: MockerFixture,
+) -> None:
+    """
+    The gate that governs every other stored expression still runs -- now the
+    same `stored_expression_error` preview, import and the legacy save path
+    use, so the function denylist applies here too.
+    """
+    gate = mocker.patch(
+        "superset.commands.dataset.update.stored_expression_error", return_value=None
+    )
+    command = _mapping_command(mocker, "unix_timestamp(:value)")
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert exceptions == []
+    gate.assert_called_once()
+    assert gate.call_args.args[-1] == "unix_timestamp(:value)"
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+@pytest.mark.parametrize(
+    "transform",
+    [
+        "unix_timestamp(:value) UNION ALL SELECT password FROM ab_user",
+        "unix_timestamp(:value); DROP TABLE ab_user",
+        "password || :value FROM ab_user",
+    ],
+    ids=["set-operation", "multi-statement", "bare-from"],
+)
+def test_a_transform_that_is_the_wrong_sql_still_reaches_the_gate(
+    mocker: MockerFixture, transform: str
+) -> None:
+    """
+    The companion to the test above, and the reason the skip condition is "not
+    SQL yet" rather than "does not parse". All three of these fail to parse as
+    a single statement, exactly as a half-typed transform does -- so a skip
+    keyed on parseability would have waved them through. None of them is on the
+    way to a valid transform.
+    """
+    command = _mapping_command(mocker, transform)
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    # Reported rather than silently accepted the way an unfinished transform is.
+    assert exceptions
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_transform_calling_a_denied_function_is_refused_on_save(
+    mocker: MockerFixture,
+) -> None:
+    """
+    A normal PUT was the one door into this field that skipped the function
+    denylist: preview, import and the legacy save path all ran
+    `stored_expression_error`, while this ran only the narrower parser gate. So
+    an owner could store what preview had just refused, and the probe would run
+    it on the next chart load.
+    """
+    command = _mapping_command(
+        mocker,
+        "schema_to_xml('public') || :value",
+        database=Database(database_name="pfm_pg", sqlalchemy_uri="postgresql://u@h/d"),
+    )
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert [exc.field_name for exc in exceptions] == ["partition_value_transform"]
+    assert "schema_to_xml" in str(exceptions[0].messages)
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_jinja_transform_is_still_rejected(mocker: MockerFixture) -> None:
+    """
+    Skipping the gate for unparseable transforms is not a hole for templating:
+    Jinja is a blocking issue of its own, reported before the gate is reached.
+    """
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(mocker, "unix_timestamp({{ current_user_id() }})")
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert [exc.field_name for exc in exceptions] == ["partition_value_transform"]
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_description_only_put_survives_an_implicit_self_mapping(
+    mocker: MockerFixture,
+) -> None:
+    """
+    `fetch_metadata` could choose the partition column as the default datetime
+    column without anyone asking, and a blocking self-mapping error then made
+    the dataset unsaveable forever -- including by the very write that would
+    have set the override that fixes it, and including a write that changes
+    nothing but the description.
+
+    The mapping is inert in that state either way, since
+    `resolve_partition_mapping` bails out on it, so the issue is reported
+    rather than blocking.
+    """
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(
+        mocker, "unix_timestamp(:value)", main_dttm_col="dt_epoch"
+    )
+    command._properties["description"] = "a new description"
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert exceptions == []
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_self_mapping_is_rejected_while_the_feature_is_on(
+    mocker: MockerFixture,
+) -> None:
+    """A column cannot stand in for itself: that is a Tier-1 blocking issue."""
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(mocker, "unix_timestamp(:value)")
+    command._properties["partition_mapped_column"] = "dt_epoch"
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert [exc.field_name for exc in exceptions] == ["partition_column"]
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=False)
+def test_no_mapping_validation_runs_while_the_feature_is_off(
+    mocker: MockerFixture,
+) -> None:
+    """
+    With the flag off nothing mirrors, so a stored mapping can never be
+    consumed. Rejecting the save over it would hand the owner a validation
+    error they have no way to act on -- and every path that reads a mapping is
+    gated the same way.
+    """
+    gate = mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(mocker, "unix_timestamp(:value)")
+    command._properties["partition_mapped_column"] = "dt_epoch"
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert exceptions == []
+    gate.assert_not_called()
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_sync_that_drops_the_mapped_column_is_not_blocked(
+    mocker: MockerFixture,
+) -> None:
+    """
+    `update_columns` clears a mapping whose columns the payload dropped, but
+    that runs later, during `run()`. Validating the pre-cleanup state would
+    reject the very sync the cleanup exists to absorb -- an `override_columns`
+    resync whose source table no longer has the mapped column.
+    """
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(
+        mocker, "unix_timestamp(:value)", partition_mapped_column="event_time"
+    )
+    command._properties["columns"] = [{"column_name": "dt_epoch"}]
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert exceptions == []
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_sync_that_drops_the_partition_column_is_not_blocked(
+    mocker: MockerFixture,
+) -> None:
+    """Losing the partition column drops the whole mapping, not just the half."""
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(
+        mocker, "unix_timestamp(:value)", partition_mapped_column="event_time"
+    )
+    command._properties["columns"] = [{"column_name": "event_time"}]
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert exceptions == []
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_mapping_onto_a_column_the_same_request_omits_is_still_rejected(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Only a *stored* reference is forgiven. Asking in this request to map onto a
+    column the same request does not define is a mistake worth reporting, not
+    something to quietly clean up.
+    """
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(mocker, "unix_timestamp(:value)")
+    command._properties["columns"] = [{"column_name": "dt_epoch"}]
+    command._properties["partition_mapped_column"] = "event_time"
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert [exc.field_name for exc in exceptions] == ["partition_mapped_column"]
+
+
+@with_feature_flags(PARTITION_FILTER_MAPPING=True)
+def test_a_self_mapping_is_still_rejected_alongside_a_column_payload(
+    mocker: MockerFixture,
+) -> None:
+    """Forgiving a dropped column does not forgive the checks that remain."""
+    mocker.patch("superset.commands.dataset.update.validate_stored_expression")
+    command = _mapping_command(mocker, "unix_timestamp(:value)")
+    command._properties["columns"] = [
+        {"column_name": "dt_epoch"},
+        {"column_name": "event_time"},
+    ]
+    command._properties["partition_mapped_column"] = "dt_epoch"
+
+    exceptions: list[ValidationError] = []
+    command._validate_partition_mapping(exceptions)
+
+    assert [exc.field_name for exc in exceptions] == ["partition_column"]

@@ -27,7 +27,10 @@ from superset.extensions import celery_app
 from superset.security.guest_token import GuestToken
 from superset.tasks.utils import get_executor
 from superset.utils.core import override_user
-from superset.utils.screenshots import ChartScreenshot, DashboardScreenshot
+from superset.utils.screenshots import (
+    ChartScreenshot,
+    DashboardScreenshot,
+)
 from superset.utils.urls import get_url_path
 from superset.utils.webdriver import WindowSize
 
@@ -37,8 +40,8 @@ logger = logging.getLogger(__name__)
 @celery_app.task(name="cache_chart_thumbnail", soft_time_limit=300)
 def cache_chart_thumbnail(
     current_user: Optional[str],
-    chart_id: int,
-    force: bool = False,
+    chart_id: str,
+    force: bool,
     window_size: Optional[WindowSize] = None,
     thumb_size: Optional[WindowSize] = None,
 ) -> None:
@@ -55,19 +58,19 @@ def cache_chart_thumbnail(
     url = get_url_path("Superset.slice", slice_id=chart.id)
     logger.info("Caching chart: %s", url)
     _, username = get_executor(
-        executor_types=current_app.config["THUMBNAIL_EXECUTE_AS"],
+        executors=current_app.config["THUMBNAIL_EXECUTORS"],
         model=chart,
         current_user=current_user,
     )
     user = security_manager.find_user(username)
     with override_user(user):
         screenshot = ChartScreenshot(url, chart.digest)
+        screenshot.cache_scope = f"chart:{chart.id}"
         screenshot.compute_and_cache(
             user=user,
-            cache=thumbnail_cache,
-            force=force,
             window_size=window_size,
             thumb_size=thumb_size,
+            force=force,
         )
     return None
 
@@ -76,9 +79,10 @@ def cache_chart_thumbnail(
 def cache_dashboard_thumbnail(
     current_user: Optional[str],
     dashboard_id: int,
-    force: bool = False,
+    force: bool,
     thumb_size: Optional[WindowSize] = None,
     window_size: Optional[WindowSize] = None,
+    cache_key: str | None = None,
 ) -> None:
     # pylint: disable=import-outside-toplevel
     from superset.models.dashboard import Dashboard
@@ -92,19 +96,23 @@ def cache_dashboard_thumbnail(
 
     logger.info("Caching dashboard: %s", url)
     _, username = get_executor(
-        executor_types=current_app.config["THUMBNAIL_EXECUTE_AS"],
+        executors=current_app.config["THUMBNAIL_EXECUTORS"],
         model=dashboard,
         current_user=current_user,
     )
     user = security_manager.find_user(username)
     with override_user(user):
         screenshot = DashboardScreenshot(url, dashboard.digest)
+        screenshot.cache_scope = f"dashboard:{dashboard.id}"
+        resolved_cache_key = cache_key or screenshot.get_cache_key(
+            window_size, thumb_size
+        )
         screenshot.compute_and_cache(
             user=user,
-            cache=thumbnail_cache,
-            force=force,
             window_size=window_size,
             thumb_size=thumb_size,
+            force=force,
+            cache_key=resolved_cache_key,
         )
 
 
@@ -113,7 +121,7 @@ def cache_dashboard_screenshot(  # pylint: disable=too-many-arguments
     username: str,
     dashboard_id: int,
     dashboard_url: str,
-    force: bool = True,
+    force: bool,
     cache_key: Optional[str] = None,
     guest_token: Optional[GuestToken] = None,
     thumb_size: Optional[WindowSize] = None,
@@ -126,28 +134,44 @@ def cache_dashboard_screenshot(  # pylint: disable=too-many-arguments
         logging.warning("No cache set, refusing to compute")
         return
 
-    dashboard = Dashboard.get(dashboard_id)
+    cache_scope = f"dashboard:{dashboard_id}"
+    try:
+        dashboard = Dashboard.get(dashboard_id)
 
-    logger.info("Caching dashboard: %s", dashboard_url)
+        logger.info("Caching dashboard: %s", dashboard_url)
 
-    # Requests from Embedded should always use the Guest user
-    if guest_token:
-        current_user = security_manager.get_guest_user_from_token(guest_token)
-    else:
-        _, exec_username = get_executor(
-            executor_types=current_app.config["THUMBNAIL_EXECUTE_AS"],
-            model=dashboard,
-            current_user=username,
-        )
-        current_user = security_manager.find_user(exec_username)
+        # Requests from Embedded should always use the Guest user
+        if guest_token:
+            current_user = security_manager.get_guest_user_from_token(guest_token)
+        else:
+            _, exec_username = get_executor(
+                executors=current_app.config["THUMBNAIL_EXECUTORS"],
+                model=dashboard,
+                current_user=username,
+            )
+            current_user = security_manager.find_user(exec_username)
 
-    with override_user(current_user):
-        screenshot = DashboardScreenshot(dashboard_url, dashboard.digest)
-        screenshot.compute_and_cache(
-            user=current_user,
-            cache=thumbnail_cache,
-            force=force,
-            window_size=window_size,
-            thumb_size=thumb_size,
-            cache_key=cache_key,
-        )
+        with override_user(current_user):
+            screenshot = DashboardScreenshot(
+                dashboard_url,
+                dashboard.digest,
+                require_complete_capture=True,
+            )
+            screenshot.cache_scope = cache_scope
+            screenshot.compute_and_cache(
+                user=current_user,
+                window_size=window_size,
+                thumb_size=thumb_size,
+                cache_key=cache_key,
+                force=force,
+                # If broker publication was ambiguous, the producer may have
+                # marked this accepted generation Error before delivery.
+                retry_fresh_error=True,
+            )
+    except Exception:  # pylint: disable=broad-except
+        if cache_key:
+            DashboardScreenshot.mark_cache_error_if_incomplete(
+                cache_key,
+                cache_scope,
+            )
+        raise

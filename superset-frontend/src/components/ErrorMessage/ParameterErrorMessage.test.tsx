@@ -17,17 +17,18 @@
  * under the License.
  */
 
-import userEvent from '@testing-library/user-event';
 import { ErrorLevel, ErrorSource, ErrorTypeEnum } from '@superset-ui/core';
-import { render, screen } from 'spec/helpers/testing-library';
-import ParameterErrorMessage from './ParameterErrorMessage';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
+import { ParameterErrorMessage } from './ParameterErrorMessage';
 
 jest.mock(
-  'src/components/Icons/Icon',
+  '@superset-ui/core/components/Icons/AsyncIcon',
   () =>
-    ({ fileName }: { fileName: string }) => (
-      <span role="img" aria-label={fileName.replace('_', '-')} />
-    ),
+    ({ fileName }: { fileName: string }) =>
+      (
+        // eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- mirrors AsyncIcon's real span+role="img" shape
+        <span role="img" aria-label={fileName.replace('_', '-')} />
+      ),
 );
 
 const mockedProps = {
@@ -51,7 +52,7 @@ const mockedProps = {
     message: 'Error message',
   },
   source: 'dashboard' as ErrorSource,
-  subtitle: 'Error message',
+  subtitle: 'Error message subtitle',
 };
 
 test('should render', () => {
@@ -64,26 +65,26 @@ test('should render the default title', () => {
   expect(screen.getByText('Parameter error')).toBeInTheDocument();
 });
 
-test('should render the error message', () => {
+test('should render the error message', async () => {
   render(<ParameterErrorMessage {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(screen.getByText('Error message')).toBeInTheDocument();
 });
 
-test('should render the issue codes', () => {
+test('should render the issue codes', async () => {
   render(<ParameterErrorMessage {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(screen.getByText(/This may be triggered by:/)).toBeInTheDocument();
   expect(screen.getByText(/Issue code message A/)).toBeInTheDocument();
   expect(screen.getByText(/Issue code message B/)).toBeInTheDocument();
 });
 
-test('should render the suggestions', () => {
+test('should render the suggestions', async () => {
   render(<ParameterErrorMessage {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(screen.getByText(/Did you mean:/)).toBeInTheDocument();
   expect(screen.getByText('"state" instead of "stat?"')).toBeInTheDocument();
   expect(screen.getByText('"country" instead of "count?"')).toBeInTheDocument();

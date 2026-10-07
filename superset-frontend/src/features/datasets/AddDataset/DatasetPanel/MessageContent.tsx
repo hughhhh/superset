@@ -17,13 +17,14 @@
  * under the License.
  */
 
-import { t, styled } from '@superset-ui/core';
-import { EmptyStateBig } from 'src/components/EmptyState';
+import { t } from '@apache-superset/core/translation';
+import { styled } from '@apache-superset/core/theme';
+import { EmptyState } from '@superset-ui/core/components';
 import { Link } from 'react-router-dom';
 
 const StyledContainer = styled.div`
-  padding: ${({ theme }) => theme.gridUnit * 8}px
-    ${({ theme }) => theme.gridUnit * 6}px;
+  padding: ${({ theme }) => theme.sizeUnit * 8}px
+    ${({ theme }) => theme.sizeUnit * 6}px;
 
   display: flex;
   align-items: center;
@@ -31,11 +32,11 @@ const StyledContainer = styled.div`
   height: 100%;
 `;
 
-const StyledEmptyStateBig = styled(EmptyStateBig)`
+const StyledEmptyState = styled(EmptyState)`
   max-width: 50%;
 
   p {
-    width: ${({ theme }) => theme.gridUnit * 115}px;
+    width: ${({ theme }) => theme.sizeUnit * 115}px;
   }
 `;
 
@@ -51,9 +52,9 @@ const renderEmptyDescription = () => (
   <>
     {SELECT_MESSAGE}
     <Link to="/sqllab">
-      <span role="button" tabIndex={0}>
-        {CREATE_MESSAGE}
-      </span>
+      {/* Link already renders an interactive <a>, so this span needs no
+          role/tabIndex of its own. */}
+      <span>{CREATE_MESSAGE}</span>
     </Link>
     {VIEW_DATASET_MESSAGE}
   </>
@@ -64,35 +65,27 @@ export const NO_COLUMNS_TITLE = t('No table columns');
 export const NO_COLUMNS_DESCRIPTION = t(
   'This database table does not contain any data. Please select a different table.',
 );
-export const ERROR_TITLE = t('An Error Occurred');
-export const ERROR_DESCRIPTION = t(
-  'Unable to load columns for the selected table. Please select a different table.',
-);
 
 interface MessageContentProps {
-  hasError: boolean;
   tableName?: string | null;
-  hasColumns: boolean;
 }
 
 export const MessageContent = (props: MessageContentProps) => {
-  const { hasError, tableName, hasColumns } = props;
-  let currentImage: string | undefined = 'empty-dataset.svg';
+  const { tableName } = props;
+  let currentImage = 'empty-dataset.svg';
   let currentTitle = SELECT_TABLE_TITLE;
   let currentDescription = renderEmptyDescription();
-  if (hasError) {
-    currentTitle = ERROR_TITLE;
-    currentDescription = <>{ERROR_DESCRIPTION}</>;
-    currentImage = undefined;
-  } else if (tableName && !hasColumns) {
+  if (tableName) {
     currentImage = 'no-columns.svg';
     currentTitle = NO_COLUMNS_TITLE;
     currentDescription = <>{NO_COLUMNS_DESCRIPTION}</>;
   }
   return (
     <StyledContainer>
-      <StyledEmptyStateBig
+      <StyledEmptyState
         image={currentImage}
+        size="medium"
+        textSize="large"
         title={currentTitle}
         description={currentDescription}
       />

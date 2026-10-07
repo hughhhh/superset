@@ -1,0 +1,136 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { t } from '@apache-superset/core/translation';
+import {
+  CurrencyFormatter,
+  DataRecordValue,
+  getSmallNumberFormatter,
+  isDefined,
+  isEmptyDateInput,
+  isProbablyHTML,
+  sanitizeHtml,
+  DateWithFormatter,
+} from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
+import {
+  ValueFormatterParams,
+  ValueGetterParams,
+} from '@superset-ui/core/components/ThemedAgGridReact';
+import { DataColumnMeta, InputColumn } from '../types';
+
+/**
+ * Format text for cell value.
+ */
+function formatValue(
+  formatter: DataColumnMeta['formatter'],
+  value: DataRecordValue,
+  rowData?: Record<string, DataRecordValue>,
+  currencyColumn?: string,
+): [boolean, string] {
+  // render undefined as empty string
+  if (value === undefined) {
+    return [false, ''];
+  }
+  // render null as `N/A`
+  if (
+    value === null ||
+    // null/empty values in temporal columns are wrapped in a Date object, so make
+    // sure we handle them here too
+    (value instanceof DateWithFormatter && isEmptyDateInput(value.input))
+  ) {
+    return [false, 'N/A'];
+  }
+  if (formatter) {
+    // If formatter is a CurrencyFormatter, pass row context for AUTO mode
+    if (formatter instanceof CurrencyFormatter) {
+      return [false, formatter(value as number, rowData, currencyColumn)];
+    }
+    return [false, formatter(value as number)];
+  }
+  if (typeof value === 'string') {
+    return isProbablyHTML(value) ? [true, sanitizeHtml(value)] : [false, value];
+  }
+  return [false, value.toString()];
+}
+
+export function formatColumnValue(
+  column: DataColumnMeta,
+  value: DataRecordValue,
+  rowData?: Record<string, DataRecordValue>,
+) {
+  const { dataType, formatter, config = {}, currencyCodeColumn } = column;
+  const isNumber = dataType === GenericDataType.Numeric;
+  const smallNumberFormatter = getSmallNumberFormatter(
+    formatter,
+    config.d3SmallNumberFormat,
+    config.currencyFormat,
+  );
+  return formatValue(
+    isNumber && typeof value === 'number' && Math.abs(value) < 1
+      ? smallNumberFormatter
+      : formatter,
+    value,
+    rowData,
+    currencyCodeColumn,
+  );
+}
+
+export const valueFormatter = (
+  params: ValueFormatterParams,
+  col: InputColumn,
+): string => {
+  const { value, node, data } = params;
+  if (
+    isDefined(value) &&
+    value !== '' &&
+    !(value instanceof DateWithFormatter && isEmptyDateInput(value.input))
+  ) {
+    // Fall back to String(value) rather than the raw value: value can be a
+    // DateWithFormatter/Date (or other object) when col.formatter is unset or
+    // returns a falsy result, and returning that raw object here - though it
+    // satisfies this function's `: string` signature at compile time since
+    // `value`'s param type is loosely typed - crashes React with "Objects are
+    // not valid as a React child" once a cell renderer renders it directly.
+    if (col.formatter instanceof CurrencyFormatter) {
+      return (
+        col.formatter(value, data, col.currencyCodeColumn) || String(value)
+      );
+    }
+    return col.formatter?.(value) || String(value);
+  }
+  if (node?.level === -1) {
+    return '';
+  }
+  return 'N/A';
+};
+
+export const valueGetter = (params: ValueGetterParams, col: InputColumn) => {
+  // @ts-expect-error
+  if (params?.colDef?.isMain) {
+    const modifiedColId = `${t('Main')} ${params.column.getColId()}`;
+    return params.data[modifiedColId];
+  }
+  if (isDefined(params.data?.[params.column.getColId()])) {
+    return params.data[params.column.getColId()];
+  }
+  if (col.isNumeric) {
+    return undefined;
+  }
+  return '';
+};

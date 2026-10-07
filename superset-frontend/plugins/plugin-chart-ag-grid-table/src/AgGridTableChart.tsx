@@ -1,0 +1,781 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { t } from '@apache-superset/core/translation';
+import {
+  BinaryQueryObjectFilterClause,
+  DataRecord,
+  DataRecordValue,
+  DateWithFormatter,
+  extractTextFromHTML,
+  getTimeFormatterForGranularity,
+  isEmptyDateInput,
+} from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
+import {
+  toTotalsAggregate,
+  hasRenderableHeaderGroups,
+} from '@superset-ui/chart-controls';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useMemo,
+} from 'react';
+import { debounce, isEqual } from 'lodash-es';
+
+import {
+  CellClickedEvent,
+  CellContextMenuEvent,
+  SelectionChangedEvent,
+} from '@superset-ui/core/components/ThemedAgGridReact';
+import {
+  AgGridTableChartTransformedProps,
+  InputColumn,
+  SearchOption,
+  SortByItem,
+} from './types';
+import AgGridDataTable from './AgGridTable';
+import { updateTableOwnState, ClientViewSnapshot } from './utils/externalAPIs';
+import TimeComparisonVisibility from './AgGridTable/components/TimeComparisonVisibility';
+import { useColDefs } from './utils/useColDefs';
+import {
+  buildSelectionCrossFilterDataMask,
+  getCrossFilterDataMask,
+} from './utils/getCrossFilterDataMask';
+import { StyledChartContainer } from './styles';
+import type { FilterState } from './utils/filterStateManager';
+import { formatColumnValue } from './utils/formatValue';
+import getTimeRangeFromGranularity from './utils/getTimeRangeFromGranularity';
+import getScrollBarSize from './utils/getScrollBarSize';
+import { isJsonCellActionTarget } from './utils/isJsonCellActionTarget';
+import { isMainComparisonLabel } from './utils/mainComparison';
+
+export default function TableChart<D extends DataRecord = DataRecord>(
+  props: AgGridTableChartTransformedProps<D> & {},
+) {
+  const {
+    height,
+    columns,
+    data,
+    includeSearch,
+    allowRearrangeColumns,
+    allowRenderHtml,
+    jsonInCell = false,
+    pageSize,
+    serverPagination,
+    rowCount,
+    setDataMask,
+    serverPaginationData,
+    slice_id,
+    percentMetrics,
+    hasServerPageLengthChanged,
+    serverPageLength,
+    emitCrossFilters,
+    filters,
+    timeGrain,
+    isRawRecords,
+    alignPositiveNegative,
+    showCellBars,
+    isUsingTimeComparison,
+    colorPositiveNegative,
+    totals,
+    totalsAggregate,
+    showTotals,
+    columnColorFormatters,
+    basicColorFormatters,
+    width,
+    onChartStateChange,
+    chartState,
+    metricSqlExpressions,
+    rawSummaryColumns,
+    showNumberedColumn,
+    headerGroups = [],
+    zebraStriping,
+    onContextMenu,
+    formData,
+  } = props;
+
+  // The dashboard's layout engine reports a burst of close-but-not-identical
+  // width/height values while it settles on initial load. Committing each
+  // intermediate value resizes the chart container and re-fits AG Grid's
+  // columns once per value; for any column with wrapText/autoHeight (the
+  // default - see useColDefs), each re-fit can flip a borderline cell across
+  // its wrap boundary and change that row's height, which is what actually
+  // reads as "flicker" rather than the container resize itself.
+  //
+  // A scrollbar-sized threshold (matching plugin-chart-table/v1's guard)
+  // filters out sub-pixel noise, but genuine multi-step settling still gets
+  // through as several real width values in quick succession. Debouncing
+  // every commit after the first collapses that burst into the single final
+  // value once it stops changing, while still painting the first available
+  // size immediately so the chart isn't blank while it waits.
+  const [tableSize, setTableSize] = useState({ width: 0, height: 0 });
+  const hasCommittedInitialSize = useRef(false);
+
+  const debouncedSetTableSize = useMemo(
+    () =>
+      debounce((size: { width: number; height: number }) => {
+        setTableSize(size);
+      }, 250),
+    [],
+  );
+
+  useEffect(
+    () =>
+      // Cleanup debounced size commit
+      () => {
+        debouncedSetTableSize.cancel();
+      },
+    [debouncedSetTableSize],
+  );
+
+  useLayoutEffect(() => {
+    const scrollBarSize = getScrollBarSize();
+    const sizeChanged =
+      Math.abs(width - tableSize.width) > scrollBarSize ||
+      Math.abs(height - tableSize.height) > scrollBarSize;
+    if (!sizeChanged) {
+      return;
+    }
+    if (!hasCommittedInitialSize.current) {
+      hasCommittedInitialSize.current = true;
+      setTableSize({ width, height });
+    } else {
+      debouncedSetTableSize({ width, height });
+    }
+  }, [width, height, tableSize, debouncedSetTableSize]);
+
+  const [searchOptions, setSearchOptions] = useState<SearchOption[]>([]);
+
+  // Extract metric column names for SQL conversion
+  const metricColumns = useMemo(
+    () =>
+      columns
+        .filter(col => col.isMetric || col.isPercentMetric)
+        .map(col => col.key),
+    [columns],
+  );
+
+  useEffect(() => {
+    const options = columns
+      .filter(col => col?.dataType === GenericDataType.String)
+      .map(column => ({
+        value: column.key,
+        label: column.label,
+      }));
+
+    if (!isEqual(options, searchOptions)) {
+      setSearchOptions(options || []);
+    }
+  }, [columns]);
+
+  // Tracks the most recently written ownState so that writes triggered
+  // asynchronously (e.g. clientView from AG Grid's onModelUpdated, which can
+  // fire with a stale closure) merge onto the latest known state instead of
+  // a stale render-time serverPaginationData snapshot. updateTableOwnState
+  // replaces ownState wholesale, so merging at write time - rather than at
+  // render time - is what keeps concurrent writers from clobbering one
+  // another's keys.
+  const ownStateRef = useRef(serverPaginationData);
+  useEffect(() => {
+    ownStateRef.current = serverPaginationData;
+  }, [serverPaginationData]);
+
+  const writeOwnState = useCallback(
+    (patch: Record<string, unknown>) => {
+      const nextOwnState = { ...ownStateRef.current, ...patch };
+      ownStateRef.current = nextOwnState;
+      updateTableOwnState(setDataMask, nextOwnState);
+    },
+    [setDataMask],
+  );
+
+  const effectiveTotalsAggregate =
+    isRawRecords && totalsAggregate === 'ORIGINAL' ? 'SUM' : totalsAggregate;
+  const requestedTotalsAggregate =
+    serverPaginationData?.totalsAggregate === undefined
+      ? effectiveTotalsAggregate
+      : toTotalsAggregate(serverPaginationData.totalsAggregate);
+  // Preserve the requested aggregation across query-driven remounts, where
+  // a newer selection can coexist with the previous request's totals.
+  const lastTotalsAggregateRef = useRef(
+    isRawRecords && requestedTotalsAggregate === 'ORIGINAL'
+      ? 'SUM'
+      : requestedTotalsAggregate,
+  );
+
+  // A single effect owns every ownState write derived from render state.
+  // updateTableOwnState replaces ownState wholesale, so separate effects that
+  // each spread serverPaginationData in the same render would clobber one
+  // another's keys: clamping the current page, priming the raw-mode summary
+  // columns and nudging a re-query for missing totals must be one combined
+  // delta.
+  useEffect(() => {
+    const patch: Record<string, unknown> = {};
+    let changed = false;
+
+    if (serverPagination && serverPaginationData && rowCount !== undefined) {
+      const currentPage = serverPaginationData.currentPage ?? 0;
+      const currentPageSize = serverPaginationData.pageSize ?? serverPageLength;
+      const totalPages = Math.ceil(rowCount / currentPageSize);
+      // An empty result set clamps to page zero; a shrunken one clamps to its
+      // last remaining page.
+      const clampedPage = Math.max(0, Math.min(currentPage, totalPages - 1));
+      if (clampedPage !== currentPage) {
+        patch.currentPage = clampedPage;
+        changed = true;
+      }
+    }
+
+    const primed = (serverPaginationData?.rawSummaryColumns ?? []) as string[];
+    const requested = Boolean(serverPaginationData?.totalsRequested);
+    if (isRawRecords && showTotals && !isEqual(primed, rawSummaryColumns)) {
+      patch.rawSummaryColumns = rawSummaryColumns;
+      changed = true;
+    }
+    // A renderTrigger toggle re-renders without re-querying; requesting totals
+    // through ownState dispatches the standard re-query whose buildQuery
+    // carries the totals query for the active mode.
+    if (showTotals && totals === undefined && !requested) {
+      patch.totalsRequested = true;
+      patch.totalsAggregate = effectiveTotalsAggregate;
+      changed = true;
+    } else if (!showTotals && requested) {
+      patch.totalsRequested = false;
+      changed = true;
+    }
+
+    // Summary aggregation stays a renderTrigger control in Customize, but
+    // its SQL totals need a refresh even when the previous totals exist.
+    // Retain the last visible aggregation while hidden to refresh on reveal.
+    if (
+      showTotals &&
+      lastTotalsAggregateRef.current !== effectiveTotalsAggregate
+    ) {
+      patch.totalsAggregate = effectiveTotalsAggregate;
+      lastTotalsAggregateRef.current = effectiveTotalsAggregate;
+      changed = true;
+    }
+
+    if (changed) {
+      writeOwnState(patch);
+    }
+  }, [
+    serverPagination,
+    rowCount,
+    serverPageLength,
+    isRawRecords,
+    showTotals,
+    totals,
+    effectiveTotalsAggregate,
+    rawSummaryColumns,
+    serverPaginationData,
+    writeOwnState,
+  ]);
+
+  const comparisonColumns = [
+    { key: 'all', label: t('Display all') },
+    { key: '#', label: '#' },
+    { key: '△', label: '△' },
+    { key: '%', label: '%' },
+  ];
+
+  const [selectedComparisonColumns, setSelectedComparisonColumns] = useState([
+    comparisonColumns?.[0]?.key,
+  ]);
+
+  const handleColumnStateChange = useCallback(
+    (agGridState: Record<string, unknown>) => {
+      if (onChartStateChange) {
+        onChartStateChange(agGridState);
+      }
+    },
+    [onChartStateChange],
+  );
+
+  const handleFilterChanged = useCallback(
+    (completeFilterState: FilterState) => {
+      if (!serverPagination) return;
+      // Sync chartState immediately with the new filter model to prevent stale state
+      // This ensures chartState and ownState are in sync
+      if (onChartStateChange && chartState) {
+        const filterModel =
+          completeFilterState.originalFilterModel &&
+          Object.keys(completeFilterState.originalFilterModel).length > 0
+            ? completeFilterState.originalFilterModel
+            : undefined;
+        const updatedChartState = {
+          ...chartState,
+          filterModel,
+          timestamp: Date.now(),
+        };
+        onChartStateChange(updatedChartState);
+      }
+
+      // Prepare modified own state for server pagination
+      writeOwnState({
+        agGridFilterModel:
+          completeFilterState.originalFilterModel &&
+          Object.keys(completeFilterState.originalFilterModel).length > 0
+            ? completeFilterState.originalFilterModel
+            : undefined,
+        agGridSimpleFilters: completeFilterState.simpleFilters,
+        agGridComplexWhere: completeFilterState.complexWhere,
+        agGridHavingClause: completeFilterState.havingClause,
+        lastFilteredColumn: completeFilterState.lastFilteredColumn,
+        lastFilteredInputPosition: completeFilterState.inputPosition,
+        currentPage: 0, // Reset to first page when filtering
+        metricSqlExpressions,
+      });
+    },
+    [
+      writeOwnState,
+      serverPagination,
+      onChartStateChange,
+      chartState,
+      metricSqlExpressions,
+    ],
+  );
+
+  const filteredColumns = useMemo(() => {
+    if (!isUsingTimeComparison) {
+      return columns;
+    }
+    if (
+      selectedComparisonColumns.length === 0 ||
+      selectedComparisonColumns.includes('all')
+    ) {
+      return columns?.filter(col => col?.config?.visible !== false);
+    }
+
+    return columns
+      .filter(
+        col =>
+          !col.originalLabel ||
+          isMainComparisonLabel(col?.label) ||
+          selectedComparisonColumns.includes(col.label),
+      )
+      .filter(col => col?.config?.visible !== false);
+  }, [columns, selectedComparisonColumns]);
+
+  const colDefs = useColDefs({
+    columns: isUsingTimeComparison
+      ? (filteredColumns as InputColumn[])
+      : (columns as InputColumn[]),
+    data,
+    serverPagination,
+    serverPaginationData,
+    serverPageLength,
+    showNumberedColumn: showNumberedColumn && !emitCrossFilters,
+    isRawRecords,
+    defaultAlignPN: alignPositiveNegative,
+    showCellBars,
+    colorPositiveNegative,
+    columnColorFormatters,
+    allowRearrangeColumns,
+    allowRenderHtml,
+    jsonInCell,
+    basicColorFormatters,
+    isUsingTimeComparison,
+    emitCrossFilters,
+    alignPositiveNegative,
+    slice_id,
+    headerGroups,
+    conditionalFormatting: formData?.conditional_formatting,
+    comparisonColorEnabled: formData?.comparison_color_enabled,
+    comparisonColorScheme: formData?.comparison_color_scheme,
+    zebraStriping,
+  });
+
+  const isActiveFilterValue = useCallback(
+    function isActiveFilterValue(key: string, val: DataRecordValue) {
+      if (!filters || !filters[key]) return false;
+      return filters[key].some(filterVal => {
+        if (filterVal === val) return true;
+        if (filterVal instanceof Date && val instanceof Date) {
+          return filterVal.getTime() === val.getTime();
+        }
+        return false;
+      });
+    },
+    [filters],
+  );
+
+  const timestampFormatter = useCallback(
+    (value: DataRecordValue) =>
+      isRawRecords
+        ? String(value ?? '')
+        : getTimeFormatterForGranularity(timeGrain)(
+            value as number | Date | null | undefined,
+          ),
+    [timeGrain, isRawRecords],
+  );
+
+  const activeColumnRef = useRef<string | null>(null);
+
+  const handleCellClicked = useCallback(
+    (event: CellClickedEvent) => {
+      const clickTarget = event.event?.target ?? null;
+      if (isJsonCellActionTarget(clickTarget)) return;
+      if (!emitCrossFilters || !event.column) return;
+      const colDef = event.column.getColDef();
+      if (colDef.context?.isMetric || colDef.context?.isPercentMetric) return;
+
+      const key = event.column.getColId();
+      activeColumnRef.current = key;
+
+      // Re-click on already-filtered single selection → untoggle
+      // AG Grid doesn't change selection when re-clicking the same row,
+      // so onSelectionChanged won't fire — handle clear directly here
+      const selectedNodes = event.api.getSelectedNodes();
+      if (
+        selectedNodes.length === 1 &&
+        selectedNodes[0] === event.node &&
+        isActiveFilterValue(key, event.value)
+      ) {
+        event.node.setSelected(false);
+        setDataMask(
+          buildSelectionCrossFilterDataMask({
+            key,
+            values: [],
+            timeGrain,
+            timestampFormatter,
+          }).dataMask,
+        );
+      }
+    },
+    [
+      emitCrossFilters,
+      isActiveFilterValue,
+      setDataMask,
+      timeGrain,
+      timestampFormatter,
+    ],
+  );
+
+  const handleSelectionChanged = useCallback(
+    (event: SelectionChangedEvent) => {
+      // Selection changes triggered by the highlight-sync effect (source
+      // 'api') reflect a filter that was already applied elsewhere (context
+      // menu, dashboard filter, etc.), so re-deriving and re-dispatching a
+      // mask from them here would use a stale activeColumnRef and could
+      // clobber that filter with the wrong column.
+      if (
+        !emitCrossFilters ||
+        !activeColumnRef.current ||
+        event.source === 'api'
+      )
+        return;
+
+      const key = activeColumnRef.current;
+      const selectedRows = event.api.getSelectedRows();
+      const values = selectedRows
+        .map(row => row[key] as DataRecordValue)
+        .filter(v => v != null);
+
+      setDataMask(
+        buildSelectionCrossFilterDataMask({
+          key,
+          values,
+          timeGrain,
+          timestampFormatter,
+        }).dataMask,
+      );
+    },
+    [emitCrossFilters, setDataMask, timeGrain, timestampFormatter],
+  );
+
+  const drillColumns = isUsingTimeComparison
+    ? (filteredColumns as InputColumn[])
+    : (columns as InputColumn[]);
+
+  const handleContextMenu = useCallback(
+    (event: CellContextMenuEvent) => {
+      if (!onContextMenu || isRawRecords || !event.column || !event.data) {
+        return;
+      }
+      const nativeEvent = event.event as MouseEvent | null | undefined;
+      if (!nativeEvent) return;
+      nativeEvent.preventDefault();
+      nativeEvent.stopPropagation();
+
+      const rowData = event.data as Record<string, DataRecordValue>;
+      const key = event.column.getColId();
+      const cellValue = event.value as DataRecordValue;
+      const colDef = event.column.getColDef();
+      const isMetric = Boolean(
+        colDef.context?.isMetric || colDef.context?.isPercentMetric,
+      );
+
+      const drillToDetailFilters: BinaryQueryObjectFilterClause[] = [];
+      drillColumns.forEach(col => {
+        if (col.isMetric || col.isPercentMetric) return;
+        const dataRecordValue = rowData[col.key];
+
+        if (
+          dataRecordValue == null ||
+          (dataRecordValue instanceof DateWithFormatter &&
+            isEmptyDateInput(dataRecordValue.input))
+        ) {
+          drillToDetailFilters.push({
+            col: col.key,
+            op: 'IS NULL' as any,
+            val: null,
+          });
+        } else if (col.dataType === GenericDataType.Temporal && timeGrain) {
+          const startTime =
+            dataRecordValue instanceof Date
+              ? dataRecordValue
+              : new Date(dataRecordValue as string | number);
+
+          if (Number.isNaN(startTime.getTime())) {
+            // Malformed temporal value: fall back to an equality filter
+            // instead of building a TEMPORAL_RANGE, since toISOString()
+            // throws on an Invalid Date and would crash the context menu.
+            const sanitizedValue = extractTextFromHTML(dataRecordValue);
+            drillToDetailFilters.push({
+              col: col.key,
+              op: '==',
+              val: sanitizedValue as string | number | boolean,
+              formattedVal: formatColumnValue(col, sanitizedValue)[1],
+            });
+          } else {
+            const [rangeStartTime, rangeEndTime] = getTimeRangeFromGranularity(
+              startTime,
+              timeGrain,
+            );
+            const timeRangeValue = `${rangeStartTime.toISOString()} : ${rangeEndTime.toISOString()}`;
+
+            drillToDetailFilters.push({
+              col: col.key,
+              op: 'TEMPORAL_RANGE',
+              val: timeRangeValue,
+              grain: timeGrain,
+              formattedVal: formatColumnValue(col, dataRecordValue)[1],
+            });
+          }
+        } else {
+          const sanitizedValue = extractTextFromHTML(dataRecordValue);
+          drillToDetailFilters.push({
+            col: col.key,
+            op: '==',
+            val: sanitizedValue as string | number | boolean,
+            formattedVal: formatColumnValue(col, sanitizedValue)[1],
+          });
+        }
+      });
+
+      const isCellValueNull =
+        cellValue == null ||
+        (cellValue instanceof DateWithFormatter &&
+          isEmptyDateInput(cellValue.input));
+
+      onContextMenu(nativeEvent.clientX, nativeEvent.clientY, {
+        drillToDetail: drillToDetailFilters,
+        crossFilter: isMetric
+          ? undefined
+          : getCrossFilterDataMask({
+              key,
+              value: cellValue,
+              filters,
+              timeGrain,
+              isActiveFilterValue,
+              timestampFormatter,
+            }),
+        drillBy: isMetric
+          ? undefined
+          : {
+              filters: [
+                isCellValueNull
+                  ? { col: key, op: 'IS NULL' as any, val: null }
+                  : {
+                      col: key,
+                      op: '==' as any,
+                      val: extractTextFromHTML(cellValue),
+                    },
+              ],
+              groupbyFieldName: 'groupby',
+            },
+      });
+    },
+    [
+      onContextMenu,
+      isRawRecords,
+      drillColumns,
+      timeGrain,
+      filters,
+      isActiveFilterValue,
+      timestampFormatter,
+    ],
+  );
+
+  const handleServerPaginationChange = useCallback(
+    (pageNumber: number, pageSize: number) => {
+      writeOwnState({
+        currentPage: pageNumber,
+        pageSize,
+        lastFilteredColumn: undefined,
+        lastFilteredInputPosition: undefined,
+      });
+    },
+    [writeOwnState],
+  );
+
+  const handlePageSizeChange = useCallback(
+    (pageSize: number) => {
+      writeOwnState({
+        currentPage: 0,
+        pageSize,
+        lastFilteredColumn: undefined,
+        lastFilteredInputPosition: undefined,
+      });
+    },
+    [writeOwnState],
+  );
+
+  const handleChangeSearchCol = (searchCol: string) => {
+    if (!isEqual(searchCol, ownStateRef.current?.searchColumn)) {
+      writeOwnState({
+        searchColumn: searchCol,
+        searchText: '',
+        currentPage: 0, // Reset to first page when the search column changes
+        lastFilteredColumn: undefined,
+        lastFilteredInputPosition: undefined,
+      });
+    }
+  };
+
+  const handleSearch = useCallback(
+    (searchText: string) => {
+      writeOwnState({
+        searchColumn:
+          (ownStateRef.current?.searchColumn as string | undefined) ||
+          searchOptions[0]?.value,
+        searchText,
+        currentPage: 0, // Reset to first page when searching
+        lastFilteredColumn: undefined,
+        lastFilteredInputPosition: undefined,
+      });
+    },
+    [writeOwnState, searchOptions],
+  );
+
+  const handleSortByChange = useCallback(
+    (sortBy: SortByItem[]) => {
+      if (!serverPagination) return;
+      writeOwnState({
+        sortBy,
+        lastFilteredColumn: undefined,
+        lastFilteredInputPosition: undefined,
+      });
+    },
+    [writeOwnState, serverPagination],
+  );
+
+  // Feeds the "Export Current View" menu item (EXPORT_CURRENT_VIEW behavior),
+  // mirroring Table V1's clientView snapshot on ownState. Written through
+  // writeOwnState (rather than spreading serverPaginationData directly)
+  // because onModelUpdated can fire with a stale closure relative to other
+  // ownState writers (e.g. a just-applied filter), and updateTableOwnState
+  // replaces ownState wholesale.
+  const handleClientViewChange = useCallback(
+    (clientView: ClientViewSnapshot) => {
+      writeOwnState({ clientView });
+    },
+    [writeOwnState],
+  );
+
+  const renderTimeComparisonVisibility = (): JSX.Element => (
+    <TimeComparisonVisibility
+      comparisonColumns={comparisonColumns}
+      selectedComparisonColumns={selectedComparisonColumns}
+      onSelectionChange={setSelectedComparisonColumns}
+    />
+  );
+
+  const columnsForKeys = isUsingTimeComparison
+    ? (filteredColumns as InputColumn[])
+    : (columns as InputColumn[]);
+  const descriptionsKey = columnsForKeys
+    .map(col => `${col.key}:${col.description ?? ''}`)
+    .join('|');
+
+  return (
+    <StyledChartContainer
+      height={tableSize.height}
+      onContextMenu={event => {
+        // Safety net: AG Grid only calls handleContextMenu (which calls
+        // preventDefault) when it resolves the native contextmenu event to
+        // a cell. If that per-cell resolution ever misses - e.g. a second,
+        // near-duplicate contextmenu event dispatched in quick succession by
+        // some mice's right-button switches - the event still bubbles
+        // through this container, so the browser's native menu is
+        // suppressed here regardless of whether AG Grid's own handler ran.
+        if (!isRawRecords) {
+          event.preventDefault();
+        }
+      }}
+    >
+      <AgGridDataTable
+        key={descriptionsKey}
+        data={data || []}
+        colDefsFromProps={colDefs}
+        includeSearch={!!includeSearch}
+        allowRearrangeColumns={!!allowRearrangeColumns}
+        pagination={!!pageSize && !serverPagination}
+        pageSize={pageSize || 0}
+        serverPagination={serverPagination}
+        rowCount={rowCount}
+        onServerPaginationChange={handleServerPaginationChange}
+        onServerPageSizeChange={handlePageSizeChange}
+        serverPaginationData={serverPaginationData}
+        searchOptions={searchOptions}
+        onSearchColChange={handleChangeSearchCol}
+        onSearchChange={handleSearch}
+        onSortChange={handleSortByChange}
+        onFilterChanged={handleFilterChanged}
+        metricColumns={metricColumns}
+        id={slice_id}
+        handleCellClicked={handleCellClicked}
+        handleCellContextMenu={handleContextMenu}
+        handleSelectionChanged={handleSelectionChanged}
+        filters={filters}
+        isActiveFilterValue={isActiveFilterValue}
+        percentMetrics={percentMetrics}
+        serverPageLength={serverPageLength}
+        hasServerPageLengthChanged={hasServerPageLengthChanged}
+        renderTimeComparisonDropdown={
+          isUsingTimeComparison ? renderTimeComparisonVisibility : () => null
+        }
+        cleanedTotals={totals || {}}
+        showTotals={
+          showTotals && totals !== undefined && Object.keys(totals).length > 0
+        }
+        width={tableSize.width}
+        onColumnStateChange={handleColumnStateChange}
+        chartState={chartState}
+        onClientViewChange={handleClientViewChange}
+        zebraStriping={!!zebraStriping}
+        resetColumnOrder={hasRenderableHeaderGroups(headerGroups, columns)}
+      />
+    </StyledChartContainer>
+  );
+}

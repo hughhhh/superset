@@ -17,8 +17,7 @@
  * under the License.
  */
 
-import userEvent from '@testing-library/user-event';
-import { render, screen } from 'spec/helpers/testing-library';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import { FilterBarOrientation } from 'src/dashboard/types';
 import FilterDivider from './FilterDivider';
 
@@ -87,7 +86,7 @@ test('horizontal mode, title and description', async () => {
   expect(description).not.toBeInTheDocument();
   const descriptionIcon = screen.getByTestId('divider-description-icon');
   expect(descriptionIcon).toBeVisible();
-  userEvent.hover(descriptionIcon);
+  await userEvent.hover(descriptionIcon);
   const tooltip = await screen.findByRole('tooltip');
 
   expect(tooltip).toBeInTheDocument();

@@ -67,7 +67,7 @@ export interface Aggregates {
 export type DefaultPostProcessing = undefined;
 
 interface _PostProcessingAggregation {
-  operation: 'aggregation';
+  operation: 'aggregate';
   options: {
     groupby: string[];
     aggregates: Aggregates;
@@ -97,6 +97,7 @@ interface _PostProcessingContribution {
     orientation?: 'row' | 'column';
     columns?: string[];
     rename_columns?: string[];
+    contribution_totals?: Record<string, number>;
   };
 }
 export type PostProcessingContribution =
@@ -137,7 +138,7 @@ export type PostProcessingProphet =
 interface _PostProcessingDiff {
   operation: 'diff';
   options: {
-    columns: string[];
+    columns: Record<string, string>;
     periods: number;
     axis: PandasAxis;
   };
@@ -150,7 +151,7 @@ interface _PostProcessingRolling {
     rolling_type: RollingType;
     window: number;
     min_periods: number;
-    columns: string[];
+    columns: Record<string, string>;
   };
 }
 export type PostProcessingRolling =
@@ -160,7 +161,7 @@ export type PostProcessingRolling =
 interface _PostProcessingCum {
   operation: 'cum';
   options: {
-    columns: string[];
+    columns: Record<string, string>;
     operator: NumpyFunction;
   };
 }
@@ -195,6 +196,13 @@ interface _PostProcessingResample {
     method: string;
     rule: string;
     fill_value?: number | null;
+    /**
+     * Pad the result so it covers the whole time range of the query instead of
+     * only the span between the first and last data point. The boundaries are
+     * resolved server side, since a time range may be expressed in natural
+     * language (e.g. `Last week`).
+     */
+    fill_time_range?: boolean;
   };
 }
 export type PostProcessingResample =
@@ -271,7 +279,7 @@ export type PostProcessingRule =
 export function isPostProcessingAggregation(
   rule?: PostProcessingRule,
 ): rule is PostProcessingAggregation {
-  return rule?.operation === 'aggregation';
+  return rule?.operation === 'aggregate';
 }
 
 export function isPostProcessingBoxplot(

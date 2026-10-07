@@ -147,6 +147,16 @@ class SupersetGenericDBErrorException(SupersetErrorFromParamsException):
         )
 
 
+class SupersetVirtualTableParseException(SupersetGenericDBErrorException):
+    """Raised when a virtual dataset's SQL cannot be parsed/templated.
+
+    Distinct from generic DB errors so callers can soften template/parse
+    failures (which cannot be validated at save time without runtime
+    context) without also swallowing genuine driver, connection, or
+    permission errors from the same code path. See #38012.
+    """
+
+
 class SupersetTemplateParamsErrorException(SupersetErrorFromParamsException):
     status = 400
 
@@ -188,7 +198,7 @@ class NullValueException(SupersetException):
 
 
 class SupersetTemplateException(SupersetException):
-    pass
+    status = 422
 
 
 class SpatialException(SupersetException):
@@ -196,7 +206,26 @@ class SpatialException(SupersetException):
 
 
 class CertificateException(SupersetException):
-    message = _("Invalid certificate")
+    def __init__(
+        self,
+        message: str = "",
+        exception: Optional[Exception] = None,
+        error_type: Optional[SupersetErrorType] = None,
+    ) -> None:
+        """Translate the default certificate error when constructing the exception.
+
+        Replaces this subclass's class-level ``message`` default with
+        construction-time translation, which resolves to a
+        plain ``str`` inside the request that raises, so no LazyString
+        can leak into ``to_dict()`` / JSON error bodies (the degradation
+        class fixed for ``json_error_response``). The class-level
+        ``message`` falls back to the base's empty default.
+        """
+        super().__init__(
+            message=message or _("Invalid certificate"),
+            exception=exception,
+            error_type=error_type,
+        )
 
 
 class DatabaseNotFound(SupersetException):
@@ -334,6 +363,9 @@ class SupersetParseError(SupersetErrorException):
         )
         super().__init__(error)
 
+    def __str__(self) -> str:
+        return self.error.message
+
 
 class OAuth2RedirectError(SupersetErrorException):
     """
@@ -350,9 +382,9 @@ class OAuth2RedirectError(SupersetErrorException):
 
     See the `OAuth2RedirectMessage.tsx` component for more details of how this
     information is handled.
-
-    TODO (betodealmeida): change status to 403.
     """
+
+    status = 403
 
     def __init__(self, url: str, tab_id: str, redirect_uri: str):
         super().__init__(
@@ -362,6 +394,32 @@ class OAuth2RedirectError(SupersetErrorException):
                 level=ErrorLevel.WARNING,
                 extra={"url": url, "tab_id": tab_id, "redirect_uri": redirect_uri},
             )
+        )
+
+
+class OAuth2TokenRefreshError(OAuth2RedirectError):
+    """
+    Raised when an OAuth2 refresh token request fails with a 400/401/403 error.
+    The stored token is no longer valid and the user must re-authenticate.
+
+    Subclasses OAuth2RedirectError as a sanitized re-authentication marker.
+    ``check_for_oauth2`` recognizes it independently of vendor-specific exception
+    classifiers and calls ``start_oauth2_dance`` to attach the authorization metadata.
+    The optional provider response is accepted for compatibility but discarded so
+    provider payloads cannot reach logs or API responses through the exception.
+    """
+
+    def __init__(  # pylint: disable=unused-argument
+        self,
+        response_text: str | None = None,
+    ) -> None:
+        SupersetErrorException.__init__(
+            self,
+            SupersetError(
+                message="OAuth2 token refresh failed, re-authentication required.",
+                error_type=SupersetErrorType.OAUTH2_REDIRECT,
+                level=ErrorLevel.WARNING,
+            ),
         )
 
 
@@ -381,7 +439,30 @@ class OAuth2Error(SupersetErrorException):
         )
 
 
-class DisallowedSQLFunction(SupersetErrorException):
+class OAuth2RejectedError(SupersetErrorException):
+    """
+    Exception for when the OAuth2 callback itself can't be completed.
+
+    Raised when the provider denies authorization or the callback request
+    can't be trusted (missing/invalid state, no authenticated session).
+    These are conditions the caller could correct by retrying the OAuth2
+    flow, so unlike ``OAuth2Error`` this maps to a 4xx response instead of
+    a 500.
+    """
+
+    status = 400
+
+    def __init__(self, error: str):
+        super().__init__(
+            SupersetError(
+                message=error,
+                error_type=SupersetErrorType.OAUTH2_REDIRECT_ERROR,
+                level=ErrorLevel.WARNING,
+            )
+        )
+
+
+class SupersetDisallowedSQLFunctionException(SupersetErrorException):
     """
     Disallowed function found on SQL statement
     """
@@ -396,15 +477,56 @@ class DisallowedSQLFunction(SupersetErrorException):
         )
 
 
-class CreateKeyValueDistributedLockFailedException(Exception):  # noqa: N818
+class SupersetDisallowedSQLTableException(SupersetErrorException):
+    """
+    Disallowed table/view found in SQL statement
+    """
+
+    def __init__(self, tables: set[str]):
+        super().__init__(
+            SupersetError(
+                message=f"SQL statement references disallowed table(s): {tables}",
+                error_type=SupersetErrorType.SYNTAX_ERROR,
+                level=ErrorLevel.ERROR,
+            )
+        )
+
+
+class SupersetDisallowedClientFileTransferException(SupersetErrorException):
+    """
+    Client-side file-transfer command found in SQL statement
+    """
+
+    def __init__(self, commands: list[str]):
+        super().__init__(
+            SupersetError(
+                message=(
+                    "SQL statement contains disallowed client-side "
+                    f"file-transfer command(s): {', '.join(commands)}"
+                ),
+                error_type=SupersetErrorType.SYNTAX_ERROR,
+                level=ErrorLevel.ERROR,
+            )
+        )
+
+
+class AcquireDistributedLockFailedException(Exception):  # noqa: N818
     """
     Exception to signalize failure to acquire lock.
     """
 
 
-class DeleteKeyValueDistributedLockFailedException(Exception):  # noqa: N818
+class LockAlreadyHeldException(AcquireDistributedLockFailedException):  # noqa: N818
     """
-    Exception to signalize failure to delete lock.
+    Raised when a distributed lock is already held by another process (lock contention).
+    Subclass of AcquireDistributedLockFailedException so existing callers that catch
+    the base exception continue to work unchanged.
+    """
+
+
+class ReleaseDistributedLockFailedException(Exception):  # noqa: N818
+    """
+    Exception to signalize failure to release lock.
     """
 
 
@@ -432,3 +554,58 @@ class TableNotFoundException(SupersetErrorException):
                 level=ErrorLevel.ERROR,
             )
         )
+
+
+class SupersetDMLNotAllowedException(SupersetErrorException):
+    def __init__(self) -> None:
+        error = SupersetError(
+            message=_(
+                "This database does not allow for DDL/DML, but the query mutates "
+                "data. Please contact your administrator for more assistance."
+            ),
+            error_type=SupersetErrorType.DML_NOT_ALLOWED_ERROR,
+            level=ErrorLevel.ERROR,
+        )
+        super().__init__(error)
+
+
+class SupersetInvalidCTASException(SupersetErrorException):
+    def __init__(self) -> None:
+        error = SupersetError(
+            message=_(
+                "CTAS (create table as select) can only be run with a query where "
+                "the last statement is a SELECT. Please make sure your query has "
+                "a SELECT as its last statement. Then, try running your query again."
+            ),
+            error_type=SupersetErrorType.INVALID_CTAS_QUERY_ERROR,
+            level=ErrorLevel.ERROR,
+        )
+        super().__init__(error)
+
+
+class SupersetInvalidCVASException(SupersetErrorException):
+    def __init__(self) -> None:
+        error = SupersetError(
+            message=_(
+                "CVAS (create view as select) can only be run with a query with "
+                "a single SELECT statement. Please make sure your query has only "
+                "a SELECT statement. Then, try running your query again."
+            ),
+            error_type=SupersetErrorType.INVALID_CVAS_QUERY_ERROR,
+            level=ErrorLevel.ERROR,
+        )
+        super().__init__(error)
+
+
+class SupersetResultsBackendNotConfigureException(SupersetErrorException):
+    def __init__(self) -> None:
+        error = SupersetError(
+            message=_("Results backend is not configured."),
+            error_type=SupersetErrorType.RESULTS_BACKEND_NOT_CONFIGURED_ERROR,
+            level=ErrorLevel.ERROR,
+        )
+        super().__init__(error)
+
+
+class ScreenshotImageNotAvailableException(SupersetException):
+    status = 404

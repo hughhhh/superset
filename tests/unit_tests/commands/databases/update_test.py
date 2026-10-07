@@ -15,86 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from pytest_mock import MockerFixture
 
+from superset import db
+from superset.commands.database.exceptions import (
+    DatabaseConnectionFailedError,
+    DatabaseInvalidError,
+)
 from superset.commands.database.update import UpdateDatabaseCommand
-from superset.db_engine_specs.base import BaseEngineSpec
-from superset.exceptions import OAuth2RedirectError
+from superset.constants import PASSWORD_MASK
+from superset.databases.ssh_tunnel.models import SSHTunnel
 from superset.extensions import security_manager
+from superset.models.core import Database
 from superset.utils import json
-
-oauth2_client_info = {
-    "id": "client_id",
-    "secret": "client_secret",
-    "scope": "scope-a",
-    "redirect_uri": "redirect_uri",
-    "authorization_request_uri": "auth_uri",
-    "token_request_uri": "token_uri",
-    "request_content_type": "json",
-}
-
-
-@pytest.fixture
-def database_with_catalog(mocker: MockerFixture) -> MagicMock:
-    """
-    Mock a database with catalogs and schemas.
-    """
-    database = mocker.MagicMock()
-    database.database_name = "my_db"
-    database.db_engine_spec.__name__ = "test_engine"
-    database.db_engine_spec.supports_catalog = True
-    database.get_all_catalog_names.return_value = ["catalog1", "catalog2"]
-    database.get_all_schema_names.side_effect = [
-        ["schema1", "schema2"],
-        ["schema3", "schema4"],
-    ]
-    database.get_default_catalog.return_value = "catalog2"
-
-    return database
-
-
-@pytest.fixture
-def database_without_catalog(mocker: MockerFixture) -> MagicMock:
-    """
-    Mock a database without catalogs.
-    """
-    database = mocker.MagicMock()
-    database.database_name = "my_db"
-    database.db_engine_spec.__name__ = "test_engine"
-    database.db_engine_spec.supports_catalog = False
-    database.get_all_schema_names.return_value = ["schema1", "schema2"]
-
-    return database
-
-
-@pytest.fixture
-def database_needs_oauth2(mocker: MockerFixture) -> MagicMock:
-    """
-    Mock a database without catalogs that needs OAuth2.
-    """
-    database = mocker.MagicMock()
-    database.database_name = "my_db"
-    database.db_engine_spec.__name__ = "test_engine"
-    database.db_engine_spec.supports_catalog = False
-    database.get_all_schema_names.side_effect = OAuth2RedirectError(
-        "url",
-        "tab_id",
-        "redirect_uri",
-    )
-    database.encrypted_extra = json.dumps({"oauth2_client_info": oauth2_client_info})
-    database.db_engine_spec.unmask_encrypted_extra = (
-        BaseEngineSpec.unmask_encrypted_extra
-    )
-
-    return database
+from tests.conftest import with_config
+from tests.unit_tests.commands.databases.conftest import oauth2_client_info
 
 
 def test_update_with_catalog(
     mocker: MockerFixture,
-    database_with_catalog: MockerFixture,
+    database_with_catalog: MagicMock,
 ) -> None:
     """
     Test that permissions are updated correctly.
@@ -111,9 +55,15 @@ def test_update_with_catalog(
     When update is called, only `catalog2.schema3` has permissions associated with it,
     so `catalog1.*` and `catalog2.schema4` are added.
     """
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
-    DatabaseDAO.find_by_id.return_value = database_with_catalog
-    DatabaseDAO.update.return_value = database_with_catalog
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_with_catalog
+    database_dao.update.return_value = database_with_catalog
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_with_catalog
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
@@ -128,23 +78,64 @@ def test_update_with_catalog(
         None,
         None,
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     UpdateDatabaseCommand(1, {}).run()
 
-    add_permission_view_menu.assert_has_calls(
+    add_pvm.assert_has_calls(
         [
             # first catalog is added with all schemas
-            mocker.call("catalog_access", "[my_db].[catalog1]"),
-            mocker.call("schema_access", "[my_db].[catalog1].[schema1]"),
-            mocker.call("schema_access", "[my_db].[catalog1].[schema2]"),
+            mocker.call(
+                db.session, security_manager, "catalog_access", "[my_db].[catalog1]"
+            ),
+            mocker.call(
+                db.session,
+                security_manager,
+                "schema_access",
+                "[my_db].[catalog1].[schema1]",
+            ),
+            mocker.call(
+                db.session,
+                security_manager,
+                "schema_access",
+                "[my_db].[catalog1].[schema2]",
+            ),
             # second catalog already exists, only `schema4` is added
-            mocker.call("schema_access", "[my_db].[catalog2].[schema4]"),
+            mocker.call(
+                db.session,
+                security_manager,
+                "schema_access",
+                f"[{database_with_catalog.name}].[catalog2].[schema4]",
+            ),
         ],
     )
+
+
+@with_config({"SYNC_DB_PERMISSIONS_IN_ASYNC_MODE": True})
+def test_update_sync_perms_in_async_mode(
+    mocker: MockerFixture,
+    database_with_catalog: MagicMock,
+) -> None:
+    """
+    Test that updating a DB connection with async mode enables
+    triggers the celery task to syn perms.
+    """
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_with_catalog
+    database_dao.update.return_value = database_with_catalog
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_with_catalog
+    sync_task = mocker.patch(
+        "superset.commands.database.sync_permissions.sync_database_permissions_task.delay"
+    )
+    mocker.patch("superset.commands.database.update.get_username", return_value="admin")
+    mock_user = mocker.patch("superset.security_manager.get_user_by_username")
+
+    UpdateDatabaseCommand(1, {}).run()
+
+    sync_task.assert_called_once_with(1, mock_user.return_value.id, "my_db")
 
 
 def test_update_without_catalog(
@@ -162,9 +153,15 @@ def test_update_without_catalog(
     When update is called, only `schema2` has permissions associated with it, so `schema1`
     is added.
     """  # noqa: E501
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
-    DatabaseDAO.find_by_id.return_value = database_without_catalog
-    DatabaseDAO.update.return_value = database_without_catalog
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_without_catalog
+    database_dao.update.return_value = database_without_catalog
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_without_catalog
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
@@ -174,22 +171,21 @@ def test_update_without_catalog(
         None,  # schema1 has no permissions
         "[my_db].[schema2]",  # second schema already exists
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     UpdateDatabaseCommand(1, {}).run()
 
-    add_permission_view_menu.assert_called_with(
+    add_pvm.assert_called_with(
+        db.session,
+        security_manager,
         "schema_access",
-        "[my_db].[schema1]",
+        f"[{database_without_catalog.name}].[schema1]",
     )
 
 
 def test_rename_with_catalog(
     mocker: MockerFixture,
-    database_with_catalog: MockerFixture,
+    database_with_catalog: MagicMock,
 ) -> None:
     """
     Test that permissions are renamed correctly.
@@ -207,25 +203,33 @@ def test_rename_with_catalog(
     so `catalog1.*` and `catalog2.schema4` are added. Additionally, the database has
     been renamed from `my_db` to `my_other_db`.
     """
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
     original_database = mocker.MagicMock()
     original_database.database_name = "my_db"
-    DatabaseDAO.find_by_id.return_value = original_database
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = original_database
     database_with_catalog.database_name = "my_other_db"
-    DatabaseDAO.update.return_value = database_with_catalog
+    database_dao.update.return_value = database_with_catalog
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_with_catalog
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     dataset = mocker.MagicMock()
     chart = mocker.MagicMock()
-    DatabaseDAO.get_datasets.return_value = [dataset]
-    DatasetDAO = mocker.patch("superset.commands.database.update.DatasetDAO")  # noqa: N806
-    DatasetDAO.get_related_objects.return_value = {"charts": [chart]}
+    sync_db_perms_dao.get_datasets.return_value = [dataset]
+    dataset_dao = mocker.patch("superset.commands.database.sync_permissions.DatasetDAO")
+    dataset_dao.get_related_objects.return_value = {"charts": [chart]}
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
         "find_permission_view_menu",
     )
     catalog2_pvm = mocker.MagicMock()
+    catalog2_pvm.view_menu.name = "[my_db].[catalog2]"
     catalog2_schema3_pvm = mocker.MagicMock()
+    catalog2_schema3_pvm.view_menu.name = "[my_db].[catalog2].[schema3]"
     find_permission_view_menu.side_effect = [
         # these are called when adding the permissions:
         None,  # first catalog is new
@@ -237,31 +241,52 @@ def test_rename_with_catalog(
         catalog2_schema3_pvm,  # old [my_db].[catalog2].[schema3]
         None,  # [my_db].[catalog2].[schema4] doesn't exist
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
+    add_vm = mocker.patch("superset.commands.database.sync_permissions.add_vm")
 
     UpdateDatabaseCommand(1, {}).run()
 
-    add_permission_view_menu.assert_has_calls(
+    add_pvm.assert_has_calls(
         [
             # first catalog is added with all schemas with the new DB name
-            mocker.call("catalog_access", "[my_other_db].[catalog1]"),
-            mocker.call("schema_access", "[my_other_db].[catalog1].[schema1]"),
-            mocker.call("schema_access", "[my_other_db].[catalog1].[schema2]"),
+            mocker.call(
+                db.session,
+                security_manager,
+                "catalog_access",
+                "[my_other_db].[catalog1]",
+            ),
+            mocker.call(
+                db.session,
+                security_manager,
+                "schema_access",
+                "[my_other_db].[catalog1].[schema1]",
+            ),
+            mocker.call(
+                db.session,
+                security_manager,
+                "schema_access",
+                "[my_other_db].[catalog1].[schema2]",
+            ),
             # second catalog already exists, only `schema4` is added
-            mocker.call("schema_access", "[my_other_db].[catalog2].[schema4]"),
+            mocker.call(
+                db.session,
+                security_manager,
+                "schema_access",
+                f"[{database_with_catalog.name}].[catalog2].[schema4]",
+            ),
         ],
     )
 
-    assert catalog2_pvm.view_menu.name == "[my_other_db].[catalog2]"
-    assert catalog2_schema3_pvm.view_menu.name == "[my_other_db].[catalog2].[schema3]"
+    assert catalog2_pvm.view_menu == add_vm.return_value
+    assert (
+        catalog2_schema3_pvm.view_menu.name
+        == f"[{database_with_catalog.name}].[catalog2].[schema3]"
+    )
 
-    assert dataset.catalog_perm == "[my_other_db].[catalog2]"
-    assert dataset.schema_perm == "[my_other_db].[catalog2].[schema4]"
-    assert chart.catalog_perm == "[my_other_db].[catalog2]"
-    assert chart.schema_perm == "[my_other_db].[catalog2].[schema4]"
+    assert dataset.catalog_perm == f"[{database_with_catalog.name}].[catalog2]"
+    assert dataset.schema_perm == f"[{database_with_catalog.name}].[catalog2].[schema4]"
+    assert chart.catalog_perm == f"[{database_with_catalog.name}].[catalog2]"
+    assert chart.schema_perm == f"[{database_with_catalog.name}].[catalog2].[schema4]"
 
 
 def test_rename_without_catalog(
@@ -279,38 +304,92 @@ def test_rename_without_catalog(
     When update is called, only `schema2` has permissions associated with it, so `schema1`
     is added. Additionally, the database has been renamed from `my_db` to `my_other_db`.
     """  # noqa: E501
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
     original_database = mocker.MagicMock()
     original_database.database_name = "my_db"
-    DatabaseDAO.find_by_id.return_value = original_database
     database_without_catalog.database_name = "my_other_db"
-    DatabaseDAO.update.return_value = database_without_catalog
-    DatabaseDAO.get_datasets.return_value = []
+    database_dao.update.return_value = database_without_catalog
+    database_dao.find_by_id.return_value = original_database
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_without_catalog
+    sync_db_perms_dao.get_datasets.return_value = []
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
         "find_permission_view_menu",
     )
     schema2_pvm = mocker.MagicMock()
+    schema2_pvm.view_menu.name = "[my_db].[schema2]"
     find_permission_view_menu.side_effect = [
         None,  # schema1 has no permissions
         "[my_db].[schema2]",  # second schema already exists
         None,  # [my_db].[schema1] doesn't exist
         schema2_pvm,  # old [my_db].[schema2]
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     UpdateDatabaseCommand(1, {}).run()
 
-    add_permission_view_menu.assert_called_with(
+    add_pvm.assert_called_with(
+        db.session,
+        security_manager,
         "schema_access",
-        "[my_other_db].[schema1]",
+        f"[{database_without_catalog.name}].[schema1]",
     )
 
-    assert schema2_pvm.view_menu.name == "[my_other_db].[schema2]"
+    assert schema2_pvm.view_menu.name == f"[{database_without_catalog.name}].[schema2]"
+
+
+def test_rename_without_catalog_with_assets(
+    mocker: MockerFixture,
+    database_without_catalog: MockerFixture,
+) -> None:
+    """
+    Test that permissions are renamed correctly when the DB connection does not support
+    catalogs, and it has assets associated with it.
+    """
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    original_database = mocker.MagicMock()
+    original_database.database_name = "my_db"
+    database_without_catalog.database_name = "my_other_db"
+    database_without_catalog.get_all_schema_names.return_value = ["schema1"]
+    database_dao.update.return_value = database_without_catalog
+    database_dao.find_by_id.return_value = original_database
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_without_catalog
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
+
+    dataset = mocker.MagicMock()
+    chart = mocker.MagicMock()
+    sync_db_perms_dao.get_datasets.return_value = [dataset]
+    dataset_dao = mocker.patch("superset.commands.database.sync_permissions.DatasetDAO")
+    dataset_dao.get_related_objects.return_value = {"charts": [chart]}
+
+    find_permission_view_menu = mocker.patch.object(
+        security_manager,
+        "find_permission_view_menu",
+    )
+    schema_pvm = mocker.MagicMock()
+    schema_pvm.view_menu.name = "[my_db].[schema1]"
+    find_permission_view_menu.side_effect = [
+        "[my_db].[schema1]",
+        schema_pvm,
+    ]
+
+    UpdateDatabaseCommand(1, {}).run()
+
+    assert schema_pvm.view_menu.name == f"[{database_without_catalog.name}].[schema1]"
+    assert dataset.schema_perm == f"[{database_without_catalog.name}].[schema1]"
+    assert dataset.catalog_perm is None
+    assert chart.catalog_perm is None
+    assert chart.schema_perm == f"[{database_without_catalog.name}].[schema1]"
 
 
 def test_update_with_oauth2(
@@ -320,9 +399,15 @@ def test_update_with_oauth2(
     """
     Test that the database can be updated even if OAuth2 is needed to connect.
     """
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
-    DatabaseDAO.find_by_id.return_value = database_needs_oauth2
-    DatabaseDAO.update.return_value = database_needs_oauth2
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_needs_oauth2
+    database_dao.update.return_value = database_needs_oauth2
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_needs_oauth2
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
@@ -332,14 +417,11 @@ def test_update_with_oauth2(
         None,  # schema1 has no permissions
         "[my_db].[schema2]",  # second schema already exists
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     UpdateDatabaseCommand(1, {}).run()
 
-    add_permission_view_menu.assert_not_called()
+    add_pvm.assert_not_called()
     database_needs_oauth2.purge_oauth2_tokens.assert_not_called()
 
 
@@ -350,9 +432,15 @@ def test_update_with_oauth2_changed(
     """
     Test that the database can be updated even if OAuth2 is needed to connect.
     """
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
-    DatabaseDAO.find_by_id.return_value = database_needs_oauth2
-    DatabaseDAO.update.return_value = database_needs_oauth2
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_needs_oauth2
+    database_dao.update.return_value = database_needs_oauth2
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_needs_oauth2
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
@@ -362,10 +450,7 @@ def test_update_with_oauth2_changed(
         None,  # schema1 has no permissions
         "[my_db].[schema2]",  # second schema already exists
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     modified_oauth2_client_info = oauth2_client_info.copy()
     modified_oauth2_client_info["scope"] = "scope-b"
@@ -379,7 +464,7 @@ def test_update_with_oauth2_changed(
         },
     ).run()
 
-    add_permission_view_menu.assert_not_called()
+    add_pvm.assert_not_called()
     database_needs_oauth2.purge_oauth2_tokens.assert_called()
 
 
@@ -390,9 +475,15 @@ def test_remove_oauth_config_purges_tokens(
     """
     Test that removing the OAuth config from a database purges existing tokens.
     """
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
-    DatabaseDAO.find_by_id.return_value = database_needs_oauth2
-    DatabaseDAO.update.return_value = database_needs_oauth2
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_needs_oauth2
+    database_dao.update.return_value = database_needs_oauth2
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_needs_oauth2
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
@@ -402,20 +493,68 @@ def test_remove_oauth_config_purges_tokens(
         None,
         "[my_db].[schema2]",
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     UpdateDatabaseCommand(1, {"masked_encrypted_extra": None}).run()
 
-    add_permission_view_menu.assert_not_called()
+    add_pvm.assert_not_called()
     database_needs_oauth2.purge_oauth2_tokens.assert_called()
 
     UpdateDatabaseCommand(1, {"masked_encrypted_extra": "{}"}).run()
 
-    add_permission_view_menu.assert_not_called()
+    add_pvm.assert_not_called()
     database_needs_oauth2.purge_oauth2_tokens.assert_called()
+
+
+def test_update_oauth2_removes_masked_encrypted_extra_key(
+    mocker: MockerFixture,
+    database_needs_oauth2: MockerFixture,
+) -> None:
+    """
+    Test that the ``masked_encrypted_extra`` key is properly purged from the properties.
+    """
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_needs_oauth2
+    database_dao.update.return_value = database_needs_oauth2
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_needs_oauth2
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
+
+    find_permission_view_menu = mocker.patch.object(
+        security_manager,
+        "find_permission_view_menu",
+    )
+    find_permission_view_menu.side_effect = [
+        None,
+        "[my_db].[schema2]",
+    ]
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
+
+    modified_oauth2_client_info = oauth2_client_info.copy()
+    modified_oauth2_client_info["scope"] = "scope-b"
+
+    UpdateDatabaseCommand(
+        1,
+        {
+            "masked_encrypted_extra": json.dumps(
+                {"oauth2_client_info": modified_oauth2_client_info}
+            )
+        },
+    ).run()
+
+    add_pvm.assert_not_called()
+    database_needs_oauth2.purge_oauth2_tokens.assert_called()
+    database_dao.update.assert_called_with(
+        database_needs_oauth2,
+        {
+            "encrypted_extra": json.dumps(
+                {"oauth2_client_info": modified_oauth2_client_info}
+            )
+        },
+    )
 
 
 def test_update_other_fields_dont_affect_oauth(
@@ -426,9 +565,15 @@ def test_update_other_fields_dont_affect_oauth(
     Test that not including ``masked_encrypted_extra`` in the payload does not
     touch the OAuth config.
     """
-    DatabaseDAO = mocker.patch("superset.commands.database.update.DatabaseDAO")  # noqa: N806
-    DatabaseDAO.find_by_id.return_value = database_needs_oauth2
-    DatabaseDAO.update.return_value = database_needs_oauth2
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database_needs_oauth2
+    database_dao.update.return_value = database_needs_oauth2
+    sync_db_perms_dao = mocker.patch(
+        "superset.commands.database.sync_permissions.DatabaseDAO"
+    )
+    sync_db_perms_dao.find_by_id.return_value = database_needs_oauth2
+    mocker.patch("superset.commands.database.update.get_username")
+    mocker.patch("superset.security_manager.get_user_by_username")
 
     find_permission_view_menu = mocker.patch.object(
         security_manager,
@@ -438,12 +583,705 @@ def test_update_other_fields_dont_affect_oauth(
         None,
         "[my_db].[schema2]",
     ]
-    add_permission_view_menu = mocker.patch.object(
-        security_manager,
-        "add_permission_view_menu",
-    )
+    add_pvm = mocker.patch("superset.commands.database.sync_permissions.add_pvm")
 
     UpdateDatabaseCommand(1, {"database_name": "New DB name"}).run()
 
-    add_permission_view_menu.assert_not_called()
+    add_pvm.assert_not_called()
     database_needs_oauth2.purge_oauth2_tokens.assert_not_called()
+
+
+def test_update_with_catalog_change(mocker: MockerFixture) -> None:
+    """
+    Test that assets are updated when the main catalog changes.
+    """
+    old_database = mocker.MagicMock(allow_multi_catalog=False)
+    old_database.get_default_catalog.return_value = "project-A"
+    old_database.id = 1
+
+    new_database = mocker.MagicMock(allow_multi_catalog=False)
+    new_database.get_default_catalog.return_value = "project-B"
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = old_database
+    database_dao.update.return_value = new_database
+
+    mocker.patch("superset.commands.database.update.SyncPermissionsCommand")
+    mocker.patch.object(
+        UpdateDatabaseCommand,
+        "validate",
+    )
+    update_catalog_attribute = mocker.patch.object(
+        UpdateDatabaseCommand,
+        "_update_catalog_attribute",
+    )
+
+    UpdateDatabaseCommand(1, {}).run()
+
+    update_catalog_attribute.assert_called_once_with(1, "project-B")
+
+
+def test_update_without_catalog_change(mocker: MockerFixture) -> None:
+    """
+    Test that assets are not updated when the main catalog doesn't change.
+    """
+    old_database = mocker.MagicMock(allow_multi_catalog=False)
+    old_database.database_name = "Ye Old DB"
+    old_database.get_default_catalog.return_value = "project-A"
+    old_database.id = 1
+
+    new_database = mocker.MagicMock(allow_multi_catalog=False)
+    new_database.database_name = "Fancy new DB"
+    new_database.get_default_catalog.return_value = "project-A"
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = old_database
+    database_dao.update.return_value = new_database
+
+    mocker.patch("superset.commands.database.update.SyncPermissionsCommand")
+    mocker.patch.object(
+        UpdateDatabaseCommand,
+        "validate",
+    )
+    update_catalog_attribute = mocker.patch.object(
+        UpdateDatabaseCommand,
+        "_update_catalog_attribute",
+    )
+
+    UpdateDatabaseCommand(1, {}).run()
+
+    update_catalog_attribute.assert_not_called()
+
+
+def test_update_broken_connection(mocker: MockerFixture) -> None:
+    """
+    Test that updating a database with a broken connection works
+    even if it has to run a query to get the default catalog.
+    """
+    database = mocker.MagicMock()
+    database.get_default_catalog.side_effect = Exception("Broken connection")
+    database.id = 1
+    new_db = mocker.MagicMock()
+    new_db.get_default_catalog.return_value = "main"
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = database
+    database_dao.update.return_value = new_db
+    mocker.patch("superset.commands.database.update.SyncPermissionsCommand")
+
+    update_catalog_attribute = mocker.patch.object(
+        UpdateDatabaseCommand,
+        "_update_catalog_attribute",
+    )
+    UpdateDatabaseCommand(1, {}).run()
+
+    update_catalog_attribute.assert_called_once_with(1, "main")
+
+
+@pytest.fixture
+def unreachable_database(mocker: MockerFixture) -> Database:
+    """Set up a database whose permission-sync ping fails, without persistence."""
+    database = Database(
+        id=1,
+        database_name="Druid",
+        expose_in_sqllab=True,
+        impersonate_user=False,
+        extra='{"engine_params": {}, "metadata_params": {}}',
+        encrypted_extra='{"connect_args": {"jwt": "original-token"}}',
+    )
+    database.set_sqlalchemy_uri("druid://user:secret@localhost:8082/druid/v2/sql/")
+    mocker.patch(
+        "superset.commands.database.update.DatabaseDAO.find_by_id",
+        return_value=database,
+    )
+
+    def update(model: Database, properties: dict[str, Any]) -> Database:
+        """Apply the command's properties in place, as the DAO does."""
+        for key, value in properties.items():
+            setattr(model, key, value)
+        return model
+
+    mocker.patch(
+        "superset.commands.database.update.DatabaseDAO.update", side_effect=update
+    )
+    mocker.patch(
+        "superset.commands.database.update.DatabaseDAO.validate_update_uniqueness",
+        return_value=True,
+    )
+    mocker.patch("superset.commands.database.update.get_username", return_value="admin")
+    mocker.patch.object(security_manager, "get_user_by_username")
+    mocker.patch.object(database, "get_sqla_engine")
+    mocker.patch("superset.commands.database.sync_permissions.ping", return_value=False)
+    return database
+
+
+@pytest.mark.parametrize("full_payload", [False, True])
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_update_unreachable_database_metadata(
+    mocker: MockerFixture,
+    unreachable_database: Database,
+    caplog: pytest.LogCaptureFixture,
+    full_payload: bool,
+    async_mode: bool,
+) -> None:
+    """An offline database can be hidden from SQL Lab with unchanged settings."""
+    from flask import current_app
+
+    mocker.patch.dict(
+        current_app.config, {"SYNC_DB_PERMISSIONS_IN_ASYNC_MODE": async_mode}
+    )
+    enqueue = mocker.patch(
+        "superset.commands.database.sync_permissions.sync_database_permissions_task.delay"
+    )
+    update_catalog = mocker.patch.object(
+        UpdateDatabaseCommand, "_update_catalog_attribute"
+    )
+    properties: dict[str, Any] = {"expose_in_sqllab": False}
+    if full_payload:
+        properties.update(
+            database_name="Druid",
+            sqlalchemy_uri=unreachable_database.sqlalchemy_uri,
+            masked_encrypted_extra=json.dumps({"connect_args": {"jwt": PASSWORD_MASK}}),
+            extra='{"metadata_params": {}, "engine_params": {}}',
+            impersonate_user=False,
+            server_cert=None,
+            ssh_tunnel=None,
+        )
+
+    result = UpdateDatabaseCommand(1, properties).run()
+
+    assert result is unreachable_database
+    assert result.expose_in_sqllab is False
+    assert result.password == "secret"  # noqa: S105
+    assert json.loads(result.encrypted_extra)["connect_args"]["jwt"] == "original-token"
+    assert "Skipping permission sync for database 1" in caplog.text
+    assert "original-token" not in caplog.text
+    enqueue.assert_not_called()
+    update_catalog.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"database_name": "Renamed"},
+        {"sqlalchemy_uri": "druid://user:secret@other-host:8082/druid/v2/sql/"},
+        {"sqlalchemy_uri": "druid://user:changed@localhost:8082/druid/v2/sql/"},
+        {"masked_encrypted_extra": '{"connect_args": {"jwt": "changed"}}'},
+        {
+            "sqlalchemy_uri": "druid://user:secret@localhost:8082/druid/v2/sql/",
+            "extra": '{"engine_params": {"connect_args": {"scheme": "https"}}}',
+        },
+        {"extra": '{"allow_multi_catalog": true}'},
+        {"server_cert": "changed-certificate"},
+        {"impersonate_user": True},
+        {"ssh_tunnel": None},
+    ],
+    ids=[
+        "rename",
+        "host",
+        "password",
+        "encrypted-extra",
+        "engine-params",
+        "catalogs",
+        "certificate",
+        "impersonation",
+        "remove-tunnel",
+    ],
+)
+def test_update_unreachable_database_changed_connection_fails(
+    mocker: MockerFixture,
+    unreachable_database: Database,
+    properties: dict[str, Any],
+) -> None:
+    """Changed connection settings or names still require a successful sync."""
+    if "sqlalchemy_uri" in properties:
+        # Keep these cases independent of stored extra credentials.
+        unreachable_database.encrypted_extra = None
+    if "ssh_tunnel" in properties:
+        unreachable_database.ssh_tunnel = SSHTunnel(server_address="localhost")
+    rollback = mocker.patch.object(db.session, "rollback")
+    commit = mocker.patch.object(db.session, "commit")
+
+    with pytest.raises(DatabaseConnectionFailedError):
+        UpdateDatabaseCommand(1, {"expose_in_sqllab": False, **properties}).run()
+
+    rollback.assert_called_once()
+    commit.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["extra", "encrypted_extra"])
+@pytest.mark.parametrize("invalid_original", [False, True], ids=["incoming", "stored"])
+def test_update_unreachable_database_invalid_json_fails(
+    mocker: MockerFixture,
+    unreachable_database: Database,
+    field: str,
+    invalid_original: bool,
+) -> None:
+    """Invalid JSON must not allow an update to skip a failed permission sync."""
+    if field == "extra":
+        # Reach JSON comparison without reusing secrets across engine-param changes.
+        unreachable_database.password = None
+        unreachable_database.encrypted_extra = None
+    properties: dict[str, Any] = {"expose_in_sqllab": False, field: "{invalid"}
+    if invalid_original:
+        setattr(unreachable_database, field, "{invalid")
+        properties[field] = "{}"
+    rollback = mocker.patch.object(db.session, "rollback")
+    commit = mocker.patch.object(db.session, "commit")
+
+    with pytest.raises(DatabaseConnectionFailedError):
+        UpdateDatabaseCommand(1, properties).run()
+
+    rollback.assert_called_once()
+    commit.assert_not_called()
+
+
+@pytest.mark.parametrize("connection_alive", [False, True])
+def test_update_with_missing_old_password(
+    mocker: MockerFixture,
+    unreachable_database: Database,
+    connection_alive: bool,
+) -> None:
+    """An unavailable old password must not prevent repairing the connection."""
+    from flask import current_app
+    from sqlalchemy.engine.url import URL
+
+    unreachable_database.encrypted_extra = None
+
+    def password_store(uri: URL) -> str:
+        """Only the replacement connection has a stored password."""
+        if uri.host == "localhost":
+            raise KeyError("The old password was removed")
+        return "new-secret"
+
+    mocker.patch.dict(
+        current_app.config, {"SQLALCHEMY_CUSTOM_PASSWORD_STORE": password_store}
+    )
+    mocker.patch(
+        "superset.commands.database.sync_permissions.ping",
+        return_value=connection_alive,
+    )
+    sync = mocker.patch(
+        "superset.commands.database.sync_permissions."
+        "SyncPermissionsCommand.sync_database_permissions"
+    )
+    new_uri = "druid://user:new-secret@replacement:8082/druid/v2/sql/"
+    command = UpdateDatabaseCommand(1, {"sqlalchemy_uri": new_uri})
+
+    if connection_alive:
+        result = command.run()
+        assert result is unreachable_database
+        assert result.sqlalchemy_uri_decrypted == new_uri
+        sync.assert_called_once()
+    else:
+        with pytest.raises(DatabaseConnectionFailedError):
+            command.run()
+        sync.assert_not_called()
+
+
+def test_update_host_change_requires_new_credentials(mocker: MockerFixture) -> None:
+    """
+    An update that repoints an existing database at a different host while
+    the URI's password stays masked must not silently reuse the stored
+    password: the update persists, so every subsequent use of the database
+    (by any user) would send the real credential to the new host.
+    """
+    existing = mocker.MagicMock()
+    existing.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    existing.extra = "{}"
+    existing.ssh_tunnel = None
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = existing
+
+    with pytest.raises(DatabaseInvalidError):
+        UpdateDatabaseCommand(
+            1,
+            {
+                "sqlalchemy_uri": (
+                    "postgresql://user:XXXXXXXXXX@attacker.example.com:5432/prod"
+                )
+            },
+        ).run()
+
+    database_dao.update.assert_not_called()
+
+
+def test_update_engine_params_change_requires_new_credentials(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An update that changes `extra.engine_params` (e.g.
+    `connect_args.host`/`port`, merged into the actual DBAPI connect kwargs
+    ahead of anything in `sqlalchemy_uri`) while the URI's password stays
+    masked must not silently reuse the stored password.
+    """
+    existing = mocker.MagicMock()
+    existing.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    existing.extra = "{}"
+    existing.ssh_tunnel = None
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = existing
+
+    with pytest.raises(DatabaseInvalidError):
+        UpdateDatabaseCommand(
+            1,
+            {
+                "extra": json.dumps(
+                    {
+                        "engine_params": {
+                            "connect_args": {
+                                "host": "attacker.example.com",
+                                "port": 15432,
+                            }
+                        }
+                    }
+                )
+            },
+        ).run()
+
+    database_dao.update.assert_not_called()
+
+
+def test_update_ssh_tunnel_host_change_requires_new_credentials(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An update that repoints an existing database's SSH tunnel at a
+    different server must not silently reuse the stored tunnel password.
+    """
+    existing = mocker.MagicMock()
+    existing.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    existing.extra = "{}"
+    tunnel = mocker.MagicMock()
+    tunnel.server_address = "10.0.0.1"
+    tunnel.server_port = 22
+    existing.ssh_tunnel = tunnel
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = existing
+
+    with pytest.raises(DatabaseInvalidError):
+        UpdateDatabaseCommand(
+            1,
+            {
+                "ssh_tunnel": {
+                    "server_address": "attacker.example.com",
+                    "server_port": 22,
+                    "username": "tunnel_user",
+                    "password": PASSWORD_MASK,
+                }
+            },
+        ).run()
+
+    database_dao.update.assert_not_called()
+
+
+def test_update_ssh_tunnel_private_key_password_not_carried_over(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An update that repoints the SSH tunnel and supplies a fresh
+    private_key but omits private_key_password must not silently keep the
+    old, real passphrase attached to the new key.
+    """
+    tunnel = mocker.MagicMock()
+    tunnel.server_address = "10.0.0.1"
+    tunnel.server_port = 22
+    tunnel.private_key_password = "original-passphrase"  # noqa: S105
+
+    existing = mocker.MagicMock()
+    existing.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    existing.extra = "{}"
+    existing.ssh_tunnel = tunnel
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = existing
+
+    with pytest.raises(DatabaseInvalidError):
+        UpdateDatabaseCommand(
+            1,
+            {
+                "ssh_tunnel": {
+                    "server_address": "attacker.example.com",
+                    "server_port": 22,
+                    "username": "tunnel_user",
+                    "private_key": "-----BEGIN PRIVATE KEY-----\nNew\n-----END-----",
+                    # private_key_password omitted entirely
+                }
+            },
+        ).run()
+
+    database_dao.update.assert_not_called()
+
+
+def test_update_encrypted_extra_reused_when_uri_password_fresh_requires_new_credentials(
+    mocker: MockerFixture,
+) -> None:
+    """
+    A fresh URI password alone isn't enough: if `encrypted_extra` carries a
+    real secret and the submission leaves it masked, the destination change
+    must still be refused, or that secret silently rides along to the new
+    destination too.
+    """
+
+    def _unmask(old: str, new: str) -> str:
+        old_config = json.loads(old)
+        new_config = json.loads(new)
+        for key, value in new_config.items():
+            if value == PASSWORD_MASK and key in old_config:
+                new_config[key] = old_config[key]
+        return json.dumps(new_config)
+
+    old_database = mocker.MagicMock()
+    old_database.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    old_database.password = "oldpass"  # noqa: S105
+    old_database.extra = "{}"
+    old_database.encrypted_extra = json.dumps({"client_secret": "real-secret"})
+    old_database.ssh_tunnel = None
+    old_database.db_engine_spec.unmask_encrypted_extra.side_effect = _unmask
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = old_database
+
+    with pytest.raises(DatabaseInvalidError):
+        UpdateDatabaseCommand(
+            1,
+            {
+                "sqlalchemy_uri": (
+                    "postgresql://user:newpass@attacker.example.com:5432/prod"
+                ),
+                "masked_encrypted_extra": json.dumps({"client_secret": PASSWORD_MASK}),
+            },
+        ).run()
+
+    database_dao.update.assert_not_called()
+
+
+def test_update_destination_change_with_fresh_encrypted_extra_and_no_uri_password(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Engines that store credentials entirely in `encrypted_extra` and carry
+    no URI password at all (BigQuery, GSheets) must still be able to move
+    destinations when a genuinely fresh credential is supplied -- gating
+    solely on URI-password freshness would block them unconditionally,
+    since they never have one to give.
+    """
+
+    def _unmask(old: str, new: str) -> str:
+        old_config = json.loads(old)
+        new_config = json.loads(new)
+        for key, value in new_config.items():
+            if value == PASSWORD_MASK and key in old_config:
+                new_config[key] = old_config[key]
+        return json.dumps(new_config)
+
+    old_database = mocker.MagicMock(allow_multi_catalog=False)
+    old_database.sqlalchemy_uri = "bigquery://old-project"
+    old_database.password = None
+    old_database.extra = "{}"
+    old_database.encrypted_extra = json.dumps({"credentials_info": "old-creds"})
+    old_database.ssh_tunnel = None
+    old_database.db_engine_spec.unmask_encrypted_extra.side_effect = _unmask
+    old_database.get_default_catalog.return_value = "old-project"
+    old_database.id = 1
+
+    new_database = mocker.MagicMock(allow_multi_catalog=False)
+    new_database.get_default_catalog.return_value = "new-project"
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = old_database
+    database_dao.update.return_value = new_database
+
+    mocker.patch("superset.commands.database.update.SyncPermissionsCommand")
+    mocker.patch.object(UpdateDatabaseCommand, "_update_catalog_attribute")
+
+    UpdateDatabaseCommand(
+        1,
+        {
+            "sqlalchemy_uri": "bigquery://old-project",
+            "extra": json.dumps(
+                {"engine_params": {"connect_args": {"host": "new-host"}}}
+            ),
+            "masked_encrypted_extra": json.dumps(
+                {"credentials_info": "brand-new-creds"}
+            ),
+        },
+    ).run()
+
+    database_dao.update.assert_called_once()
+
+
+def test_update_host_change_with_new_credentials(mocker: MockerFixture) -> None:
+    """
+    A deliberate connection move is still possible when the update supplies
+    a fresh password for the new destination.
+    """
+    old_database = mocker.MagicMock(allow_multi_catalog=False)
+    old_database.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    old_database.password = "oldpass"  # noqa: S105
+    old_database.extra = "{}"
+    old_database.encrypted_extra = "{}"
+    old_database.ssh_tunnel = None
+    old_database.get_default_catalog.return_value = "prod"
+    old_database.id = 1
+
+    new_database = mocker.MagicMock(allow_multi_catalog=False)
+    new_database.get_default_catalog.return_value = "prod"
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = old_database
+    database_dao.update.return_value = new_database
+
+    mocker.patch("superset.commands.database.update.SyncPermissionsCommand")
+    mocker.patch.object(UpdateDatabaseCommand, "_update_catalog_attribute")
+
+    UpdateDatabaseCommand(
+        1,
+        {"sqlalchemy_uri": "postgresql://user:newpass@host2:5432/prod"},
+    ).run()
+
+    database_dao.update.assert_called_once()
+
+
+def test_update_unrelated_fields_still_work(mocker: MockerFixture) -> None:
+    """
+    An update that doesn't touch `sqlalchemy_uri`, `extra`, or `ssh_tunnel`
+    at all must not be blocked by the new destination-change check.
+    """
+    old_database = mocker.MagicMock(allow_multi_catalog=False)
+    old_database.sqlalchemy_uri = "postgresql://user:XXXXXXXXXX@host1"
+    old_database.extra = "{}"
+    old_database.ssh_tunnel = None
+    old_database.get_default_catalog.return_value = "prod"
+    old_database.id = 1
+
+    new_database = mocker.MagicMock(allow_multi_catalog=False)
+    new_database.get_default_catalog.return_value = "prod"
+
+    database_dao = mocker.patch("superset.commands.database.update.DatabaseDAO")
+    database_dao.find_by_id.return_value = old_database
+    database_dao.update.return_value = new_database
+
+    mocker.patch("superset.commands.database.update.SyncPermissionsCommand")
+    mocker.patch.object(UpdateDatabaseCommand, "_update_catalog_attribute")
+
+    UpdateDatabaseCommand(1, {"expose_in_sqllab": False}).run()
+
+    database_dao.update.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "new_host, purged",
+    [
+        (None, False),
+        ("dbc-1234.cloud.databricks.com", False),
+        ("dbc-5678.cloud.databricks.com", True),
+    ],
+)
+def test_update_oauth2_derived_endpoints(
+    mocker: MockerFixture,
+    app_context: None,
+    new_host: str | None,
+    purged: bool,
+) -> None:
+    """
+    Endpoints derived from the host are compared with the new host's endpoints:
+    saving the same config keeps the tokens, and a new workspace host purges them.
+    """
+    client_info = {
+        "id": "my_client_id",
+        "secret": "my_client_secret",
+        "scope": "sql offline_access",
+    }
+    uri = "databricks://token:@{host}:443?http_path=/sql/1.0/warehouses/abc"
+    database = Database(
+        database_name="db",
+        sqlalchemy_uri=uri.format(host="dbc-1234.cloud.databricks.com"),
+        encrypted_extra=json.dumps({"oauth2_client_info": client_info}),
+    )
+    purge_oauth2_tokens = mocker.patch.object(database, "purge_oauth2_tokens")
+    properties: dict[str, Any] = {
+        "encrypted_extra": json.dumps({"oauth2_client_info": client_info}),
+    }
+    if new_host:
+        properties["sqlalchemy_uri"] = uri.format(host=new_host)
+
+    command = UpdateDatabaseCommand(1, properties)
+    command._model = database
+    command._handle_oauth2()
+
+    assert purge_oauth2_tokens.called is purged
+
+
+@pytest.mark.parametrize("new_client_info", ["not-a-dict", ["a", "b"], ""])
+def test_update_oauth2_malformed_client_info_purges_tokens(
+    mocker: MockerFixture,
+    app_context: None,
+    new_client_info: Any,
+) -> None:
+    """
+    A non-dict ``oauth2_client_info`` doesn't crash the update; it counts as a
+    change and purges the existing tokens.
+    """
+    client_info = {
+        "id": "my_client_id",
+        "secret": "my_client_secret",
+        "scope": "sql offline_access",
+    }
+    database = Database(
+        database_name="db",
+        sqlalchemy_uri=(
+            "databricks://token:@dbc-1234.cloud.databricks.com:443"
+            "?http_path=/sql/1.0/warehouses/abc"
+        ),
+        encrypted_extra=json.dumps({"oauth2_client_info": client_info}),
+    )
+    purge_oauth2_tokens = mocker.patch.object(database, "purge_oauth2_tokens")
+
+    command = UpdateDatabaseCommand(
+        1,
+        {"encrypted_extra": json.dumps({"oauth2_client_info": new_client_info})},
+    )
+    command._model = database
+    command._handle_oauth2()
+
+    purge_oauth2_tokens.assert_called_once()
+
+
+def test_update_oauth2_unresolvable_endpoints_purges_tokens(
+    mocker: MockerFixture,
+    app_context: None,
+) -> None:
+    """
+    When the new URI has no host the endpoints can't be derived, so the raw
+    client info is compared and the tokens are purged instead of failing.
+    """
+    client_info = {
+        "id": "my_client_id",
+        "secret": "my_client_secret",
+        "scope": "sql offline_access",
+    }
+    database = Database(
+        database_name="db",
+        sqlalchemy_uri=(
+            "databricks://token:@dbc-1234.cloud.databricks.com:443"
+            "?http_path=/sql/1.0/warehouses/abc"
+        ),
+        encrypted_extra=json.dumps({"oauth2_client_info": client_info}),
+    )
+    purge_oauth2_tokens = mocker.patch.object(database, "purge_oauth2_tokens")
+
+    command = UpdateDatabaseCommand(
+        1,
+        {
+            "encrypted_extra": json.dumps({"oauth2_client_info": client_info}),
+            "sqlalchemy_uri": "databricks://token:@:443?http_path=/sql/1.0/warehouses/abc",
+        },
+    )
+    command._model = database
+    command._handle_oauth2()
+
+    purge_oauth2_tokens.assert_called_once()

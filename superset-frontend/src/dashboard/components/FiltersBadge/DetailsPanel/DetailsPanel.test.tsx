@@ -16,9 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import userEvent from '@testing-library/user-event';
+/// <reference types="@emotion/jest" />
 import { RefObject } from 'react';
-import { render, screen, fireEvent } from 'spec/helpers/testing-library';
+import {
+  fireEvent,
+  render,
+  screen,
+  userEvent,
+} from 'spec/helpers/testing-library';
 import { Indicator } from 'src/dashboard/components/nativeFilters/selectors';
 import DetailsPanel from '.';
 
@@ -32,7 +37,7 @@ const mockPopoverTriggerRef = {
   current: {
     focus: jest.fn(),
   },
-} as unknown as RefObject<HTMLDivElement>;
+} as unknown as RefObject<HTMLButtonElement>;
 
 const createProps = () => ({
   popoverVisible: true,
@@ -56,7 +61,7 @@ const createProps = () => ({
   ] as Indicator[],
   appliedIndicators: [
     {
-      column: 'country_name',
+      column: 'Country_name',
       name: 'Country',
       value: [],
       status: 'UNSET',
@@ -115,16 +120,18 @@ test('Should render "appliedCrossFilterIndicators"', async () => {
     { useRedux: true },
   );
 
-  userEvent.hover(screen.getByTestId('details-panel-content'));
+  await userEvent.hover(screen.getByTestId('details-panel-content'));
   expect(
     await screen.findByText('Applied cross-filters (1)'),
   ).toBeInTheDocument();
   expect(
-    screen.getByRole('button', { name: 'Clinical Stage' }),
+    screen.getByRole('button', { name: 'search Clinical Stage' }),
   ).toBeInTheDocument();
 
   expect(props.onHighlightFilterSource).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'Clinical Stage' }));
+  await userEvent.click(
+    screen.getByRole('button', { name: 'search Clinical Stage' }),
+  );
   expect(props.onHighlightFilterSource).toHaveBeenCalledTimes(1);
   expect(props.onHighlightFilterSource).toHaveBeenCalledWith([
     'ROOT_ID',
@@ -149,12 +156,14 @@ test('Should render "appliedIndicators"', async () => {
     { useRedux: true },
   );
 
-  userEvent.hover(screen.getByTestId('details-panel-content'));
+  await userEvent.hover(screen.getByTestId('details-panel-content'));
   expect(await screen.findByText('Applied filters (1)')).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Country' })).toBeInTheDocument();
+  expect(
+    screen.getByRole('button', { name: 'search Country' }),
+  ).toBeInTheDocument();
 
   expect(props.onHighlightFilterSource).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'Country' }));
+  await userEvent.click(screen.getByRole('button', { name: 'search Country' }));
   expect(props.onHighlightFilterSource).toHaveBeenCalledTimes(1);
   expect(props.onHighlightFilterSource).toHaveBeenCalledWith([
     'ROOT_ID',
@@ -162,11 +171,11 @@ test('Should render "appliedIndicators"', async () => {
     'TAB-BCIJF4NvgQ',
     'ROW-xSeNAspgw',
     'CHART-eirDduqb1A',
-    'LABEL-country_name',
+    'LABEL-Country_name',
   ]);
 });
 
-test('Should render empty', () => {
+test('Should render empty', async () => {
   const props = createProps();
   props.appliedCrossFilterIndicators = [];
   props.appliedIndicators = [];
@@ -181,7 +190,7 @@ test('Should render empty', () => {
   );
 
   expect(screen.getByTestId('details-panel-content')).toBeInTheDocument();
-  userEvent.click(screen.getByTestId('details-panel-content'));
+  await userEvent.click(screen.getByTestId('details-panel-content'));
   expect(screen.queryByRole('button')).not.toBeInTheDocument();
 });
 
@@ -206,6 +215,22 @@ test('Close popover with ESC or ENTER', async () => {
   // Close with Enter
   fireEvent.keyDown(activeElement, { key: 'Enter', code: 'Enter' });
   expect(props.setPopoverVisible).toHaveBeenCalledWith(false);
+});
+
+test('Popover container suppresses default browser focus outline', () => {
+  const props = createProps();
+  render(
+    <DetailsPanel {...props}>
+      <div>Content</div>
+    </DetailsPanel>,
+    { useRedux: true },
+  );
+
+  const menu = screen.getByRole('menu');
+  expect(menu).toHaveStyleRule('outline', 'none', { target: ':focus' });
+  expect(menu).toHaveStyleRule('outline', 'none', {
+    target: ':focus-visible',
+  });
 });
 
 test('Arrow key navigation switches focus between indicators', () => {
@@ -235,8 +260,12 @@ test('Arrow key navigation switches focus between indicators', () => {
   );
 
   // Query the indicators
-  const firstIndicator = screen.getByRole('button', { name: 'Clinical Stage' });
-  const secondIndicator = screen.getByRole('button', { name: 'Age Group' });
+  const firstIndicator = screen.getByRole('button', {
+    name: 'search Clinical Stage',
+  });
+  const secondIndicator = screen.getByRole('button', {
+    name: 'search Age Group',
+  });
 
   // Focus the first indicator
   firstIndicator.focus();

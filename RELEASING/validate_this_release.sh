@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -14,8 +16,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-#!/bin/bash
 
 # Function to determine Python command
 get_python_command() {
@@ -38,7 +38,7 @@ get_pip_command() {
 PYTHON=$(get_python_command)
 PIP=$(get_pip_command)
 
-# Get the release directory's path. If you unzip an Apache release and just run the npm script to validate the release, this will be a file name like `apache-superset-x.x.xrcx-source.tar.gz`
+# Get the release directory's path. If you unzip an Apache release and just run the npm script to validate the release, this will be a file name like `apache_superset-x.x.xrcx-source.tar.gz`
 RELEASE_ZIP_PATH="../../$(basename "$(dirname "$(pwd)")")-source.tar.gz"
 
 # Install dependencies from requirements.txt if the file exists

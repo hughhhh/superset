@@ -21,8 +21,15 @@ import {
   QueryFormColumn,
   QueryFormData,
   QueryFormMetric,
+  RgbaColor,
 } from '@superset-ui/core';
 import { BaseChartProps, BaseTransformedProps } from '../types';
+
+// Sentinel value for the Sort Y Axis control's explicit "keep original
+// order" choice. Shared between controlPanel.tsx (where the choice is
+// defined) and transformProps.ts (where it's interpreted) so the two
+// stay in sync if the value ever changes.
+export const SORT_Y_AXIS_NONE = 'none';
 
 export interface HeatmapFormData extends QueryFormData {
   bottomMargin: string;
@@ -33,6 +40,8 @@ export interface HeatmapFormData extends QueryFormData {
   metric: QueryFormMetric;
   normalizeAcross: 'heatmap' | 'x' | 'y';
   normalized?: boolean;
+  borderColor: RgbaColor;
+  borderWidth: number;
   showLegend?: boolean;
   showPercentage?: boolean;
   showValues?: boolean;
@@ -40,6 +49,7 @@ export interface HeatmapFormData extends QueryFormData {
   sortYAxis?: string;
   timeFormat?: string;
   xAxis: QueryFormColumn;
+  xAxisLabelRotation: number;
   xscaleInterval: number;
   valueBounds: [number | undefined | null, number | undefined | null];
   yAxisFormat?: string;

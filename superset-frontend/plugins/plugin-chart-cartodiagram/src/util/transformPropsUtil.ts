@@ -18,11 +18,14 @@
  */
 
 import {
+  CategoricalColorNamespace,
   ChartProps,
   convertKeysToCamelCase,
   DataRecord,
+  getLabelsColorMap,
+  LabelsColorMapSource,
 } from '@superset-ui/core';
-import { isObject } from 'lodash';
+import { isObject } from 'lodash-es';
 import {
   LocationConfigMapping,
   SelectedChartConfig,
@@ -208,7 +211,7 @@ export const stripGeomColumnFromLabelMap = (
   labelMap: { [key: string]: string[] },
   geomColumn: string,
 ) => {
-  const newLabelMap = {};
+  const newLabelMap: Record<string, string[]> = {};
   Object.entries(labelMap).forEach(([key, value]) => {
     if (key === geomColumn) {
       return;
@@ -273,6 +276,11 @@ export const getChartConfigs = (
     formData: chartFormData,
     rawFormData: chartFormDataSnake,
     datasource: {},
+    // Dashboard colors are coordinated by the shared labels color map.
+    colorScale:
+      getLabelsColorMap().source === LabelsColorMapSource.Explore
+        ? CategoricalColorNamespace.getScale(chartFormData.colorScheme)
+        : undefined,
   };
 
   const { queriesData } = chartProps;

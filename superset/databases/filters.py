@@ -23,7 +23,7 @@ from sqlalchemy.orm import Query
 from sqlalchemy.sql.expression import cast
 from sqlalchemy.sql.sqltypes import JSON
 
-from superset import app, security_manager
+from superset import security_manager
 from superset.models.core import Database
 from superset.views.base import BaseFilter
 
@@ -45,7 +45,7 @@ class DatabaseFilter(BaseFilter):  # pylint: disable=too-few-public-methods
         """
         Dynamic Filters need to be applied to the Query before we filter
         databases with anything else. This way you can show/hide databases using
-        Feature Flags for example in conjuction with the regular role filtering.
+        Feature Flags for example in conjunction with the regular role filtering.
         If not, if an user has access to all Databases it would skip this dynamic
         filtering.
         """
@@ -91,7 +91,7 @@ class DatabaseUploadEnabledFilter(BaseFilter):  # pylint: disable=too-few-public
 
         if hasattr(g, "user"):
             allowed_schemas = [
-                app.config["ALLOWED_USER_CSV_SCHEMA_FUNC"](database, g.user)
+                current_app.config["ALLOWED_USER_CSV_SCHEMA_FUNC"](database, g.user)
                 for database in datasource_access_databases
             ]
 

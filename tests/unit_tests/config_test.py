@@ -16,14 +16,19 @@
 # under the License.
 # pylint: disable=import-outside-toplevel, unused-argument, redefined-outer-name, invalid-name
 
+import runpy
+import sys
 from functools import partial
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import pytest
+from flask import Flask
 from pytest_mock import MockerFixture
 from sqlalchemy.orm.session import Session
 
 from superset import db
+from tests.conftest import with_config
 
 if TYPE_CHECKING:
     from superset.connectors.sqla.models import SqlaTable
@@ -44,6 +49,300 @@ FULL_DTTM_DEFAULTS_EXAMPLE = {
         },
     },
 }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 180),
+        ("360", 360),
+        ("0", 0),
+        ("-1", -1),
+        ("-2", 0),
+        ("36500", 36500),
+        ("36501", 0),
+        ("1000000000", 0),
+        ("30d", 0),
+        ("", 0),
+    ],
+)
+def test_version_history_retention_env_loads_application_config(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
+) -> None:
+    """The canonical environment key wins; a legacy-only setting is retained."""
+    from superset import config
+
+    monkeypatch.delenv("SUPERSET_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("SUPERSET_CONFIG", raising=False)
+    monkeypatch.setitem(sys.modules, "superset_config", None)
+
+    monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", value)
+    monkeypatch.setenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", "180")
+    loaded: dict[str, Any] = runpy.run_path(config.__file__)
+    app: Flask = Flask(__name__)
+    app.config.from_mapping(loaded)
+    assert app.config["VERSION_HISTORY_RETENTION_DAYS"] == expected
+    assert type(app.config["VERSION_HISTORY_RETENTION_DAYS"]) is int
+    assert "SUPERSET_VERSION_HISTORY_RETENTION_DAYS" not in app.config
+
+
+def test_invalid_version_history_retention_env_defers_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid retention input does not prevent configuration from loading."""
+    from superset import config
+
+    monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "30d")
+
+    assert config._parse_version_history_retention_days() == 0
+    assert "Invalid VERSION_HISTORY_RETENTION_DAYS='30d'" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected"),
+    [("0", 0), ("-1", 0), ("-7", 0), ("180", 180), ("bad", 0), ("1000000000", 0)],
+)
+def test_released_legacy_history_retention_env_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, legacy: str, expected: int
+) -> None:
+    """Released 7.0 retention values cannot silently revert to 30 days."""
+    from superset import config
+
+    monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    monkeypatch.setenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", legacy)
+    assert config._parse_version_history_retention_days() == expected
+
+
+def test_explicit_new_history_retention_env_precedes_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the canonical key can explicitly request immediate eligibility."""
+    from superset import config
+
+    monkeypatch.setenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", "-1")
+    monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "-1")
+    assert config._parse_version_history_retention_days() == -1
+
+
+@pytest.mark.parametrize(
+    ("legacy", "canonical", "expected"),
+    [
+        (-1, None, 0),
+        (0, None, 0),
+        (180, None, 180),
+        (180, 365, 365),
+        (-1, -1, -1),
+        (180, 1000000000, 0),
+    ],
+)
+def test_released_legacy_history_retention_config_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    legacy: int,
+    canonical: int | None,
+    expected: int,
+) -> None:
+    """A custom superset_config.py retains 7.0 semantics unless replaced."""
+    from superset import config
+
+    config_file: Path = tmp_path / "superset_config.py"
+    lines: list[str] = [f"SUPERSET_VERSION_HISTORY_RETENTION_DAYS = {legacy}"]
+    if canonical is not None:
+        lines.append(f"VERSION_HISTORY_RETENTION_DAYS = {canonical}")
+    config_file.write_text("\n".join(lines))
+    monkeypatch.setenv("SUPERSET_CONFIG_PATH", str(config_file))
+    monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    monkeypatch.delenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    loaded: dict[str, Any] = runpy.run_path(config.__file__)
+    assert loaded["VERSION_HISTORY_RETENTION_DAYS"] == expected
+
+
+def test_explicit_immediate_history_retention_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An intentional immediate setting is visible during startup."""
+    from superset import config
+
+    monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "-1")
+    assert config._parse_version_history_retention_days() == -1
+    assert "VERSION_HISTORY_RETENTION_DAYS=-1 makes history eligible" in caplog.text
+
+
+def test_legacy_immediate_history_retention_disables_without_immediate_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The released legacy -1 value disables pruning instead of requesting it."""
+    from superset import config
+
+    monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    monkeypatch.setenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", "-1")
+    assert config._parse_version_history_retention_days() == 0
+    assert "SUPERSET_VERSION_HISTORY_RETENTION_DAYS is deprecated" in caplog.text
+    assert "immediate pruning" not in caplog.text
+
+
+@pytest.mark.parametrize("legacy", ["180", "-1", "bad"])
+def test_ignored_legacy_retention_env_warns_without_normalizing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    legacy: str,
+) -> None:
+    """Ignored legacy input warns about migration without claiming pruning stops."""
+    from superset import config
+
+    monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "365")
+    monkeypatch.setenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", legacy)
+    assert config._parse_version_history_retention_days() == 365
+    assert "SUPERSET_VERSION_HISTORY_RETENTION_DAYS is deprecated" in caplog.text
+    assert "skipping pruning" not in caplog.text
+    assert "immediate pruning" not in caplog.text
+
+
+@pytest.mark.parametrize("canonical_env", [False, True])
+@pytest.mark.parametrize("legacy", ["180", "bad"])
+def test_ignored_legacy_retention_config_warns_when_canonical_wins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    canonical_env: bool,
+    legacy: str,
+) -> None:
+    """Both configured keys produce a deprecation warning even when env wins."""
+    from superset import config
+
+    config_file: Path = tmp_path / "superset_config.py"
+    config_file.write_text(
+        "VERSION_HISTORY_RETENTION_DAYS = 365\n"
+        f"SUPERSET_VERSION_HISTORY_RETENTION_DAYS = {legacy!r}\n"
+    )
+    monkeypatch.setenv("SUPERSET_CONFIG_PATH", str(config_file))
+    monkeypatch.delenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    if canonical_env:
+        monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "7")
+    else:
+        monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    loaded: dict[str, Any] = runpy.run_path(config.__file__)
+    assert loaded["VERSION_HISTORY_RETENTION_DAYS"] == 365
+    assert "SUPERSET_VERSION_HISTORY_RETENTION_DAYS is deprecated" in caplog.text
+    assert "skipping pruning" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected", "restricted_export"),
+    [(0, 0, False), (365, 365, False), (0, 0, True)],
+)
+def test_star_imported_default_does_not_hide_legacy_retention(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    legacy: int,
+    expected: int,
+    restricted_export: bool,
+) -> None:
+    """An imported new default is not an explicit migration decision."""
+    from superset import config
+
+    config_file: Path = tmp_path / "superset_config.py"
+    lines: list[str] = [
+        "from superset.config import *",
+        f"SUPERSET_VERSION_HISTORY_RETENTION_DAYS = {legacy}",
+    ]
+    if restricted_export:
+        lines.append('__all__ = ["VERSION_HISTORY_RETENTION_DAYS"]')
+    config_file.write_text("\n".join(lines))
+    monkeypatch.setenv("SUPERSET_CONFIG_PATH", str(config_file))
+    monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    monkeypatch.delenv("SUPERSET_VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    loaded: dict[str, Any] = runpy.run_path(config.__file__)
+    assert loaded["VERSION_HISTORY_RETENTION_DAYS"] == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 30),
+        ("360", 360),
+        ("0", 0),
+        ("-1", -1),
+        ("-2", 0),
+        ("36500", 36500),
+        ("36501", 0),
+        ("1000000000", 0),
+        ("bad", 0),
+        ("", 0),
+    ],
+)
+def test_soft_delete_retention_environment_seed(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
+) -> None:
+    """Bootstrap exports canonical integer days without an environment alias."""
+    from superset import config
+
+    monkeypatch.delenv("SUPERSET_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("SUPERSET_CONFIG", raising=False)
+    monkeypatch.setitem(sys.modules, "superset_config", None)
+
+    monkeypatch.delenv("SOFT_DELETE_RETENTION_DAYS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("SOFT_DELETE_RETENTION_DAYS", value)
+    loaded: dict[str, Any] = runpy.run_path(config.__file__)
+    assert loaded["SOFT_DELETE_RETENTION_DAYS"] == expected
+    assert type(loaded["SOFT_DELETE_RETENTION_DAYS"]) is int
+
+
+@pytest.mark.parametrize(
+    ("canonical", "legacy", "canonical_env", "expected"),
+    [
+        (None, None, False, 30),
+        (None, "180", False, 180),
+        (None, "bad", False, 0),
+        ("7", "365", False, 7),
+        ("30", "365", False, 365),
+        ("30", "0", False, 0),
+        ("30", "bad", False, 0),
+        ("bad", "365", False, 0),
+        ("30", "365", True, 30),
+        ("36501", None, False, 0),
+    ],
+)
+def test_resolve_version_history_retention_days_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    canonical: str | None,
+    legacy: str | None,
+    canonical_env: bool,
+    expected: int,
+) -> None:
+    """Env beats legacy; canonical beats legacy unless star-imported; None = absent."""
+    from superset import config
+
+    if canonical_env:
+        monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "30")
+    else:
+        monkeypatch.delenv("VERSION_HISTORY_RETENTION_DAYS", raising=False)
+    missing: object = config._MISSING_RETENTION
+    assert (
+        config._resolve_version_history_retention_days(
+            missing if canonical is None else canonical,
+            missing if legacy is None else legacy,
+            seed=30,
+        )
+        == expected
+    )
+
+
+def test_oversized_version_history_retention_env_defers_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An oversized retention window cannot overflow cutoff arithmetic."""
+    from superset import config
+
+    monkeypatch.setenv("VERSION_HISTORY_RETENTION_DAYS", "1000000000")
+
+    assert config._parse_version_history_retention_days() == 0
+    assert "exceeds the maximum" in caplog.text
 
 
 def apply_dttm_defaults(table: "SqlaTable", dttm_defaults: dict[str, Any]) -> None:
@@ -103,23 +402,21 @@ def test_table(session: Session) -> "SqlaTable":
     )
 
 
+@with_config(
+    {
+        "SQLA_TABLE_MUTATOR": partial(
+            apply_dttm_defaults,
+            dttm_defaults={
+                "main_dttm_col": "event_time",
+                "dttm_columns": {"ds": {}, "event_time": {}},
+            },
+        )
+    }
+)
 def test_main_dttm_col(mocker: MockerFixture, test_table: "SqlaTable") -> None:
     """
     Test the ``SQLA_TABLE_MUTATOR`` config.
     """
-    dttm_defaults = {
-        "main_dttm_col": "event_time",
-        "dttm_columns": {"ds": {}, "event_time": {}},
-    }
-    mocker.patch(
-        "superset.connectors.sqla.models.config",
-        new={
-            "SQLA_TABLE_MUTATOR": partial(
-                apply_dttm_defaults,
-                dttm_defaults=dttm_defaults,
-            )
-        },
-    )
     mocker.patch(
         "superset.connectors.sqla.models.get_physical_table_metadata",
         return_value=[
@@ -134,6 +431,16 @@ def test_main_dttm_col(mocker: MockerFixture, test_table: "SqlaTable") -> None:
     assert test_table.main_dttm_col == "event_time"
 
 
+@with_config(
+    {
+        "SQLA_TABLE_MUTATOR": partial(
+            apply_dttm_defaults,
+            dttm_defaults={
+                "main_dttm_col": "nonexistent",
+            },
+        )
+    }
+)
 def test_main_dttm_col_nonexistent(
     mocker: MockerFixture,
     test_table: "SqlaTable",
@@ -141,18 +448,6 @@ def test_main_dttm_col_nonexistent(
     """
     Test the ``SQLA_TABLE_MUTATOR`` config when main datetime column doesn't exist.
     """
-    dttm_defaults = {
-        "main_dttm_col": "nonexistent",
-    }
-    mocker.patch(
-        "superset.connectors.sqla.models.config",
-        new={
-            "SQLA_TABLE_MUTATOR": partial(
-                apply_dttm_defaults,
-                dttm_defaults=dttm_defaults,
-            )
-        },
-    )
     mocker.patch(
         "superset.connectors.sqla.models.get_physical_table_metadata",
         return_value=[
@@ -168,6 +463,16 @@ def test_main_dttm_col_nonexistent(
     assert test_table.main_dttm_col == "ds"
 
 
+@with_config(
+    {
+        "SQLA_TABLE_MUTATOR": partial(
+            apply_dttm_defaults,
+            dttm_defaults={
+                "main_dttm_col": "id",
+            },
+        )
+    }
+)
 def test_main_dttm_col_nondttm(
     mocker: MockerFixture,
     test_table: "SqlaTable",
@@ -175,18 +480,6 @@ def test_main_dttm_col_nondttm(
     """
     Test the ``SQLA_TABLE_MUTATOR`` config when main datetime column has wrong type.
     """
-    dttm_defaults = {
-        "main_dttm_col": "id",
-    }
-    mocker.patch(
-        "superset.connectors.sqla.models.config",
-        new={
-            "SQLA_TABLE_MUTATOR": partial(
-                apply_dttm_defaults,
-                dttm_defaults=dttm_defaults,
-            )
-        },
-    )
     mocker.patch(
         "superset.connectors.sqla.models.get_physical_table_metadata",
         return_value=[
@@ -202,6 +495,19 @@ def test_main_dttm_col_nondttm(
     assert test_table.main_dttm_col == "ds"
 
 
+@with_config(
+    {
+        "SQLA_TABLE_MUTATOR": partial(
+            apply_dttm_defaults,
+            dttm_defaults={
+                "dttm_columns": {
+                    "id": {"python_date_format": "epoch_ms"},
+                    "dttm": {"python_date_format": "epoch_s"},
+                },
+            },
+        )
+    }
+)
 def test_python_date_format_by_column_name(
     mocker: MockerFixture,
     test_table: "SqlaTable",
@@ -209,21 +515,6 @@ def test_python_date_format_by_column_name(
     """
     Test the ``SQLA_TABLE_MUTATOR`` setting for "python_date_format".
     """
-    table_defaults = {
-        "dttm_columns": {
-            "id": {"python_date_format": "epoch_ms"},
-            "dttm": {"python_date_format": "epoch_s"},
-        },
-    }
-    mocker.patch(
-        "superset.connectors.sqla.models.config",
-        new={
-            "SQLA_TABLE_MUTATOR": partial(
-                apply_dttm_defaults,
-                dttm_defaults=table_defaults,
-            )
-        },
-    )
     mocker.patch(
         "superset.connectors.sqla.models.get_physical_table_metadata",
         return_value=[
@@ -243,6 +534,19 @@ def test_python_date_format_by_column_name(
     assert dttm_col.python_date_format == "epoch_s"
 
 
+@with_config(
+    {
+        "SQLA_TABLE_MUTATOR": partial(
+            apply_dttm_defaults,
+            dttm_defaults={
+                "dttm_columns": {
+                    "dttm": {"expression": "CAST(dttm as INTEGER)"},
+                    "duration_ms": {"expression": "CAST(duration_ms as DOUBLE)"},
+                },
+            },
+        )
+    }
+)
 def test_expression_by_column_name(
     mocker: MockerFixture,
     test_table: "SqlaTable",
@@ -250,21 +554,6 @@ def test_expression_by_column_name(
     """
     Test the ``SQLA_TABLE_MUTATOR`` setting for expression.
     """
-    table_defaults = {
-        "dttm_columns": {
-            "dttm": {"expression": "CAST(dttm as INTEGER)"},
-            "duration_ms": {"expression": "CAST(duration_ms as DOUBLE)"},
-        },
-    }
-    mocker.patch(
-        "superset.connectors.sqla.models.config",
-        new={
-            "SQLA_TABLE_MUTATOR": partial(
-                apply_dttm_defaults,
-                dttm_defaults=table_defaults,
-            )
-        },
-    )
     mocker.patch(
         "superset.connectors.sqla.models.get_physical_table_metadata",
         return_value=[
@@ -286,6 +575,14 @@ def test_expression_by_column_name(
     assert duration_ms_col.expression == "CAST(duration_ms as DOUBLE)"
 
 
+@with_config(
+    {
+        "SQLA_TABLE_MUTATOR": partial(
+            apply_dttm_defaults,
+            dttm_defaults=FULL_DTTM_DEFAULTS_EXAMPLE,
+        )
+    }
+)
 def test_full_setting(
     mocker: MockerFixture,
     test_table: "SqlaTable",
@@ -293,15 +590,6 @@ def test_full_setting(
     """
     Test the ``SQLA_TABLE_MUTATOR`` with full settings.
     """
-    mocker.patch(
-        "superset.connectors.sqla.models.config",
-        new={
-            "SQLA_TABLE_MUTATOR": partial(
-                apply_dttm_defaults,
-                dttm_defaults=FULL_DTTM_DEFAULTS_EXAMPLE,
-            )
-        },
-    )
     mocker.patch(
         "superset.connectors.sqla.models.get_physical_table_metadata",
         return_value=[
@@ -322,3 +610,160 @@ def test_full_setting(
     assert dttm_col.is_dttm
     assert dttm_col.python_date_format == "epoch_s"
     assert dttm_col.expression == "CAST(dttm as INTEGER)"
+
+
+def test_sync_theme_logo_href() -> None:
+    """
+    Verify LOGO_TARGET_PATH is wired into a theme's brandLogoHref.
+
+    THEME_DEFAULT is built before superset_config.py overrides load, so the link
+    is re-synced afterwards via sync_theme_logo_href. A provided LOGO_TARGET_PATH
+    must update brandLogoHref; None must leave the existing value untouched.
+    """
+    from copy import deepcopy
+
+    from superset.config import sync_theme_logo_href, THEME_DEFAULT
+
+    # A user-provided LOGO_TARGET_PATH propagates to the logo link.
+    theme = deepcopy(THEME_DEFAULT)
+    theme["token"]["brandLogoHref"] = "/"
+    sync_theme_logo_href(theme, "https://custom.url")
+    assert theme["token"]["brandLogoHref"] == "https://custom.url"
+
+    # The default (None) leaves the existing link untouched.
+    default_theme = deepcopy(THEME_DEFAULT)
+    default_theme["token"]["brandLogoHref"] = "/"
+    sync_theme_logo_href(default_theme, None)
+    assert default_theme["token"]["brandLogoHref"] == "/"
+
+    # A disabled theme (None) is a no-op rather than an error.
+    sync_theme_logo_href(None, "https://custom.url")
+
+
+def test_theme_default_logo_defaults() -> None:
+    """With the shipped defaults, brandLogoHref is "/" and brandLogoUrl is APP_ICON."""
+    from superset import config
+
+    assert config.LOGO_TARGET_PATH is None
+    assert config.THEME_DEFAULT["token"]["brandLogoHref"] == "/"
+    assert config.THEME_DEFAULT["token"]["brandLogoUrl"] == config.APP_ICON
+
+
+def test_smtp_ssl_server_auth_defaults_to_true() -> None:
+    """
+    The shipped default for SMTP_SSL_SERVER_AUTH validates the SMTP server's
+    TLS certificate. Operators can still opt out by overriding it to False.
+    """
+    from superset import config
+
+    assert config.SMTP_SSL_SERVER_AUTH is True
+
+
+def _smtp_config(**overrides: Any) -> dict[str, Any]:
+    """
+    Build a minimal SMTP config dict for ``send_mime_email`` tests, with
+    plaintext transport defaults; keyword ``overrides`` replace any key.
+    """
+    config = {
+        "SMTP_HOST": "localhost",
+        "SMTP_PORT": 25,
+        "SMTP_USER": "",
+        "SMTP_PASSWORD": "",
+        "SMTP_STARTTLS": False,
+        "SMTP_SSL": False,
+        "SMTP_SSL_SERVER_AUTH": True,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_send_mime_email_ssl_server_auth_passes_context(
+    mocker: MockerFixture,
+) -> None:
+    """
+    With SMTP_SSL and SMTP_SSL_SERVER_AUTH enabled, ``send_mime_email`` builds a
+    default SSL context and threads it through to ``smtplib.SMTP_SSL`` so the
+    server certificate is validated.
+    """
+    from email.mime.multipart import MIMEMultipart
+
+    from superset.utils import core as utils
+
+    create_default_context = mocker.patch(
+        "superset.utils.core.ssl.create_default_context"
+    )
+    smtp_ssl = mocker.patch("smtplib.SMTP_SSL")
+    smtp = mocker.patch("smtplib.SMTP")
+
+    utils.send_mime_email(
+        "from",
+        ["to"],
+        MIMEMultipart(),
+        _smtp_config(SMTP_SSL=True, SMTP_SSL_SERVER_AUTH=True),
+        dryrun=False,
+    )
+
+    create_default_context.assert_called_once_with()
+    assert not smtp.called
+    smtp_ssl.assert_called_once_with(
+        "localhost", 25, context=create_default_context.return_value, timeout=30
+    )
+
+
+def test_send_mime_email_starttls_server_auth_passes_context(
+    mocker: MockerFixture,
+) -> None:
+    """
+    With STARTTLS and SMTP_SSL_SERVER_AUTH enabled, ``send_mime_email`` builds a
+    default SSL context and threads it through to ``starttls`` so the server
+    certificate is validated.
+    """
+    from email.mime.multipart import MIMEMultipart
+
+    from superset.utils import core as utils
+
+    create_default_context = mocker.patch(
+        "superset.utils.core.ssl.create_default_context"
+    )
+    smtp = mocker.patch("smtplib.SMTP")
+
+    utils.send_mime_email(
+        "from",
+        ["to"],
+        MIMEMultipart(),
+        _smtp_config(SMTP_STARTTLS=True, SMTP_SSL_SERVER_AUTH=True),
+        dryrun=False,
+    )
+
+    create_default_context.assert_called_once_with()
+    smtp.return_value.starttls.assert_called_once_with(
+        context=create_default_context.return_value
+    )
+
+
+def test_send_mime_email_server_auth_disabled_skips_context(
+    mocker: MockerFixture,
+) -> None:
+    """
+    When SMTP_SSL_SERVER_AUTH is disabled no SSL context is built and ``None`` is
+    passed through, preserving the opt-out (certificate validation skipped).
+    """
+    from email.mime.multipart import MIMEMultipart
+
+    from superset.utils import core as utils
+
+    create_default_context = mocker.patch(
+        "superset.utils.core.ssl.create_default_context"
+    )
+    smtp_ssl = mocker.patch("smtplib.SMTP_SSL")
+
+    utils.send_mime_email(
+        "from",
+        ["to"],
+        MIMEMultipart(),
+        _smtp_config(SMTP_SSL=True, SMTP_SSL_SERVER_AUTH=False),
+        dryrun=False,
+    )
+
+    assert not create_default_context.called
+    smtp_ssl.assert_called_once_with("localhost", 25, context=None, timeout=30)

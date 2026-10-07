@@ -16,8 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import SSHTunnelSwitch from './SSHTunnelSwitch';
 import { DatabaseForm, DatabaseObject } from '../types';
 
@@ -26,7 +25,7 @@ jest.mock('@superset-ui/core', () => ({
   isFeatureEnabled: jest.fn().mockReturnValue(true),
 }));
 
-jest.mock('src/components/Switch', () => ({
+jest.mock('@superset-ui/core/components/Switch', () => ({
   Switch: ({
     checked,
     onChange,
@@ -66,7 +65,7 @@ afterEach(() => {
   jest.clearAllMocks();
 });
 
-test('Renders SSH Tunnel switch enabled by default and toggles its state', () => {
+test('Renders SSH Tunnel switch enabled by default and toggles its state', async () => {
   render(
     <SSHTunnelSwitch
       changeMethods={mockChangeMethods}
@@ -77,7 +76,7 @@ test('Renders SSH Tunnel switch enabled by default and toggles its state', () =>
   );
   const switchButton = screen.getByRole('switch');
   expect(switchButton).toHaveTextContent('OFF');
-  userEvent.click(switchButton);
+  await userEvent.click(switchButton);
   expect(mockChangeMethods.onParametersChange).toHaveBeenCalledWith({
     target: { type: 'toggle', name: 'ssh', checked: true, value: true },
   });
@@ -149,12 +148,10 @@ test('Displays tooltip text on hover over the InfoTooltip', async () => {
     />,
   );
 
-  const infoTooltipTrigger = screen.getByRole('img', {
-    name: 'info-solid_small',
-  });
+  const infoTooltipTrigger = screen.getByTestId('info-tooltip-icon');
   expect(infoTooltipTrigger).toBeInTheDocument();
 
-  userEvent.hover(infoTooltipTrigger);
+  await userEvent.hover(infoTooltipTrigger);
 
   const tooltip = await screen.findByText(tooltipText);
 

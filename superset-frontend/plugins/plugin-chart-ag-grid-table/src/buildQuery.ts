@@ -1,0 +1,838 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  AdhocColumn,
+  buildQueryContext,
+  ensureIsArray,
+  getColumnLabel,
+  getMetricLabel,
+  isDefined,
+  isPhysicalColumn,
+  QueryFormColumn,
+  QueryFormMetric,
+  QueryFormOrderBy,
+  QueryMode,
+  QueryObject,
+  QueryObjectExtras,
+  removeDuplicates,
+  PostProcessingRule,
+  BuildQuery,
+} from '@superset-ui/core';
+import {
+  getTotalsMetrics,
+  isTimeComparison,
+  timeCompareOperator,
+  toTotalsAggregate,
+} from '@superset-ui/chart-controls';
+import { isEmpty } from 'lodash-es';
+import { TableChartFormData } from './types';
+import { updateTableOwnState } from './utils/externalAPIs';
+import {
+  convertAgGridFiltersToSQL,
+  type AgGridFilterModel,
+  type SQLAlchemyFilter,
+} from './utils/agGridFilterConverter';
+
+/**
+ * Infer query mode from form data. If `all_columns` is set, then raw records mode,
+ * otherwise defaults to aggregation mode.
+ *
+ * The same logic is used in `controlPanel` with control values as well.
+ */
+export function getQueryMode(formData: TableChartFormData) {
+  const { query_mode: mode } = formData;
+  if (mode === QueryMode.Aggregate || mode === QueryMode.Raw) {
+    return mode;
+  }
+  const rawColumns = formData?.all_columns;
+  const hasRawColumns = rawColumns && rawColumns.length > 0;
+  return hasRawColumns ? QueryMode.Raw : QueryMode.Aggregate;
+}
+
+export const buildQueryUncached: BuildQuery<TableChartFormData> = (
+  formData: TableChartFormData,
+  options,
+) => {
+  const {
+    percent_metrics: percentMetrics,
+    order_desc: orderDesc = false,
+    extra_form_data,
+  } = formData;
+  const queryMode = getQueryMode(formData);
+  const sortByMetric = ensureIsArray(formData.timeseries_limit_metric)[0];
+  const time_grain_sqla =
+    extra_form_data?.time_grain_sqla || formData.time_grain_sqla;
+  let formDataCopy = formData;
+  // never include time in raw records mode
+  if (queryMode === QueryMode.Raw) {
+    formDataCopy = {
+      ...formData,
+      include_time: false,
+    };
+  }
+
+  const addComparisonPercentMetrics = (metrics: string[], suffixes: string[]) =>
+    metrics.reduce<string[]>((acc, metric) => {
+      const newMetrics = suffixes.map(suffix => `${metric}__${suffix}`);
+      return acc.concat([metric, ...newMetrics]);
+    }, []);
+
+  return buildQueryContext(formDataCopy, baseQueryObject => {
+    let { metrics, orderby = [], columns = [] } = baseQueryObject;
+    const { extras = {} } = baseQueryObject;
+    let postProcessing: PostProcessingRule[] = [];
+    // Capture the percent-metric `contribution` rule so it can be reused for
+    // the totals query below. The totals query must rename percent-metric
+    // columns the same way (`metric` -> `%metric`) so the footer can look them
+    // up; without it the totals row renders 0.000%. We deliberately reuse only
+    // this rule and not the full `postProcessing` array, which may also contain
+    // a time-comparison operator that must not run on the single totals row.
+    let contributionPostProcessing: PostProcessingRule | undefined;
+    const nonCustomNorInheritShifts = ensureIsArray(
+      formData.time_compare,
+    ).filter((shift: string) => shift !== 'custom' && shift !== 'inherit');
+    const customOrInheritShifts = ensureIsArray(formData.time_compare).filter(
+      (shift: string) => shift === 'custom' || shift === 'inherit',
+    );
+
+    let timeOffsets: string[] = [];
+
+    // Shifts for non-custom or non inherit time comparison
+    if (
+      isTimeComparison(formData, baseQueryObject) &&
+      !isEmpty(nonCustomNorInheritShifts)
+    ) {
+      timeOffsets = nonCustomNorInheritShifts;
+    }
+
+    // Shifts for custom or inherit time comparison
+    if (
+      isTimeComparison(formData, baseQueryObject) &&
+      !isEmpty(customOrInheritShifts)
+    ) {
+      if (customOrInheritShifts.includes('custom')) {
+        timeOffsets = timeOffsets.concat([formData.start_date_offset]);
+      }
+      if (customOrInheritShifts.includes('inherit')) {
+        timeOffsets = timeOffsets.concat(['inherit']);
+      }
+    }
+
+    // Dashboard filter override - allows dashboard-level time shifts to OVERRIDE
+    // chart-level time shift settings (from PRs #33947 and #34014)
+    if (extra_form_data?.time_compare) {
+      timeOffsets = [extra_form_data.time_compare];
+    }
+
+    let temporalColumnAdded = false;
+    let temporalColumn = null;
+
+    if (queryMode === QueryMode.Aggregate) {
+      metrics = metrics || [];
+      // override orderby with timeseries metric when in aggregation mode
+      if (sortByMetric) {
+        orderby = [[sortByMetric, !orderDesc]];
+      } else if (metrics?.length > 0) {
+        // default to ordering by first metric in descending order
+        // when no "sort by" metric is set (regardless if "SORT DESC" is set to true)
+        orderby = [[metrics[0], false]];
+      }
+      // add postprocessing for percent metrics only when in aggregation mode
+      if (percentMetrics && percentMetrics.length > 0) {
+        const percentMetricsLabelsWithTimeComparison = isTimeComparison(
+          formData,
+          baseQueryObject,
+        )
+          ? addComparisonPercentMetrics(
+              percentMetrics.map(getMetricLabel),
+              timeOffsets,
+            )
+          : percentMetrics.map(getMetricLabel);
+        const percentMetricLabels = removeDuplicates(
+          percentMetricsLabelsWithTimeComparison,
+        );
+        metrics = removeDuplicates(
+          metrics.concat(percentMetrics),
+          getMetricLabel,
+        );
+        contributionPostProcessing = {
+          operation: 'contribution',
+          options: {
+            columns: percentMetricLabels,
+            rename_columns: percentMetricLabels.map(x => `%${x}`),
+          },
+        };
+        postProcessing = [contributionPostProcessing];
+      }
+      // Add the operator for the time comparison if some is selected
+      if (!isEmpty(timeOffsets)) {
+        postProcessing.push(timeCompareOperator(formData, baseQueryObject));
+      }
+
+      const temporalColumnsLookup = formData?.temporal_columns_lookup;
+      // Filter out the column if needed and prepare the temporal column object
+
+      columns = columns.filter(col => {
+        const shouldBeAdded =
+          isPhysicalColumn(col) &&
+          time_grain_sqla &&
+          temporalColumnsLookup?.[col];
+
+        if (shouldBeAdded && !temporalColumnAdded) {
+          temporalColumn = {
+            timeGrain: time_grain_sqla,
+            columnType: 'BASE_AXIS',
+            sqlExpression: col,
+            label: col,
+            expressionType: 'SQL',
+          } as AdhocColumn;
+          temporalColumnAdded = true;
+          return false; // Do not include this in the output; it's added separately
+        }
+        return true;
+      });
+
+      // So we ensure the temporal column is added first
+      if (temporalColumn) {
+        columns = [temporalColumn, ...columns];
+      }
+    }
+
+    const moreProps: Partial<QueryObject> = {};
+    const ownState = options?.ownState ?? {};
+    // AG Grid header filters applied to a download query as structured filters
+    // (see the isDownloadQuery branch). Tracked so the totals/summary query can
+    // exclude them and keep its prior "start from pre-filter extras" behavior.
+    const agGridDownloadSimpleFilters: SQLAlchemyFilter[] = [];
+    // Server pagination sizing, shared between the per-page request below and
+    // the filter-change reset further down.
+    const pageSize =
+      Number(ownState.pageSize ?? formDataCopy.server_page_length) || 0;
+    const configuredRowLimit = Number(formDataCopy.row_limit) || 0;
+    // row_limit for the first page, capped by the configured row limit. Used
+    // when a filter change resets pagination back to page 0. A pageSize of 0
+    // means "no pagination", so the configured row limit applies directly.
+    const firstPageRowLimit =
+      pageSize > 0
+        ? configuredRowLimit > 0
+          ? Math.min(pageSize, configuredRowLimit)
+          : pageSize
+        : configuredRowLimit;
+
+    // Build Query flag to check if its for either download as csv, excel or json
+    const isDownloadQuery =
+      ['csv', 'xlsx'].includes(formData?.result_format || '') ||
+      (formData?.result_format === 'json' &&
+        formData?.result_type === 'results');
+
+    if (isDownloadQuery) {
+      moreProps.row_limit = Number(formDataCopy.row_limit) || 0;
+      moreProps.row_offset = 0;
+    }
+
+    if (!isDownloadQuery && formDataCopy.server_pagination) {
+      if (pageSize > 0) {
+        // Never page past the configured row limit. Clamping the page to the
+        // last one that still falls within the limit keeps the request inside
+        // the cap and avoids emitting row_limit: 0, which the backend treats
+        // as "no limit" rather than "no rows" (see helpers.py get_sqla_query).
+        const lastPage =
+          configuredRowLimit > 0
+            ? Math.max(Math.ceil(configuredRowLimit / pageSize) - 1, 0)
+            : Number(ownState.currentPage) || 0;
+        const currentPage = Math.min(
+          Number(ownState.currentPage) || 0,
+          lastPage,
+        );
+        const rowOffset = currentPage * pageSize;
+        const remainingRows =
+          configuredRowLimit > 0
+            ? Math.max(configuredRowLimit - rowOffset, 0)
+            : pageSize;
+
+        moreProps.row_limit =
+          configuredRowLimit > 0 ? Math.min(pageSize, remainingRows) : pageSize;
+        moreProps.row_offset = rowOffset;
+      } else {
+        // A pageSize of 0 means "no pagination" (server_page_length: 0), so
+        // request a single unpaginated result capped at the configured row
+        // limit. Feeding 0 into the paging math would emit row_limit: 0,
+        // which the backend treats as "no limit".
+        moreProps.row_limit = configuredRowLimit;
+        moreProps.row_offset = 0;
+      }
+    }
+
+    let sortByFromOwnState: QueryFormOrderBy[] | undefined;
+
+    const sortSource =
+      isDownloadQuery && ownState?.sortModel
+        ? ownState.sortModel
+        : ownState?.sortBy;
+
+    if (Array.isArray(sortSource) && sortSource.length > 0) {
+      const mapColIdToIdentifier = (colId: string): string | undefined => {
+        const matchingColumn = columns.find((col: QueryFormColumn) => {
+          const colLabel = getColumnLabel(col);
+          return colLabel === colId;
+        });
+
+        if (matchingColumn) {
+          // Return the label, not the raw sqlExpression. The backend
+          // (helpers.py get_sqla_query) resolves orderby strings by
+          // matching adhoc column labels, then uses adhoc_column_to_sqla
+          // to emit the actual SQL expression into ORDER BY — so this
+          // is dialect-safe across all database engines.
+          return getColumnLabel(matchingColumn);
+        }
+
+        const matchingMetric = (metrics || []).find((met: QueryFormMetric) => {
+          const metLabel = getMetricLabel(met);
+          return metLabel === colId || `%${metLabel}` === colId;
+        });
+
+        if (matchingMetric) {
+          return getMetricLabel(matchingMetric);
+        }
+
+        return colId;
+      };
+
+      sortByFromOwnState = sortSource
+        .map(
+          (sortItem: {
+            colId?: string | number;
+            key?: string | number;
+            sort?: string;
+            desc?: boolean;
+          }) => {
+            const colId = isDefined(sortItem?.colId)
+              ? sortItem.colId
+              : sortItem?.key;
+            if (!isDefined(colId)) return null;
+            const sortKey = mapColIdToIdentifier(String(colId));
+            if (!sortKey) return null;
+            const isDesc = sortItem?.sort === 'desc' || sortItem?.desc;
+            return [sortKey, !isDesc] as QueryFormOrderBy;
+          },
+        )
+        .filter((item): item is QueryFormOrderBy => item !== null);
+
+      // Add secondary sort for stable ordering (matches AG Grid's stable sort behavior)
+      if (sortByFromOwnState.length === 1 && isDownloadQuery && orderby) {
+        const primarySort = sortByFromOwnState[0][0];
+        orderby.forEach(orderItem => {
+          if (orderItem[0] !== primarySort) {
+            sortByFromOwnState!.push(orderItem);
+          }
+        });
+      }
+    }
+
+    // Note: In Superset, "columns" are dimensions and "metrics" are measures,
+    // but AG Grid treats them all as "columns" in the UI
+    let orderedColumns = columns;
+    let orderedMetrics = metrics;
+
+    if (
+      isDownloadQuery &&
+      ownState.columnOrder &&
+      Array.isArray(ownState.columnOrder)
+    ) {
+      type ColumnOrMetric = QueryFormColumn | QueryFormMetric;
+
+      const matchesColId = (item: ColumnOrMetric, colId: string): boolean => {
+        if (typeof item === 'string') {
+          return item === colId;
+        }
+
+        // Check AdhocColumn properties
+        if ('sqlExpression' in item || 'columnName' in item) {
+          return (
+            (item as AdhocColumn).sqlExpression === colId ||
+            item.label === colId
+          );
+        }
+
+        // Check metric properties
+        return getMetricLabel(item) === colId || item.label === colId;
+      };
+
+      const reorderByColumnOrder = (
+        items: ColumnOrMetric[],
+      ): ColumnOrMetric[] => {
+        const ordered: ColumnOrMetric[] = [];
+        const remaining = new Set(items);
+
+        ownState.columnOrder.forEach((colId: string) => {
+          const match = items.find(
+            item => remaining.has(item) && matchesColId(item, colId),
+          );
+          if (match) {
+            ordered.push(match);
+            remaining.delete(match);
+          }
+        });
+
+        remaining.forEach(item => ordered.push(item));
+        return ordered;
+      };
+
+      orderedColumns = reorderByColumnOrder(columns) as typeof columns;
+      orderedMetrics = metrics
+        ? (reorderByColumnOrder(metrics) as typeof metrics)
+        : metrics;
+    }
+
+    let queryObject = {
+      ...baseQueryObject,
+      columns: orderedColumns,
+      extras: {
+        ...extras,
+        // Pass column order to enable mixed column+metric ordering
+        ...(isDownloadQuery &&
+        ownState.columnOrder &&
+        Array.isArray(ownState.columnOrder)
+          ? { column_order: ownState.columnOrder }
+          : {}),
+      },
+      orderby:
+        (formData.server_pagination || isDownloadQuery) && sortByFromOwnState
+          ? sortByFromOwnState
+          : orderby,
+      metrics: orderedMetrics,
+      post_processing: postProcessing,
+      time_offsets: timeOffsets,
+      ...moreProps,
+    };
+
+    if (
+      !isDownloadQuery &&
+      formData.server_pagination &&
+      options?.extras?.cachedChanges?.[formData.slice_id] &&
+      JSON.stringify(options?.extras?.cachedChanges?.[formData.slice_id]) !==
+        JSON.stringify(queryObject.filters)
+    ) {
+      // Reset to the first page: restore the full first-page row_limit rather
+      // than carrying over the last page's capped value. Skipped for download
+      // queries so CSV/JSON exports keep the full configured row_limit instead
+      // of being capped to the page size.
+      queryObject = {
+        ...queryObject,
+        row_offset: 0,
+        row_limit: firstPageRowLimit,
+      };
+      const modifiedOwnState = {
+        ...options?.ownState,
+        currentPage: 0,
+        // Persist the user-selected page size, not the per-request row_limit,
+        // which may be capped to the remaining rows on the last page.
+        pageSize,
+        lastFilteredColumn: undefined,
+        lastFilteredInputPosition: undefined,
+      };
+      updateTableOwnState(options?.hooks?.setDataMask, modifiedOwnState);
+    }
+    // Because we use same buildQuery for all table on the page we need split them by id
+    options?.hooks?.setCachedChanges({
+      [formData.slice_id]: queryObject.filters,
+    });
+
+    const extraQueries: QueryObject[] = [];
+
+    const interactiveGroupBy = formData.extra_form_data?.interactive_groupby;
+    if (interactiveGroupBy && queryObject.columns) {
+      queryObject.columns = [
+        ...new Set([...queryObject.columns, ...interactiveGroupBy]),
+      ];
+    }
+
+    if (formData.server_pagination) {
+      // Add search filter if search text exists
+      if (ownState.searchText && ownState?.searchColumn) {
+        queryObject = {
+          ...queryObject,
+          filters: [
+            ...(queryObject.filters || []),
+            {
+              col: ownState?.searchColumn,
+              op: 'ILIKE',
+              val: `${ownState.searchText}%`,
+            },
+          ],
+        };
+      }
+      // Add AG Grid column filters from ownState (non-metric filters only)
+      if (
+        ownState.agGridSimpleFilters &&
+        ownState.agGridSimpleFilters.length > 0
+      ) {
+        // Get columns that have AG Grid filters
+        const agGridFilterColumns = new Set(
+          ownState.agGridSimpleFilters.map(
+            (filter: { col: string }) => filter.col,
+          ),
+        );
+
+        // Remove existing TEMPORAL_RANGE filters for columns that have new AG Grid filters
+        // This prevents duplicate filters like "No filter" and actual date ranges
+        const existingFilters = (queryObject.filters || []).filter(filter => {
+          // Keep filter if it doesn't have the expected structure
+          if (!filter || typeof filter !== 'object' || !filter.col) {
+            return true;
+          }
+          // Keep filter if it's not a temporal range filter
+          if (filter.op !== 'TEMPORAL_RANGE') {
+            return true;
+          }
+          // Remove if this column has an AG Grid filter
+          return !agGridFilterColumns.has(filter.col);
+        });
+
+        queryObject = {
+          ...queryObject,
+          filters: [...existingFilters, ...ownState.agGridSimpleFilters],
+        };
+      }
+
+      // Map metric/column labels to SQL expressions for WHERE/HAVING resolution
+      const sqlExpressionMap: Record<string, string> = {};
+      (metrics || []).forEach((m: QueryFormMetric) => {
+        if (typeof m === 'object' && 'expressionType' in m) {
+          const label = getMetricLabel(m);
+          if (m.expressionType === 'SQL' && m.sqlExpression) {
+            sqlExpressionMap[label] = m.sqlExpression;
+          } else if (
+            m.expressionType === 'SIMPLE' &&
+            m.aggregate &&
+            m.column?.column_name
+          ) {
+            sqlExpressionMap[label] = `${m.aggregate}(${m.column.column_name})`;
+          }
+        }
+      });
+      // Map dimension columns with custom SQL expressions
+      (columns || []).forEach((col: QueryFormColumn) => {
+        if (typeof col === 'object' && 'sqlExpression' in col) {
+          const label = getColumnLabel(col);
+          if (col.sqlExpression) {
+            sqlExpressionMap[label] = col.sqlExpression;
+          }
+        }
+      });
+      // Merge datasource-level saved metrics and calculated columns
+      if (ownState.metricSqlExpressions) {
+        Object.entries(
+          ownState.metricSqlExpressions as Record<string, string>,
+        ).forEach(([label, expression]) => {
+          if (!sqlExpressionMap[label]) {
+            sqlExpressionMap[label] = expression;
+          }
+        });
+      }
+
+      const resolveLabelsToSQL = (clause: string): string => {
+        let resolved = clause;
+        // Sort by label length descending to prevent substring false positives
+        const sortedEntries = Object.entries(sqlExpressionMap).sort(
+          ([a], [b]) => b.length - a.length,
+        );
+        sortedEntries.forEach(([label, expression]) => {
+          if (resolved.includes(label)) {
+            const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            // Wrap complex expressions in parentheses for valid SQL
+            const isExpression =
+              expression.includes('(') ||
+              expression.toUpperCase().includes('CASE') ||
+              expression.includes('\n');
+            const wrappedExpression = isExpression
+              ? `(${expression})`
+              : expression;
+            resolved = resolved.replace(
+              new RegExp(`\\b${escapedLabel}\\b`, 'g'),
+              wrappedExpression,
+            );
+          }
+        });
+        return resolved;
+      };
+
+      // Resolve and apply AG Grid WHERE clause
+      if (ownState.agGridComplexWhere && ownState.agGridComplexWhere.trim()) {
+        const resolvedWhere = resolveLabelsToSQL(ownState.agGridComplexWhere);
+        (ownState as Record<string, unknown>).agGridComplexWhere =
+          resolvedWhere;
+        const existingWhere = queryObject.extras?.where;
+        const combinedWhere = existingWhere
+          ? `${existingWhere} AND ${resolvedWhere}`
+          : resolvedWhere;
+
+        queryObject = {
+          ...queryObject,
+          extras: {
+            ...queryObject.extras,
+            where: combinedWhere,
+          },
+        };
+      }
+
+      // Resolve and apply AG Grid HAVING clause
+      if (ownState.agGridHavingClause && ownState.agGridHavingClause.trim()) {
+        const resolvedHaving = resolveLabelsToSQL(ownState.agGridHavingClause);
+        (ownState as Record<string, unknown>).agGridHavingClause =
+          resolvedHaving;
+        const existingHaving = queryObject.extras?.having;
+        const combinedHaving = existingHaving
+          ? `${existingHaving} AND ${resolvedHaving}`
+          : resolvedHaving;
+
+        queryObject = {
+          ...queryObject,
+          extras: {
+            ...queryObject.extras,
+            having: combinedHaving,
+          },
+        };
+      }
+    }
+
+    if (isDownloadQuery) {
+      // Apply any QueryFilterClause filters from ownState (e.g., server pagination search)
+      if (ownState.filters?.length) {
+        queryObject.filters = [
+          ...(queryObject.filters || []),
+          ...ownState.filters,
+        ];
+      }
+
+      // Apply AG Grid header filters. Simple single-condition, non-metric
+      // filters are sent as structured `{ col, op, val }` filters so the
+      // backend (SQLAlchemy) quotes each identifier for the target dialect.
+      // Unlike a raw `extras.where` string, this works for column names with
+      // spaces or reserved words across ClickHouse/Postgres/MySQL/BigQuery --
+      // a raw fragment like `Destination Address Street ILIKE '%x%'` fails
+      // backend clause validation, and no fixed quote character is valid for
+      // every dialect. Compound (AND/OR) and metric (HAVING) filters remain
+      // free-form SQL, matching the live in-grid path.
+      if (ownState.agGridFilterModel) {
+        // Percent metrics (`%<label>`) and time-comparison columns
+        // (`% <label>`) are classified as metrics inside convertAgGridFiltersToSQL
+        // via a `%`-prefix check, so only the plain metric labels are needed here.
+        const metricColumns = (metrics || []).map(m =>
+          typeof m === 'string' ? m : getMetricLabel(m),
+        );
+        const { simpleFilters, complexWhere, havingClause } =
+          convertAgGridFiltersToSQL(
+            ownState.agGridFilterModel as AgGridFilterModel,
+            metricColumns,
+          );
+
+        if (simpleFilters.length > 0) {
+          // Drop any placeholder TEMPORAL_RANGE filters on the same columns so
+          // an AG Grid date filter fully replaces the "No filter" default.
+          const filteredCols = new Set(simpleFilters.map(f => f.col));
+          const existingFilters = (queryObject.filters || []).filter(
+            filter =>
+              !(
+                filter &&
+                typeof filter === 'object' &&
+                typeof filter.col === 'string' &&
+                filter.op === 'TEMPORAL_RANGE' &&
+                filteredCols.has(filter.col)
+              ),
+          );
+          agGridDownloadSimpleFilters.push(...simpleFilters);
+          queryObject.filters = [
+            ...existingFilters,
+            ...simpleFilters,
+          ] as QueryObject['filters'];
+        }
+
+        if (complexWhere || havingClause) {
+          queryObject.extras = {
+            ...queryObject.extras,
+            transpile_to_dialect: true,
+            ...(complexWhere && {
+              where: queryObject.extras?.where
+                ? `${queryObject.extras.where} AND ${complexWhere}`
+                : complexWhere,
+            }),
+            ...(havingClause && {
+              having: queryObject.extras?.having
+                ? `${queryObject.extras.having} AND ${havingClause}`
+                : havingClause,
+            }),
+          } as QueryObjectExtras;
+        }
+      }
+    }
+
+    // Build the "all records" percent-metric denominator query AFTER all
+    // filter mutations (interactive group-by, search, AG Grid WHERE/HAVING)
+    // above, so its denominator reflects the same filtered result set as the
+    // main query instead of a stale pre-filter snapshot.
+    const calculationMode = formData.percent_metric_calculation || 'row_limit';
+
+    if (
+      calculationMode === 'all_records' &&
+      percentMetrics &&
+      percentMetrics.length > 0
+    ) {
+      extraQueries.push({
+        ...queryObject,
+        columns: [],
+        metrics: percentMetrics,
+        post_processing: [],
+        row_limit: 0,
+        row_offset: 0,
+        orderby: [],
+        is_timeseries: false,
+      });
+    }
+
+    // Create totals query AFTER all filters (including AG Grid filters) are applied
+    // This ensures we can properly exclude AG Grid WHERE filters from the totals
+    // In raw records mode the summary is a SUM over the numeric columns primed
+    // into ownState by the chart (see rawSummaryColumns in transformProps).
+    // Own state can outlive a datasource or column-selection change, so bound
+    // the primed summary columns to the current raw selection: a stale name
+    // must never reach a SUM metric or the whole chart query fails before the
+    // chart can re-prime its own state.
+    const selectedRawColumns = new Set(
+      ensureIsArray(formData.all_columns).map(getColumnLabel),
+    );
+    const rawSummaryColumns =
+      queryMode === QueryMode.Raw && formData.show_totals
+        ? ensureIsArray(
+            ownState.rawSummaryColumns as string[] | undefined,
+          ).filter(columnName => selectedRawColumns.has(columnName))
+        : [];
+    const showAggregateTotals = Boolean(
+      metrics?.length &&
+      formData.show_totals &&
+      queryMode === QueryMode.Aggregate,
+    );
+    const totalsAggregate = toTotalsAggregate(formData.totals_aggregate);
+    // Raw-mode summary columns have no metric of their own to preserve, so
+    // ORIGINAL has nothing to fall back to; sum them as before.
+    const rawSummaryAggregate =
+      totalsAggregate === 'ORIGINAL' ? 'SUM' : totalsAggregate;
+    const totalsMetrics =
+      rawSummaryColumns.length > 0
+        ? rawSummaryColumns.map(columnName => ({
+            expressionType: 'SIMPLE' as const,
+            aggregate: rawSummaryAggregate,
+            column: { column_name: columnName },
+            label: columnName,
+          }))
+        : showAggregateTotals
+          ? getTotalsMetrics(metrics ?? [], totalsAggregate)
+          : undefined;
+
+    if (showAggregateTotals || rawSummaryColumns.length > 0) {
+      // Start from the original, pre-filter extras (captured before any AG Grid
+      // complexWhere/havingClause fragments were merged in above) rather than
+      // trying to subtract those fragments back out of the now-combined
+      // `queryObject.extras` string. AG Grid filters can reference calculated
+      // columns that aren't available once the totals subquery drops all
+      // grouping columns (columns: []), and that applies to HAVING just as much
+      // as WHERE — starting clean avoids having to special-case each source.
+      // The structured simpleFilters are stripped separately below.
+      const totalsExtras = { ...extras };
+      if (!totalsExtras.where) {
+        delete totalsExtras.where;
+      }
+      if (!totalsExtras.having) {
+        delete totalsExtras.having;
+      }
+
+      extraQueries.push({
+        ...queryObject,
+        columns: [],
+        // Exclude AG Grid download filters here for the same reason the extras
+        // above start clean: the totals subquery drops grouping columns, so its
+        // result set is computed without the interactive AG Grid filtering.
+        filters: (queryObject.filters || []).filter(
+          filter =>
+            !agGridDownloadSimpleFilters.includes(
+              filter as unknown as SQLAlchemyFilter,
+            ),
+        ),
+        ...(totalsMetrics ? { metrics: totalsMetrics } : {}),
+        extras: totalsExtras, // Use extras with AG Grid WHERE removed
+        row_limit: 0,
+        row_offset: 0,
+        // Reapply only the percent-metric contribution rule so the totals row
+        // exposes `%metric` keys (value/value = 100% on the single aggregated
+        // row). The time-comparison operator from the main query is omitted on
+        // purpose; it must not run against the single-row totals query.
+        post_processing: contributionPostProcessing
+          ? [contributionPostProcessing]
+          : [],
+        order_desc: undefined, // we don't need orderby stuff here,
+        orderby: undefined, // because this query will be used for get total aggregation.
+      });
+    }
+
+    // Now since row limit control is always visible even
+    // in case of server pagination
+    // we must use row limit from form data
+    if (formData.server_pagination && !isDownloadQuery) {
+      return [
+        { ...queryObject },
+        {
+          ...queryObject,
+          time_offsets: [],
+          row_limit: Number(formData?.row_limit ?? 0),
+          row_offset: 0,
+          post_processing: [],
+          is_rowcount: true,
+        },
+        ...extraQueries,
+      ];
+    }
+
+    return [queryObject, ...extraQueries];
+  });
+};
+
+// Use this closure to cache changing of external filters, if we have server pagination we need reset page to 0, after
+// external filter changed
+export const cachedBuildQuery = (): BuildQuery<TableChartFormData> => {
+  let cachedChanges: Record<string, unknown> = {};
+  const setCachedChanges = (newChanges: Record<string, unknown>) => {
+    cachedChanges = { ...cachedChanges, ...newChanges };
+  };
+
+  return (formData, options) =>
+    buildQueryUncached(
+      { ...formData },
+      {
+        extras: { cachedChanges },
+        ownState: options?.ownState ?? {},
+        hooks: {
+          ...options?.hooks,
+          setDataMask: () => {},
+          setCachedChanges,
+        },
+      },
+    );
+};
+
+export default cachedBuildQuery();

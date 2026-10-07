@@ -16,18 +16,30 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { t, validateNonEmpty } from '@superset-ui/core';
+import { t } from '@apache-superset/core/translation';
+import { validateNonEmpty } from '@superset-ui/core';
 import {
   ControlPanelConfig,
   formatSelectOptionsForRange,
   getStandardizedControls,
 } from '@superset-ui/chart-controls';
+import { xAxisLabelRotation } from '../controls';
+import { SORT_Y_AXIS_NONE } from './types';
 
 const sortAxisChoices = [
   ['alpha_asc', t('Axis ascending')],
   ['alpha_desc', t('Axis descending')],
   ['value_asc', t('Metric ascending')],
   ['value_desc', t('Metric descending')],
+];
+
+// Y-axis sort choices extend the shared list with an explicit "no sort" option.
+// Selecting SORT_Y_AXIS_NONE persists a non-null value that the transform layer
+// honours as "keep original order", giving users a way to opt out of the
+// alpha_asc default that applies when the control is cleared or never touched.
+const sortYAxisChoices = [
+  ...sortAxisChoices,
+  [SORT_Y_AXIS_NONE, t('No sort (original order)')],
 ];
 
 const config: ControlPanelConfig = {
@@ -60,7 +72,7 @@ const config: ControlPanelConfig = {
             config: {
               type: 'SelectControl',
               label: t('Sort Y Axis'),
-              choices: sortAxisChoices,
+              choices: sortYAxisChoices,
               renderTrigger: false,
               clearable: true,
             },
@@ -125,10 +137,35 @@ const config: ControlPanelConfig = {
         ['linear_color_scheme'],
         [
           {
+            name: 'border_color',
+            config: {
+              type: 'ColorPickerControl',
+              label: t('Border color'),
+              renderTrigger: true,
+              description: t('The color of the elements border'),
+              default: { r: 0, g: 0, b: 0, a: 1 },
+            },
+          },
+          {
+            name: 'border_width',
+            config: {
+              type: 'SliderControl',
+              label: t('Border width'),
+              renderTrigger: true,
+              min: 0,
+              max: 2,
+              default: 0,
+              step: 0.1,
+              description: t('The width of the elements border'),
+            },
+          },
+        ],
+        [
+          {
             name: 'xscale_interval',
             config: {
               type: 'SelectControl',
-              label: t('XScale Interval'),
+              label: t('X-scale interval'),
               renderTrigger: true,
               choices: [[-1, t('Auto')]].concat(
                 formatSelectOptionsForRange(1, 50),
@@ -146,7 +183,7 @@ const config: ControlPanelConfig = {
             name: 'yscale_interval',
             config: {
               type: 'SelectControl',
-              label: t('YScale Interval'),
+              label: t('Y-scale interval'),
               choices: [[-1, t('Auto')]].concat(
                 formatSelectOptionsForRange(1, 50),
               ),
@@ -223,6 +260,7 @@ const config: ControlPanelConfig = {
         ],
         ['y_axis_format'],
         ['x_axis_time_format'],
+        [xAxisLabelRotation],
         ['currency_format'],
         [
           {

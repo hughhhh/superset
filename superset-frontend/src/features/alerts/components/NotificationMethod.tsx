@@ -20,22 +20,29 @@ import {
   FunctionComponent,
   useState,
   ChangeEvent,
+  useCallback,
   useEffect,
   useMemo,
+  useRef,
 } from 'react';
 import rison from 'rison';
 
+import { t } from '@apache-superset/core/translation';
 import {
   FeatureFlag,
   JsonResponse,
   SupersetClient,
   isFeatureEnabled,
-  styled,
-  t,
-  useTheme,
 } from '@superset-ui/core';
-import { Select } from 'src/components';
-import Icons from 'src/components/Icons';
+import { styled, useTheme } from '@apache-superset/core/theme';
+import { Icons } from '@superset-ui/core/components/Icons';
+import {
+  ActionButton,
+  AsyncSelect,
+  Input,
+  Select,
+} from '@superset-ui/core/components';
+import RefreshLabel from '@superset-ui/core/components/RefreshLabel';
 import {
   NotificationMethodOption,
   NotificationSetting,
@@ -45,7 +52,7 @@ import { StyledInputContainer } from '../AlertReportModal';
 
 const StyledNotificationMethod = styled.div`
   ${({ theme }) => `
-    margin-bottom: ${theme.gridUnit * 3}px;
+    margin-bottom: ${theme.sizeUnit * 3}px;
 
     .input-container {
       textarea {
@@ -54,52 +61,74 @@ const StyledNotificationMethod = styled.div`
 
       &.error {
         input {
-          border-color: ${theme.colors.error.base};
+          border-color: ${theme.colorError};
         }
       }
 
       .helper {
-        margin-top: ${theme.gridUnit * 2}px;
-        font-size: ${theme.typography.sizes.s}px;
-        color: ${theme.colors.grayscale.base};
+        margin-top: ${theme.sizeUnit * 2}px;
+        font-size: ${theme.fontSizeSM}px;
+        color: ${theme.colorTextSecondary};
       }
     }
 
     .inline-container {
-      margin-bottom: ${theme.gridUnit * 2}px;
+      margin-bottom: ${theme.sizeUnit * 2}px;
 
       > div {
         margin: 0px;
       }
 
       .delete-button {
-        margin-left: ${theme.gridUnit * 2}px;
-        padding-top: ${theme.gridUnit}px;
+        margin-left: ${theme.sizeUnit * 2}px;
+        padding-top: ${theme.sizeUnit}px;
+      }
+      .anticon {
+        margin-left: ${theme.sizeUnit}px;
       }
     }
 
     .ghost-button {
-      color: ${theme.colors.primary.dark1};
+      appearance: none;
+      border: none;
+      background: none;
+      padding: 0;
+      font: inherit;
+      color: ${theme.colorPrimaryText};
       display: inline-flex;
       align-items: center;
-      font-size: ${theme.typography.sizes.s}px;
+      font-size: ${theme.fontSizeSM}px;
       cursor: pointer;
-      margin-top: ${theme.gridUnit}px;
 
       .icon {
-        width: ${theme.gridUnit * 3}px;
-        height: ${theme.gridUnit * 3}px;
-        font-size: ${theme.typography.sizes.s}px;
-        margin-right: ${theme.gridUnit}px;
+        width: ${theme.sizeUnit * 3}px;
+        height: ${theme.sizeUnit * 3}px;
+        font-size: ${theme.fontSizeSM}px;
+        margin-right: ${theme.sizeUnit}px;
       }
     }
 
     .ghost-button + .ghost-button {
-      margin-left: ${theme.gridUnit * 4}px;
+      margin-left: ${theme.sizeUnit * 4}px;
     }
 
-    .ghost-button:first-child[style*='none'] + .ghost-button {
+    .ghost-button:first-of-type[style*='none'] + .ghost-button {
       margin-left: 0px; /* Remove margin when the first button is hidden */
+    }
+
+    .email-recipient-container {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+
+      .email-recipient-select {
+        width: 100%;
+      }
+
+      .helper {
+        margin-top: ${theme.sizeUnit * 2}px;
+        padding: 0;
+      }
     }
   `}
 `;
@@ -147,46 +176,84 @@ export const mapSlackValues = ({
     .filter(val => !!val) as { label: string; value: string }[];
 };
 
-export const mapChannelsToOptions = (result: SlackChannel[]) => {
-  const publicChannels: SlackChannel[] = [];
-  const privateChannels: SlackChannel[] = [];
+type EmailRecipientField = 'recipients' | 'cc' | 'bcc';
 
-  result.forEach(channel => {
-    if (channel.is_private) {
-      privateChannels.push(channel);
-    } else {
-      publicChannels.push(channel);
-    }
-  });
-
-  return [
-    {
-      label: 'Public Channels',
-      options: publicChannels.map((channel: SlackChannel) => ({
-        label: `${channel.name} ${
-          channel.is_member ? '' : t('(Bot not in channel)')
-        }`,
-        value: channel.id,
-        key: channel.id,
-      })),
-      key: 'public',
-    },
-    {
-      label: t('Private Channels (Bot in channel)'),
-      options: privateChannels.map((channel: SlackChannel) => ({
-        label: channel.name,
-        value: channel.id,
-        key: channel.id,
-      })),
-      key: 'private',
-    },
-  ];
+type EmailRecipientOption = {
+  label: string;
+  value: string;
 };
 
-type SlackOptionsType = {
-  label: string;
-  options: { label: string; value: string }[];
-}[];
+type RelatedUserOption = {
+  text: string;
+  value: number;
+  extra?: {
+    email?: string;
+  };
+};
+
+const emailRecipientSeparators = /[,;]/;
+
+const recipientStringToOptions = (value: string): EmailRecipientOption[] =>
+  value
+    .split(emailRecipientSeparators)
+    .map(recipient => recipient.trim())
+    .filter(Boolean)
+    .map(recipient => ({
+      label: recipient,
+      value: recipient,
+    }));
+
+const isEmailRecipientOption = (
+  option: unknown,
+): option is EmailRecipientOption => {
+  if (!option || typeof option !== 'object') {
+    return false;
+  }
+  const { value } = option as { value?: unknown };
+  return typeof value === 'string';
+};
+
+const normalizeEmailRecipientOptions = (
+  selected: unknown,
+): EmailRecipientOption[] =>
+  Array.isArray(selected) ? selected.filter(isEmailRecipientOption) : [];
+
+const emailRecipientOptionsToString = (selected: unknown) =>
+  normalizeEmailRecipientOptions(selected)
+    .map(option => option.value)
+    .join(',');
+
+const fetchEmailRecipientOptions = async (
+  filterValue: string,
+  page: number,
+  pageSize: number,
+) => {
+  const query = rison.encode_uri({
+    filter: filterValue,
+    page,
+    page_size: pageSize,
+    order_column: 'username',
+    order_direction: 'asc',
+  });
+
+  const response = await SupersetClient.get({
+    endpoint: `/api/v1/report/related/created_by?q=${query}`,
+  });
+  const results = (response.json?.result ?? []) as RelatedUserOption[];
+
+  return {
+    data: results
+      .filter(
+        (user): user is RelatedUserOption & { extra: { email: string } } =>
+          !!user.extra?.email,
+      )
+      .map(({ text, extra }) => ({
+        value: extra.email,
+        label: `${text} <${extra.email}>`,
+      })),
+    totalCount: response.json?.count ?? 0,
+  };
+};
 
 export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
   setting = null,
@@ -213,12 +280,20 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
   const theme = useTheme();
   const [methodOptionsLoading, setMethodOptionsLoading] =
     useState<boolean>(true);
-  const [slackOptions, setSlackOptions] = useState<SlackOptionsType>([
-    {
-      label: '',
-      options: [],
-    },
-  ]);
+  const [slackRefreshKey, setSlackRefreshKey] = useState<number>(0);
+  const forceRefreshSlackRef = useRef<boolean>(false);
+  const recipientEmailOptions = useMemo(
+    () => recipientStringToOptions(recipientValue),
+    [recipientValue],
+  );
+  const ccEmailOptions = useMemo(
+    () => recipientStringToOptions(ccValue),
+    [ccValue],
+  );
+  const bccEmailOptions = useMemo(
+    () => recipientStringToOptions(bccValue),
+    [bccValue],
+  );
 
   const [useSlackV1, setUseSlackV1] = useState<boolean>(false);
 
@@ -244,67 +319,153 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
     }
   };
 
-  const fetchSlackChannels = async ({
+  const fetchSlackChannels = ({
     searchString = '',
     types = [],
     exactMatch = false,
+    force = false,
+    page,
+    pageSize,
   }: {
-    searchString?: string | undefined;
+    searchString?: string;
     types?: string[];
-    exactMatch?: boolean | undefined;
+    exactMatch?: boolean;
+    force?: boolean;
+    page?: number;
+    pageSize?: number;
   } = {}): Promise<JsonResponse> => {
-    const queryString = rison.encode({ searchString, types, exactMatch });
+    const queryString = rison.encode({
+      search_string: searchString,
+      types,
+      exact_match: exactMatch,
+      force,
+      ...(page !== undefined ? { page } : {}),
+      ...(pageSize !== undefined ? { page_size: pageSize } : {}),
+    });
     const endpoint = `/api/v1/report/slack_channels/?q=${queryString}`;
     return SupersetClient.get({ endpoint });
   };
 
+  // Lazily fetch one page of channels as the user searches, so workspaces with
+  // tens of thousands of channels never load the whole list into the browser.
+  const loadSlackChannels = useCallback(
+    async (search: string, page: number, pageSize: number) => {
+      const force = forceRefreshSlackRef.current;
+      forceRefreshSlackRef.current = false;
+      const { json } = await fetchSlackChannels({
+        searchString: search,
+        types: ['public_channel', 'private_channel'],
+        force,
+        page,
+        pageSize,
+      });
+      const result = (json?.result ?? []) as SlackChannel[];
+      return {
+        data: result.map(channel => ({
+          label:
+            !channel.is_private && !channel.is_member
+              ? `${channel.name} ${t('(Bot not in channel)')}`
+              : channel.name,
+          value: channel.id,
+        })),
+        totalCount: json?.count ?? result.length,
+      };
+    },
+    // fetchSlackChannels only closes over stable refs/imports
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const onRefreshSlackChannels = () => {
+    forceRefreshSlackRef.current = true;
+    // Remount the AsyncSelect so its internal result cache is discarded and the
+    // forced (cache-busting) fetch runs.
+    setSlackRefreshKey(key => key + 1);
+  };
+
+  // Resolve the channel ids saved on an existing SlackV2 report into
+  // human-readable labels. Bounded by exact_match so it never enumerates the
+  // whole workspace.
   useEffect(() => {
+    let cancelled = false;
     const slackEnabled = options?.some(
       option =>
         option === NotificationMethodOption.Slack ||
         option === NotificationMethodOption.SlackV2,
     );
-    if (slackEnabled && !slackOptions[0]?.options.length) {
-      fetchSlackChannels({ types: ['public_channel', 'private_channel'] })
-        .then(({ json }) => {
-          const { result } = json;
-          const options: SlackOptionsType = mapChannelsToOptions(result);
+    const savedIds =
+      method === NotificationMethodOption.SlackV2 && recipientValue
+        ? recipientValue
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean)
+        : [];
 
-          setSlackOptions(options);
-
-          if (isFeatureEnabled(FeatureFlag.AlertReportSlackV2)) {
-            // for edit mode, map existing ids to names for display if slack v2
-            // or names to ids if slack v1
-            const [publicOptions, privateOptions] = options;
-            if (
-              method &&
-              [
-                NotificationMethodOption.SlackV2,
-                NotificationMethodOption.Slack,
-              ].includes(method)
-            ) {
-              setSlackRecipients(
-                mapSlackValues({
-                  method,
-                  recipientValue,
-                  slackOptions: [
-                    ...publicOptions.options,
-                    ...privateOptions.options,
-                  ],
-                }),
-              );
-            }
+    const resolveSavedRecipients = async () => {
+      // Show the saved ids immediately so the existing selection is always
+      // visible, then enrich with channel names once the lookup resolves.
+      if (savedIds.length && !cancelled) {
+        setSlackRecipients(savedIds.map(id => ({ label: id, value: id })));
+      }
+      try {
+        if (savedIds.length) {
+          const { json } = await fetchSlackChannels({
+            searchString: recipientValue,
+            types: ['public_channel', 'private_channel'],
+            exactMatch: true,
+          });
+          const result = (json?.result ?? []) as SlackChannel[];
+          const namesById = new Map(
+            result.map(channel => [channel.id, channel.name]),
+          );
+          if (!cancelled) {
+            setSlackRecipients(
+              savedIds.map(id => ({
+                label: namesById.get(id) ?? id,
+                value: id,
+              })),
+            );
           }
-        })
-        .catch(e => {
-          // Fallback to slack v1 if slack v2 is not compatible
-          setUseSlackV1(true);
-        })
-        .finally(() => {
+        }
+      } catch {
+        // Keep the raw ids as labels; the AsyncSelect onError handler drives
+        // the v1 fallback for the picker itself.
+      } finally {
+        if (!cancelled) {
           setMethodOptionsLoading(false);
-        });
+        }
+      }
+    };
+
+    if (slackEnabled) {
+      resolveSavedRecipients();
+    } else {
+      setMethodOptionsLoading(false);
     }
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (recipients !== undefined && recipientValue !== recipients) {
+      setRecipientValue(recipients);
+    }
+  }, [recipientValue, recipients]);
+
+  useEffect(() => {
+    if (cc !== undefined && ccValue !== cc) {
+      setCcValue(cc);
+    }
+  }, [cc, ccValue]);
+
+  useEffect(() => {
+    if (bcc !== undefined && bccValue !== bcc) {
+      setBccValue(bcc);
+    }
+  }, [bcc, bccValue]);
 
   const methodOptions = useMemo(
     () =>
@@ -317,6 +478,8 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
             ((!isFeatureEnabled(FeatureFlag.AlertReportSlackV2) ||
               useSlackV1) &&
               method === NotificationMethodOption.Slack) ||
+            (isFeatureEnabled(FeatureFlag.AlertReportWebhook) &&
+              method === NotificationMethodOption.Webhook) ||
             method === NotificationMethodOption.Email,
         )
         .map(method => ({
@@ -333,7 +496,9 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
     return null;
   }
 
-  const onRecipientsChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+  const onRecipientsChange = (
+    event: ChangeEvent<HTMLTextAreaElement | HTMLInputElement>,
+  ) => {
     const { target } = event;
 
     setRecipientValue(target.value);
@@ -347,6 +512,28 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
       onUpdate(index, updatedSetting);
     }
   };
+
+  const onEmailRecipientsChange =
+    (field: EmailRecipientField) => (selected: unknown) => {
+      const value = emailRecipientOptionsToString(selected);
+
+      if (field === 'recipients') {
+        setRecipientValue(value);
+      } else if (field === 'cc') {
+        setCcValue(value);
+      } else {
+        setBccValue(value);
+      }
+
+      if (onUpdate) {
+        const updatedSetting = {
+          ...setting,
+          [field]: value,
+        };
+
+        onUpdate(index, updatedSetting);
+      }
+    };
 
   const onSlackRecipientsChange = (
     recipients: { label: string; value: string }[],
@@ -379,49 +566,6 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
     }
   };
 
-  const onCcChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const { target } = event;
-
-    setCcValue(target.value);
-
-    if (onUpdate) {
-      const updatedSetting = {
-        ...setting,
-        cc: target.value,
-      };
-
-      onUpdate(index, updatedSetting);
-    }
-  };
-
-  const onBccChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const { target } = event;
-
-    setBccValue(target.value);
-
-    if (onUpdate) {
-      const updatedSetting = {
-        ...setting,
-        bcc: target.value,
-      };
-
-      onUpdate(index, updatedSetting);
-    }
-  };
-
-  // Set recipients
-  if (!!recipients && recipientValue !== recipients) {
-    setRecipientValue(recipients);
-  }
-
-  if (!!cc && ccValue !== cc) {
-    setCcValue(cc);
-  }
-
-  if (!!bcc && bccValue !== bcc) {
-    setBccValue(bcc);
-  }
-
   return (
     <StyledNotificationMethod>
       <div className="inline-container">
@@ -440,30 +584,27 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
               loading={methodOptionsLoading}
             />
             {index !== 0 && !!onRemove ? (
-              // eslint-disable-next-line jsx-a11y/control-has-associated-label
-              <span
-                role="button"
-                tabIndex={0}
+              <ActionButton
+                label={t('Remove notification method')}
                 className="delete-button"
+                icon={<Icons.DeleteOutlined iconSize="l" />}
                 onClick={() => onRemove(index)}
-              >
-                <Icons.Trash iconColor={theme.colors.grayscale.base} />
-              </span>
+              />
             ) : null}
           </div>
         </StyledInputContainer>
       </div>
       {method !== undefined ? (
         <>
-          <div className="inline-container">
-            <StyledInputContainer>
-              {method === NotificationMethodOption.Email ? (
+          {method === NotificationMethodOption.Email ? (
+            <div className="inline-container">
+              <StyledInputContainer>
                 <>
                   <div className="control-label">
                     {TRANSLATIONS.EMAIL_SUBJECT_NAME}
                   </div>
                   <div className={`input-container ${error ? 'error' : ''}`}>
-                    <input
+                    <Input
                       type="text"
                       name="email_subject"
                       value={email_subject}
@@ -474,66 +615,114 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
                   {error && (
                     <div
                       style={{
-                        color: theme.colors.error.base,
-                        fontSize: theme.gridUnit * 3,
+                        color: theme.colorError,
+                        fontSize: theme.sizeUnit * 3,
                       }}
                     >
                       {TRANSLATIONS.EMAIL_SUBJECT_ERROR_TEXT}
                     </div>
                   )}
                 </>
-              ) : null}
-            </StyledInputContainer>
-          </div>
-          <div className="inline-container">
-            <StyledInputContainer>
-              <div className="control-label">
-                {t(
-                  '%s recipients',
-                  method === NotificationMethodOption.SlackV2
-                    ? NotificationMethodOption.Slack
-                    : method,
-                )}
-                <span className="required">*</span>
-              </div>
-              <div>
-                {[
-                  NotificationMethodOption.Email,
-                  NotificationMethodOption.Slack,
-                ].includes(method) ? (
-                  <>
-                    <div className="input-container">
-                      <textarea
+              </StyledInputContainer>
+            </div>
+          ) : null}
+          {method !== NotificationMethodOption.Webhook ? (
+            <div className="inline-container">
+              <StyledInputContainer>
+                <div className="control-label">
+                  {t(
+                    '%s recipients',
+                    method === NotificationMethodOption.SlackV2
+                      ? NotificationMethodOption.Slack
+                      : method,
+                  )}
+                  <span className="required">*</span>
+                </div>
+                <div>
+                  {method === NotificationMethodOption.Slack ? (
+                    <>
+                      <div className="input-container">
+                        <Input.TextArea
+                          name="To"
+                          data-test="recipients"
+                          value={recipientValue}
+                          onChange={onRecipientsChange}
+                        />
+                      </div>
+                      <div className="input-container">
+                        <div className="helper">
+                          {t('Recipients are separated by "," or ";"')}
+                        </div>
+                      </div>
+                    </>
+                  ) : method === NotificationMethodOption.Email ? (
+                    <div className="input-container email-recipient-container">
+                      <AsyncSelect
                         name="To"
+                        ariaLabel={t('Email recipients')}
+                        className="email-recipient-select"
                         data-test="recipients"
-                        value={recipientValue}
-                        onChange={onRecipientsChange}
+                        mode="multiple"
+                        value={recipientEmailOptions}
+                        options={fetchEmailRecipientOptions}
+                        onChange={onEmailRecipientsChange('recipients')}
+                        placeholder={t('Select or type email recipients')}
+                        allowNewOptions
+                        lazyLoading={false}
                       />
-                    </div>
-                    <div className="input-container">
                       <div className="helper">
                         {t('Recipients are separated by "," or ";"')}
                       </div>
                     </div>
-                  </>
-                ) : (
-                  // for SlackV2
-                  <Select
-                    ariaLabel={t('Select channels')}
-                    mode="multiple"
-                    name="recipients"
-                    value={slackRecipients}
-                    options={slackOptions}
-                    onChange={onSlackRecipientsChange}
-                    allowClear
-                    data-test="recipients"
-                    allowSelectAll={false}
-                    labelInValue
-                  />
-                )}
-              </div>
-            </StyledInputContainer>
-          </div>
+                  ) : (
+                    // for SlackV2
+                    <div className="input-container">
+                      <AsyncSelect
+                        key={slackRefreshKey}
+                        ariaLabel={t('Select channels')}
+                        mode="multiple"
+                        name="recipients"
+                        value={slackRecipients}
+                        options={loadSlackChannels}
+                        onChange={onSlackRecipientsChange}
+                        onError={() => setUseSlackV1(true)}
+                        allowClear
+                        allowNewOptions
+                        data-test="recipients"
+                        labelInValue
+                        placeholder={t(
+                          'Search a channel by name, or paste a channel ID',
+                        )}
+                      />
+                      <RefreshLabel
+                        onClick={onRefreshSlackChannels}
+                        tooltipContent={t('Force refresh Slack channels list')}
+                      />
+                    </div>
+                  )}
+                </div>
+              </StyledInputContainer>
+            </div>
+          ) : (
+            <div className="inline-container">
+              <StyledInputContainer>
+                <div className="control-label">
+                  {t('%s URL', method)}
+                  <span className="required">*</span>
+                </div>
+                <div>
+                  <div className="input-container">
+                    <Input
+                      name="To"
+                      data-test="recipients"
+                      value={recipientValue}
+                      onChange={onRecipientsChange}
+                    />
+                  </div>
+                </div>
+              </StyledInputContainer>
+            </div>
+          )}
           {method === NotificationMethodOption.Email && (
             <StyledInputContainer>
               {/* Render "CC" input field if ccVisible is true */}
@@ -542,12 +731,19 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
                   <div className="control-label">
                     {TRANSLATIONS.EMAIL_CC_NAME}
                   </div>
-                  <div className="input-container">
-                    <textarea
+                  <div className="input-container email-recipient-container">
+                    <AsyncSelect
                       name="CC"
+                      ariaLabel={TRANSLATIONS.EMAIL_CC_NAME}
+                      className="email-recipient-select"
                       data-test="cc"
-                      value={ccValue}
-                      onChange={onCcChange}
+                      mode="multiple"
+                      value={ccEmailOptions}
+                      options={fetchEmailRecipientOptions}
+                      onChange={onEmailRecipientsChange('cc')}
+                      placeholder={t('Select or type CC recipients')}
+                      allowNewOptions
+                      lazyLoading={false}
                     />
                   </div>
                   <div className="input-container">
@@ -563,12 +759,19 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
                   <div className="control-label">
                     {TRANSLATIONS.EMAIL_BCC_NAME}
                   </div>
-                  <div className="input-container">
-                    <textarea
+                  <div className="input-container email-recipient-container">
+                    <AsyncSelect
                       name="BCC"
+                      ariaLabel={TRANSLATIONS.EMAIL_BCC_NAME}
+                      className="email-recipient-select"
                       data-test="bcc"
-                      value={bccValue}
-                      onChange={onBccChange}
+                      mode="multiple"
+                      value={bccEmailOptions}
+                      options={fetchEmailRecipientOptions}
+                      onChange={onEmailRecipientsChange('bcc')}
+                      placeholder={t('Select or type BCC recipients')}
+                      allowNewOptions
+                      lazyLoading={false}
                     />
                   </div>
                   <div className="input-container">
@@ -580,26 +783,24 @@ export const NotificationMethod: FunctionComponent<NotificationMethodProps> = ({
               )}
               {/* New buttons container */}
               <div className="ghost-button">
-                <span
+                <button
+                  type="button"
                   className="ghost-button"
-                  role="button"
-                  tabIndex={0}
                   onClick={() => setCcVisible(true)}
                   style={{ display: ccVisible ? 'none' : 'inline-flex' }}
                 >
-                  <Icons.Email className="icon" />
+                  <Icons.MailOutlined iconSize="xs" className="icon" />
                   {t('Add CC Recipients')}
-                </span>
-                <span
+                </button>
+                <button
+                  type="button"
                   className="ghost-button"
-                  role="button"
-                  tabIndex={0}
                   onClick={() => setBccVisible(true)}
                   style={{ display: bccVisible ? 'none' : 'inline-flex' }}
                 >
-                  <Icons.Email className="icon" />
+                  <Icons.MailOutlined iconSize="xs" className="icon" />
                   {t('Add BCC Recipients')}
-                </span>
+                </button>
               </div>
             </StyledInputContainer>
           )}

@@ -23,7 +23,7 @@ from typing import Any
 
 from flask_appbuilder.models.sqla import Model
 
-from superset import is_feature_enabled, security_manager
+from superset import db
 from superset.commands.base import BaseCommand
 from superset.commands.database.exceptions import (
     DatabaseConnectionFailedError,
@@ -31,21 +31,25 @@ from superset.commands.database.exceptions import (
     DatabaseInvalidError,
     DatabaseNotFoundError,
     DatabaseUpdateFailedError,
+    DatabaseUpdateUnsafeRebindError,
+    MissingOAuth2TokenError,
 )
-from superset.commands.database.ssh_tunnel.create import CreateSSHTunnelCommand
-from superset.commands.database.ssh_tunnel.delete import DeleteSSHTunnelCommand
-from superset.commands.database.ssh_tunnel.exceptions import (
-    SSHTunnelingNotEnabledError,
+from superset.commands.database.sync_permissions import SyncPermissionsCommand
+from superset.commands.database.utils import (
+    engine_params_changed,
+    oauth2_endpoint_rebind_unsafe,
+    ssh_tunnel_rebind_unsafe,
+    uri_identity_changed,
 )
-from superset.commands.database.ssh_tunnel.update import UpdateSSHTunnelCommand
+from superset.constants import PASSWORD_MASK
 from superset.daos.database import DatabaseDAO
-from superset.daos.dataset import DatasetDAO
-from superset.databases.ssh_tunnel.models import SSHTunnel
-from superset.db_engine_specs.base import GenericDBException
-from superset.exceptions import OAuth2RedirectError
+from superset.databases.utils import make_url_safe
+from superset.exceptions import OAuth2Error, OAuth2RedirectError
 from superset.models.core import Database
 from superset.utils import json
+from superset.utils.core import get_username
 from superset.utils.decorators import on_error, transaction
+from superset.utils.ssh_tunnel import unmask_password_info
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +76,7 @@ class UpdateDatabaseCommand(BaseCommand):
             self._properties["encrypted_extra"] = (
                 self._model.db_engine_spec.unmask_encrypted_extra(
                     self._model.encrypted_extra,
-                    self._properties["masked_encrypted_extra"],
+                    self._properties.pop("masked_encrypted_extra"),
                 )
             )
 
@@ -80,19 +84,107 @@ class UpdateDatabaseCommand(BaseCommand):
             # existing personal tokens.
             self._handle_oauth2()
 
-        # if the database name changed we need to update any existing permissions,
-        # since they're name based
-        original_database_name = self._model.database_name
+        # The DAO updates the model in place, so compare settings before applying them.
+        can_skip_failed_sync = self._can_skip_failed_sync()
 
+        # Some DBs require running a query to get the default catalog.
+        # In these cases, if the current connection is broken then
+        # `get_default_catalog` would raise an exception. We need to
+        # gracefully handle that so that the connection can be fixed.
+        original_database_name = self._model.database_name
+        force_update: bool = False
+        try:
+            original_catalog = self._model.get_default_catalog()
+        except Exception:
+            original_catalog = None
+            force_update = True
+
+        # build new DB
         database = DatabaseDAO.update(self._model, self._properties)
         database.set_sqlalchemy_uri(database.sqlalchemy_uri)
-        ssh_tunnel = self._handle_ssh_tunnel(database)
+
+        new_catalog = database.get_default_catalog()
+
+        # update assets when the database catalog changes, if the database was not
+        # configured with multi-catalog support; if it was enabled or is enabled in the
+        # update we don't update the assets
+        if (
+            force_update
+            or new_catalog != original_catalog
+            and not self._model.allow_multi_catalog
+            and not database.allow_multi_catalog
+        ):
+            self._update_catalog_attribute(self._model.id, new_catalog)
+
+        # if the database name changed we need to update any existing permissions,
+        # since they're name based
         try:
-            self._refresh_catalogs(database, original_database_name, ssh_tunnel)
-        except OAuth2RedirectError:
+            current_username = get_username()
+            SyncPermissionsCommand(
+                self._model_id,
+                current_username,
+                old_db_connection_name=original_database_name,
+                db_connection=database,
+            ).run()
+        except (OAuth2RedirectError, MissingOAuth2TokenError):
             pass
+        except DatabaseConnectionFailedError:
+            if not can_skip_failed_sync:
+                raise
+            logger.warning(
+                "Skipping permission sync for database %s: connection unavailable "
+                "and connection settings unchanged",
+                self._model_id,
+            )
 
         return database
+
+    def _can_skip_failed_sync(self) -> bool:
+        """Check that the connection and permission identity remain unchanged."""
+        assert self._model
+
+        connection_fields = {
+            "database_name",  # Schema and catalog permissions include this name.
+            "sqlalchemy_uri",
+            "encrypted_extra",
+            "extra",
+            "server_cert",
+            "impersonate_user",
+            "ssh_tunnel",
+        }
+        for key in connection_fields & self._properties.keys():
+            incoming = self._properties[key]
+            original = getattr(self._model, key)
+            if key == "sqlalchemy_uri":
+                try:
+                    original = make_url_safe(self._model.sqlalchemy_uri_decrypted)
+                except Exception:
+                    # An unavailable old password store must not block repairs.
+                    return False
+                incoming = make_url_safe(incoming.strip())
+                if incoming.password == PASSWORD_MASK:
+                    incoming = incoming.set(password=original.password)
+            elif key in {"extra", "encrypted_extra"}:
+                try:
+                    original = json.loads(original or "{}")
+                    incoming = json.loads(incoming or "{}")
+                except json.JSONDecodeError:
+                    return False
+            elif key == "server_cert":
+                original = original or None
+                incoming = incoming or None
+            elif key == "ssh_tunnel" and original is not None and incoming is not None:
+                incoming = unmask_password_info(incoming.copy(), original)
+                incoming = {
+                    field: incoming.get(field) for field in original.export_fields
+                }
+                original = {
+                    field: getattr(original, field) for field in original.export_fields
+                }
+            if incoming != original:
+                return False
+
+        return True
 
     def _handle_oauth2(self) -> None:
         """
@@ -110,7 +202,9 @@ class UpdateDatabaseCommand(BaseCommand):
             return
 
         encrypted_extra = json.loads(self._properties["encrypted_extra"])
-        new_config = encrypted_extra.get("oauth2_client_info", {})
+        new_config = self._resolve_oauth2_client_info(
+            encrypted_extra.get("oauth2_client_info", {})
+        )
 
         # Keys that require purging personal tokens because they probably are no longer
         # valid. For example, if the scope has changed the existing tokens are still
@@ -127,226 +221,56 @@ class UpdateDatabaseCommand(BaseCommand):
                 self._model.purge_oauth2_tokens()
                 break
 
-    def _handle_ssh_tunnel(self, database: Database) -> SSHTunnel | None:
+    def _resolve_oauth2_client_info(self, client_info: Any) -> dict[str, Any]:
         """
-        Delete, create, or update an SSH tunnel.
+        Fill in the values the engine spec derives, as ``get_oauth2_config`` does.
+
+        The current config has the derived values (e.g. Databricks endpoints from
+        the workspace host), so the new one needs them too, otherwise an omitted
+        value would count as a change and purge the tokens on every update. The
+        new connection URI is used, since a new host means new endpoints.
+
+        A malformed (non-dict) value resolves to an empty config, so the caller
+        treats it as a change and purges the tokens instead of crashing.
         """
-        if "ssh_tunnel" not in self._properties:
-            return None
+        if not isinstance(client_info, dict):
+            return {}
+        if not self._model or not client_info:
+            return client_info
 
-        if not is_feature_enabled("SSH_TUNNELING"):
-            raise SSHTunnelingNotEnabledError()
-
-        current_ssh_tunnel = DatabaseDAO.get_ssh_tunnel(database.id)
-        ssh_tunnel_properties = self._properties["ssh_tunnel"]
-
-        if ssh_tunnel_properties is None:
-            if current_ssh_tunnel:
-                DeleteSSHTunnelCommand(current_ssh_tunnel.id).run()
-            return None
-
-        if current_ssh_tunnel is None:
-            return CreateSSHTunnelCommand(database, ssh_tunnel_properties).run()
-
-        return UpdateSSHTunnelCommand(
-            current_ssh_tunnel.id,
-            ssh_tunnel_properties,
-        ).run()
-
-    def _get_catalog_names(
-        self,
-        database: Database,
-        ssh_tunnel: SSHTunnel | None,
-    ) -> set[str]:
-        """
-        Helper method to load catalogs.
-        """
+        database = self._model
+        if sqlalchemy_uri := self._properties.get("sqlalchemy_uri"):
+            database = Database(sqlalchemy_uri=sqlalchemy_uri)
         try:
-            return database.get_all_catalog_names(
-                force=True,
-                ssh_tunnel=ssh_tunnel,
-            )
-        except OAuth2RedirectError:
-            # raise OAuth2 exceptions as-is
-            raise
-        except GenericDBException as ex:
-            raise DatabaseConnectionFailedError() from ex
-
-    def _get_schema_names(
-        self,
-        database: Database,
-        catalog: str | None,
-        ssh_tunnel: SSHTunnel | None,
-    ) -> set[str]:
-        """
-        Helper method to load schemas.
-        """
-        try:
-            return database.get_all_schema_names(
-                force=True,
-                catalog=catalog,
-                ssh_tunnel=ssh_tunnel,
-            )
-        except OAuth2RedirectError:
-            # raise OAuth2 exceptions as-is
-            raise
-        except GenericDBException as ex:
-            raise DatabaseConnectionFailedError() from ex
-
-    def _refresh_catalogs(
-        self,
-        database: Database,
-        original_database_name: str,
-        ssh_tunnel: SSHTunnel | None,
-    ) -> None:
-        """
-        Add permissions for any new catalogs and schemas.
-        """
-        catalogs = (
-            self._get_catalog_names(database, ssh_tunnel)
-            if database.db_engine_spec.supports_catalog
-            else [None]
-        )
-
-        for catalog in catalogs:
-            try:
-                schemas = self._get_schema_names(database, catalog, ssh_tunnel)
-
-                if catalog:
-                    perm = security_manager.get_catalog_perm(
-                        original_database_name,
-                        catalog,
-                    )
-                    existing_pvm = security_manager.find_permission_view_menu(
-                        "catalog_access",
-                        perm,
-                    )
-                    if not existing_pvm:
-                        # new catalog
-                        security_manager.add_permission_view_menu(
-                            "catalog_access",
-                            security_manager.get_catalog_perm(
-                                database.database_name,
-                                catalog,
-                            ),
-                        )
-                        for schema in schemas:
-                            security_manager.add_permission_view_menu(
-                                "schema_access",
-                                security_manager.get_schema_perm(
-                                    database.database_name,
-                                    catalog,
-                                    schema,
-                                ),
-                            )
-                        continue
-            except DatabaseConnectionFailedError:
-                # more than one catalog, move to next
-                if catalog:
-                    logger.warning("Error processing catalog %s", catalog)
-                    continue
-                raise
-
-            # add possible new schemas in catalog
-            self._refresh_schemas(
+            return database.db_engine_spec.resolve_oauth2_client_info(
                 database,
-                original_database_name,
-                catalog,
-                schemas,
+                client_info,
             )
+        except OAuth2Error:
+            return client_info
 
-            if original_database_name != database.database_name:
-                self._rename_database_in_permissions(
-                    database,
-                    original_database_name,
-                    catalog,
-                    schemas,
-                )
-
-    def _refresh_schemas(
+    def _update_catalog_attribute(
         self,
-        database: Database,
-        original_database_name: str,
-        catalog: str | None,
-        schemas: set[str],
+        database_id: int,
+        new_catalog: str | None,
     ) -> None:
         """
-        Add new schemas that don't have permissions yet.
+        Update the catalog of the datasets that are associated with database.
         """
-        for schema in schemas:
-            perm = security_manager.get_schema_perm(
-                original_database_name,
-                catalog,
-                schema,
-            )
-            existing_pvm = security_manager.find_permission_view_menu(
-                "schema_access",
-                perm,
-            )
-            if not existing_pvm:
-                new_name = security_manager.get_schema_perm(
-                    database.database_name,
-                    catalog,
-                    schema,
-                )
-                security_manager.add_permission_view_menu("schema_access", new_name)
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.models.sql_lab import Query, SavedQuery, TableSchema, TabState
 
-    def _rename_database_in_permissions(
-        self,
-        database: Database,
-        original_database_name: str,
-        catalog: str | None,
-        schemas: set[str],
-    ) -> None:
-        new_catalog_perm_name = security_manager.get_catalog_perm(
-            database.database_name,
-            catalog,
-        )
-
-        # rename existing catalog permission
-        if catalog:
-            perm = security_manager.get_catalog_perm(
-                original_database_name,
-                catalog,
-            )
-            existing_pvm = security_manager.find_permission_view_menu(
-                "catalog_access",
-                perm,
-            )
-            if existing_pvm:
-                existing_pvm.view_menu.name = new_catalog_perm_name
-
-        for schema in schemas:
-            new_schema_perm_name = security_manager.get_schema_perm(
-                database.database_name,
-                catalog,
-                schema,
-            )
-
-            # rename existing schema permission
-            perm = security_manager.get_schema_perm(
-                original_database_name,
-                catalog,
-                schema,
-            )
-            existing_pvm = security_manager.find_permission_view_menu(
-                "schema_access",
-                perm,
-            )
-            if existing_pvm:
-                existing_pvm.view_menu.name = new_schema_perm_name
-
-            # rename permissions on datasets and charts
-            for dataset in DatabaseDAO.get_datasets(
-                database.id,
-                catalog=catalog,
-                schema=schema,
-            ):
-                dataset.catalog_perm = new_catalog_perm_name
-                dataset.schema_perm = new_schema_perm_name
-                for chart in DatasetDAO.get_related_objects(dataset.id)["charts"]:
-                    chart.catalog_perm = new_catalog_perm_name
-                    chart.schema_perm = new_schema_perm_name
+        for model in [
+            SqlaTable,
+            Query,
+            SavedQuery,
+            TabState,
+            TableSchema,
+        ]:
+            fk = "db_id" if model == SavedQuery else "database_id"
+            predicate = {fk: database_id}
+            update = {"catalog": new_catalog}
+            db.session.query(model).filter_by(**predicate).update(update)
 
     def validate(self) -> None:
         if database_name := self._properties.get("database_name"):
@@ -355,3 +279,97 @@ class UpdateDatabaseCommand(BaseCommand):
                 database_name,
             ):
                 raise DatabaseInvalidError(exceptions=[DatabaseExistsValidationError()])
+
+        if self._model:
+            self._check_no_unsafe_secret_rebind()
+
+    def _check_no_unsafe_secret_rebind(self) -> None:
+        """
+        Refuse an update that changes the connection's effective destination
+        (URI host/port, `extra.engine_params`, the SSH tunnel endpoint, or the
+        OAuth2 endpoint URIs in `encrypted_extra`) while leaving the
+        corresponding stored secret masked.
+
+        Without this, an editor could silently redirect the real stored
+        password/encrypted_extra/SSH tunnel credential to a different
+        destination -- and since an update persists, every subsequent use of
+        the database (by any user) would send the real secret there, not
+        just the editor's own request.
+        """
+        model = self._model
+        assert model is not None
+
+        connection_identity_changed = False
+        submitted_password: str | None = None
+
+        if "sqlalchemy_uri" in self._properties:
+            submitted_uri = self._properties["sqlalchemy_uri"] or ""
+            connection_identity_changed = uri_identity_changed(
+                model.sqlalchemy_uri, submitted_uri
+            )
+            try:
+                submitted_password = make_url_safe(submitted_uri).password
+            except DatabaseInvalidError:
+                submitted_password = None
+
+        if "extra" in self._properties and engine_params_changed(
+            model.extra, self._properties["extra"]
+        ):
+            connection_identity_changed = True
+
+        if connection_identity_changed:
+            # The URI password is only one of the secrets that can silently
+            # carry over onto a changed destination. `encrypted_extra` (e.g.
+            # a service-account key or OAuth2 client secret) is reattached
+            # unconditionally in `run()` via `unmask_encrypted_extra` unless
+            # we catch it here -- gating on the URI password alone would
+            # both miss that reuse when a fresh URI password is supplied,
+            # and wrongly block engines that keep credentials entirely in
+            # `encrypted_extra` and carry no URI password at all (BigQuery,
+            # GSheets), since those never have a "fresh" URI password to
+            # give.
+            uri_password_reused = model.password is not None and submitted_password in (
+                None,
+                PASSWORD_MASK,
+            )
+            # encrypted_extra is a blob with per-field masks, so "reused"
+            # means unmasking the submission against the stored value
+            # changes nothing -- including not submitting it at all, which
+            # leaves the old (real) value attached unchanged.
+            encrypted_extra_reused = model.encrypted_extra not in (
+                None,
+                "",
+                "{}",
+            ) and (
+                "masked_encrypted_extra" not in self._properties
+                or model.db_engine_spec.unmask_encrypted_extra(
+                    model.encrypted_extra,
+                    self._properties["masked_encrypted_extra"],
+                )
+                == model.encrypted_extra
+            )
+            if uri_password_reused or encrypted_extra_reused:
+                raise DatabaseInvalidError(
+                    exceptions=[DatabaseUpdateUnsafeRebindError()]
+                )
+
+        if "ssh_tunnel" in self._properties and ssh_tunnel_rebind_unsafe(
+            model.ssh_tunnel, self._properties["ssh_tunnel"]
+        ):
+            raise DatabaseInvalidError(
+                exceptions=[DatabaseUpdateUnsafeRebindError(field_name="ssh_tunnel")]
+            )
+
+        # The OAuth2 endpoints live inside encrypted_extra, so a change there is
+        # invisible to the URI/engine-params check above -- yet the stored client
+        # secret is what the next token exchange posts to the new endpoint.
+        if "masked_encrypted_extra" in self._properties and (
+            oauth2_endpoint_rebind_unsafe(
+                model.encrypted_extra, self._properties["masked_encrypted_extra"]
+            )
+        ):
+            raise DatabaseInvalidError(
+                exceptions=[
+                    DatabaseUpdateUnsafeRebindError(field_name="masked_encrypted_extra")
+                ]
+            )

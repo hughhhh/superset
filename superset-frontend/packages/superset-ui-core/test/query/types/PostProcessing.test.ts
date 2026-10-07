@@ -49,8 +49,10 @@ import {
   isPostProcessingRename,
   isPostProcessingFlatten,
   isPostProcessingRank,
+  ComparisonType,
+  RollingType,
+  TimeGranularity,
 } from '@superset-ui/core';
-import { ComparisonType, RollingType, TimeGranularity } from '../../../src';
 
 const AGGREGATES_OPTION: Aggregates = {
   bar: {
@@ -61,7 +63,7 @@ const AGGREGATES_OPTION: Aggregates = {
 };
 
 const AGGREGATE_RULE: PostProcessingAggregation = {
-  operation: 'aggregation',
+  operation: 'aggregate',
   options: {
     groupby: ['foo'],
     aggregates: AGGREGATES_OPTION,
@@ -98,7 +100,7 @@ const CONTRIBUTION_RULE: PostProcessingContribution = {
 const CUM_RULE: PostProcessingCum = {
   operation: 'cum',
   options: {
-    columns: ['foo'],
+    columns: { foo: 'foo' },
     operator: 'min',
   },
 };
@@ -106,7 +108,7 @@ const CUM_RULE: PostProcessingCum = {
 const DIFF_RULE: PostProcessingDiff = {
   operation: 'diff',
   options: {
-    columns: ['foo'],
+    columns: { foo: 'foo' },
     periods: 12,
     axis: PandasAxis.Column,
   },
@@ -148,7 +150,7 @@ const ROLLING_RULE: PostProcessingRolling = {
     rolling_type: RollingType.Cumsum,
     window: 12,
     min_periods: 12,
-    columns: ['foo', 'bar'],
+    columns: { foo: 'foo', bar: 'bar' },
   },
 };
 

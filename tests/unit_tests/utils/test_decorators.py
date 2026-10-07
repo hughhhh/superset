@@ -24,8 +24,8 @@ from typing import Any, Optional
 from unittest.mock import call, Mock, patch
 
 import pytest
+from pytest_mock import MockerFixture
 
-from superset import app
 from superset.utils import decorators
 from superset.utils.backports import StrEnum
 
@@ -34,6 +34,20 @@ class ResponseValues(StrEnum):
     FAIL = "fail"
     WARN = "warn"
     OK = "ok"
+
+
+class WarningError(Exception):
+    status = 400
+
+
+class InvalidStatusError(Exception):
+    status = "400"
+
+
+class UnreadableStatusError(Exception):
+    @property
+    def status(self) -> int:
+        raise RuntimeError("status is unavailable")
 
 
 def test_debounce() -> None:
@@ -63,7 +77,7 @@ def test_debounce() -> None:
     [
         (ResponseValues.OK, None, "custom.prefix.ok"),
         (ResponseValues.FAIL, ValueError, "custom.prefix.error"),
-        (ResponseValues.WARN, FileNotFoundError, "custom.prefix.warn"),
+        (ResponseValues.WARN, WarningError, "custom.prefix.warning"),
     ],
 )
 def test_statsd_gauge(
@@ -74,10 +88,10 @@ def test_statsd_gauge(
         if response == ResponseValues.FAIL:
             raise ValueError("Error")
         if response == ResponseValues.WARN:
-            raise FileNotFoundError("Not found")
+            raise WarningError("Warning")
         return "OK"
 
-    with patch.object(app.config["STATS_LOGGER"], "gauge") as mock:
+    with patch("superset.extensions.stats_logger_manager.instance.gauge") as mock:
         cm = (
             pytest.raises(expected_exception)
             if isclass(expected_exception) and issubclass(expected_exception, Exception)
@@ -86,7 +100,47 @@ def test_statsd_gauge(
 
         with cm:
             my_func(response_value, 1, 2)
-            mock.assert_called_once_with(expected_result, 1)
+
+        mock.assert_called_once_with(expected_result, 1)
+
+
+def test_statsd_gauge_ignores_configured_exception() -> None:
+    class RoutingSignalError(Exception):
+        pass
+
+    @decorators.statsd_gauge(
+        "custom.prefix",
+        ignored_exceptions=(RoutingSignalError,),
+    )
+    def my_func() -> None:
+        raise RoutingSignalError
+
+    with (
+        patch("superset.extensions.stats_logger_manager.instance.gauge") as mock,
+        pytest.raises(RoutingSignalError),
+    ):
+        my_func()
+
+    mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected_metric"),
+    [
+        (ValueError("failure"), "custom.prefix.error"),
+        (WarningError("warning"), "custom.prefix.warning"),
+        (InvalidStatusError("invalid status"), "custom.prefix.error"),
+        (UnreadableStatusError("unreadable status"), "custom.prefix.error"),
+    ],
+)
+def test_record_statsd_gauge_failure_uses_shared_severity_contract(
+    exception: Exception,
+    expected_metric: str,
+) -> None:
+    with patch("superset.extensions.stats_logger_manager.instance.gauge") as mock:
+        decorators.record_statsd_gauge_failure("custom.prefix", exception)
+
+    mock.assert_called_once_with(expected_metric, 1)
 
 
 @patch("superset.utils.decorators.g")
@@ -294,3 +348,55 @@ def test_suppress_logging() -> None:
     decorated = decorators.suppress_logging("test-logger", logging.CRITICAL + 1)(func)
     decorated()
     assert len(handler.log_records) == 0
+
+
+def test_transacation_commit(mocker: MockerFixture) -> None:
+    """
+    Test the `transaction` decorator when the function completes successfully.
+    """
+    db = mocker.patch("superset.db")
+
+    @decorators.transaction()
+    def func() -> int:
+        return 42
+
+    result = func()
+    assert result == 42
+    db.session.commit.assert_called_once()
+
+
+def test_transacation_rollback(mocker: MockerFixture) -> None:
+    """
+    Test the `transaction` decorator when the function raises an exception.
+    """
+    db = mocker.patch("superset.db")
+
+    @decorators.transaction()
+    def func() -> None:
+        raise ValueError("error")
+
+    with pytest.raises(ValueError, match="error"):
+        func()
+    db.session.commit.assert_not_called()
+    db.session.rollback.assert_called_once()
+
+
+def test_transacation_nested(mocker: MockerFixture) -> None:
+    """
+    Test the `transaction` decorator when the function is nested.
+    """
+    db = mocker.patch("superset.db")
+
+    @decorators.transaction()
+    def func() -> int:
+        return 42
+
+    @decorators.transaction()
+    def nested() -> int:
+        func()  # should not commit
+        raise ValueError("error")
+
+    with pytest.raises(ValueError, match="error"):
+        nested()
+    db.session.commit.assert_not_called()
+    db.session.rollback.assert_called_once()

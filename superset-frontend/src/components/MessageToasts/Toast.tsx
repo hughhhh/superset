@@ -16,26 +16,58 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { styled, css, SupersetTheme } from '@superset-ui/core';
+import {
+  styled,
+  css,
+  SupersetTheme,
+  useTheme,
+} from '@apache-superset/core/theme';
+import { t } from '@apache-superset/core/translation';
 import cx from 'classnames';
 import { Interweave } from 'interweave';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import Icons from 'src/components/Icons';
+import { Button } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
 import { ToastType, ToastMeta } from './types';
 
 const ToastContainer = styled.div`
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  ${({ theme }) => css`
+    display: flex;
+    align-items: flex-start;
+    gap: ${theme.sizeUnit * 2}px;
 
-  span {
-    padding: 0 11px;
-  }
+    /* Content container for icon and text */
+    .toast__content {
+      display: flex;
+      align-items: flex-start;
+      gap: ${theme.sizeUnit * 2}px;
+
+      flex: 1;
+
+      max-height: 60vh;
+      overflow-y: auto;
+
+      padding-right: ${theme.sizeUnit * 2}px;
+
+      scrollbar-width: thin;
+      scrollbar-color: ${theme.colorTextLightSolid} ${theme.colorBgSpotlight};
+    }
+
+    .anticon {
+      padding: 0 ${theme.sizeUnit}px;
+    }
+
+    .toast__close,
+    .toast__close span {
+      padding-left: ${theme.sizeUnit * 4}px;
+    }
+  `}
 `;
 
-const StyledIcon = (theme: SupersetTheme) => css`
-  min-width: ${theme.gridUnit * 5}px;
-  color: ${theme.colors.grayscale.base};
+const notificationStyledIcon = (theme: SupersetTheme) => css`
+  min-width: ${theme.sizeUnit * 5}px;
+  color: ${theme.colorTextLightSolid};
+  margin-right: 0;
 `;
 
 interface ToastPresenterProps {
@@ -46,6 +78,7 @@ interface ToastPresenterProps {
 export default function Toast({ toast, onCloseToast }: ToastPresenterProps) {
   const hideTimer = useRef<ReturnType<typeof setTimeout>>();
   const [visible, setVisible] = useState(false);
+
   const showToast = () => {
     setVisible(true);
   };
@@ -65,8 +98,9 @@ export default function Toast({ toast, onCloseToast }: ToastPresenterProps) {
 
   useEffect(() => {
     setTimeout(showToast);
-
-    if (toast.duration > 0) {
+    // Interactive notifications remain available until the user activates or
+    // dismisses them, so keyboard and assistive-technology users are not raced.
+    if (!toast.action && toast.duration > 0) {
       hideTimer.current = setTimeout(handleClosePress, toast.duration);
     }
     return () => {
@@ -76,17 +110,38 @@ export default function Toast({ toast, onCloseToast }: ToastPresenterProps) {
     };
   }, [handleClosePress, toast.duration]);
 
+  const theme = useTheme();
   let className = 'toast--success';
-  let icon = <Icons.CircleCheckSolid css={theme => StyledIcon(theme)} />;
+  let icon = (
+    <Icons.CheckCircleFilled
+      css={theme => notificationStyledIcon(theme)}
+      iconColor={theme.colorSuccess}
+    />
+  );
 
   if (toast.toastType === ToastType.Warning) {
-    icon = <Icons.WarningSolid css={StyledIcon} />;
+    icon = (
+      <Icons.ExclamationCircleFilled
+        css={notificationStyledIcon}
+        iconColor={theme.colorWarning}
+      />
+    );
     className = 'toast--warning';
   } else if (toast.toastType === ToastType.Danger) {
-    icon = <Icons.ErrorSolid css={StyledIcon} />;
+    icon = (
+      <Icons.ExclamationCircleFilled
+        css={notificationStyledIcon}
+        iconColor={theme.colorError}
+      />
+    );
     className = 'toast--danger';
   } else if (toast.toastType === ToastType.Info) {
-    icon = <Icons.InfoSolid css={StyledIcon} />;
+    icon = (
+      <Icons.InfoCircleFilled
+        css={notificationStyledIcon}
+        iconColor={theme.colorInfo}
+      />
+    );
     className = 'toast--info';
   }
 
@@ -96,14 +151,29 @@ export default function Toast({ toast, onCloseToast }: ToastPresenterProps) {
       data-test="toast-container"
       role="alert"
     >
-      {icon}
-      <Interweave content={toast.text} noHtml={!toast.allowHtml} />
-      <i
-        className="fa fa-close pull-right pointer"
-        role="button"
+      <div className="toast__content">
+        {icon}
+        <Interweave content={toast.text} noHtml={!toast.allowHtml} />
+      </div>
+      {toast.action && (
+        <Button
+          size="small"
+          onClick={() => {
+            toast.action?.onClick();
+            handleClosePress();
+          }}
+        >
+          {toast.action.label}
+        </Button>
+      )}
+      {/* role is auto-computed by BaseIconComponent as "button" since
+          onClick is present, so no explicit role needed here. */}
+      <Icons.CloseOutlined
+        iconSize="m"
+        className="toast__close pointer"
         tabIndex={0}
         onClick={handleClosePress}
-        aria-label="Close"
+        aria-label={t('Close')}
         data-test="close-button"
       />
     </ToastContainer>

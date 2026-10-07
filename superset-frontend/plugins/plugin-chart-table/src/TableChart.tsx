@@ -24,6 +24,8 @@ import {
   useState,
   MouseEvent,
   KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useRef,
 } from 'react';
 
 import {
@@ -33,27 +35,39 @@ import {
   Row,
 } from 'react-table';
 import { extent as d3Extent, max as d3Max } from 'd3-array';
-import { FaSort } from '@react-icons/all-files/fa/FaSort';
-import { FaSortDown as FaSortDesc } from '@react-icons/all-files/fa/FaSortDown';
-import { FaSortUp as FaSortAsc } from '@react-icons/all-files/fa/FaSortUp';
 import cx from 'classnames';
 import {
   DataRecord,
   DataRecordValue,
   DTTM_ALIAS,
   ensureIsArray,
-  GenericDataType,
   getSelectedText,
   getTimeFormatterForGranularity,
   BinaryQueryObjectFilterClause,
+  extractTextFromHTML,
+  TimeGranularity,
+  forceHexAlpha,
+  DateWithFormatter,
+} from '@superset-ui/core';
+import {
   styled,
   css,
-  t,
-  tn,
   useTheme,
-} from '@superset-ui/core';
-import { Dropdown, Menu, Tooltip } from '@superset-ui/chart-controls';
+  SupersetTheme,
+} from '@apache-superset/core/theme';
+import { t } from '@apache-superset/core/translation';
+import { GenericDataType } from '@apache-superset/core/common';
 import {
+  Input,
+  Space,
+  RawAntdSelect as Select,
+  Dropdown,
+  Tooltip,
+} from '@superset-ui/core/components';
+import {
+  CaretUpOutlined,
+  CaretDownOutlined,
+  ColumnHeightOutlined,
   CheckOutlined,
   InfoCircleOutlined,
   DownOutlined,
@@ -61,10 +75,17 @@ import {
   PlusCircleOutlined,
   TableOutlined,
 } from '@ant-design/icons';
-import { isEmpty, isNumber } from 'lodash';
+import { isEmpty, debounce, isEqual } from 'lodash-es';
 import {
+  ColorFormatters,
+  getTextColorForBackground,
+  ObjectFormattingEnum,
   ColorSchemeEnum,
+} from '@superset-ui/chart-controls';
+import {
   DataColumnMeta,
+  SearchOption,
+  SortByItem,
   TableChartTransformedProps,
 } from './types';
 import DataTable, {
@@ -73,19 +94,46 @@ import DataTable, {
   SelectPageSizeRendererProps,
   SizeOption,
 } from './DataTable';
-
 import Styles from './Styles';
 import { formatColumnValue } from './utils/formatValue';
-import { PAGE_SIZE_OPTIONS } from './consts';
-import { updateExternalFormData } from './DataTable/utils/externalAPIs';
+import { PAGE_SIZE_OPTIONS, SERVER_PAGE_SIZE_OPTIONS } from './consts';
+import { updateTableOwnState } from './DataTable/utils/externalAPIs';
 import getScrollBarSize from './DataTable/utils/getScrollBarSize';
+import {
+  buildHeaderGroupRows,
+  hasRenderableHeaderGroups,
+  orderColumnsByHeaderGroups,
+} from './utils/headerGroups';
 
 type ValueRange = [number, number];
+
+function getComparisonKeyPortion(key: string, label: string): string {
+  return key.startsWith(label) ? key.substring(label.length) : key;
+}
 
 interface TableSize {
   width: number;
   height: number;
 }
+
+const getCrossFilterValue = (
+  value: DataRecordValue,
+  column: DataColumnMeta | undefined,
+): DataRecordValue => {
+  const input = value instanceof DateWithFormatter ? value.input : value;
+  if (
+    column?.dataType === GenericDataType.Temporal &&
+    typeof input === 'string' &&
+    input.trim() !== '' &&
+    Number.isFinite(Number(input))
+  ) {
+    return Number(input);
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  return value;
+};
 
 const ACTION_KEYS = {
   enter: 'Enter',
@@ -131,6 +179,31 @@ function cellWidth({
 }
 
 /**
+ * Sanitize a column identifier for use in HTML id attributes and CSS selectors.
+ * Replaces characters that are invalid in CSS selectors with safe alternatives.
+ *
+ * Note: The returned value should be prefixed with a string (e.g., "header-")
+ * to ensure it forms a valid HTML ID (IDs cannot start with a digit).
+ *
+ * Exported for testing.
+ */
+export function sanitizeHeaderId(columnId: string): string {
+  return (
+    columnId
+      // Semantic replacements first: preserve meaning in IDs for readability
+      // (e.g., '%pct_nice' → 'percentpct_nice' instead of '_pct_nice')
+      .replace(/%/g, 'percent')
+      .replace(/#/g, 'hash')
+      .replace(/△/g, 'delta')
+      // Generic sanitization for remaining special characters
+      .replace(/\s+/g, '_')
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .replace(/_+/g, '_') // Collapse consecutive underscores
+      .replace(/^_+|_+$/g, '') // Trim leading/trailing underscores
+  );
+}
+
+/**
  * Cell left margin (offset) calculation for horizontal bar chart elements
  * when alignPositiveNegative is not set
  */
@@ -159,35 +232,70 @@ function cellOffset({
 function cellBackground({
   value,
   colorPositiveNegative = false,
+  theme,
 }: {
   value: number;
   colorPositiveNegative: boolean;
+  theme: SupersetTheme;
 }) {
-  const r = colorPositiveNegative && value < 0 ? 150 : 0;
-  return `rgba(${r},0,0,0.2)`;
+  if (!colorPositiveNegative) {
+    return `${theme.colorFill}`;
+  }
+
+  if (value < 0) {
+    return `${theme.colorError}50`;
+  }
+
+  return `${theme.colorSuccess}50`;
 }
 
 function SortIcon<D extends object>({ column }: { column: ColumnInstance<D> }) {
   const { isSorted, isSortedDesc } = column;
-  let sortIcon = <FaSort />;
+  let sortIcon = <ColumnHeightOutlined />;
   if (isSorted) {
-    sortIcon = isSortedDesc ? <FaSortDesc /> : <FaSortAsc />;
+    sortIcon = isSortedDesc ? <CaretDownOutlined /> : <CaretUpOutlined />;
   }
   return sortIcon;
 }
 
-function SearchInput({ count, value, onChange }: SearchInputProps) {
+/**
+ * Label that is visually hidden but accessible
+ */
+const VisuallyHidden = styled.label`
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+`;
+
+function SearchInput({
+  value,
+  onChange,
+  onBlur,
+  onCompositionStart,
+  onCompositionEnd,
+  inputRef,
+}: SearchInputProps) {
   return (
-    <span className="dt-global-filter">
-      {t('Search')}{' '}
-      <input
-        aria-label={t('Search %s records', count)}
-        className="form-control input-sm"
-        placeholder={tn('search.num_records', count)}
+    <Space direction="vertical" size={4} className="dt-global-filter">
+      <span aria-hidden="true">{t('Search')}</span>
+      <Input
+        aria-label={t('Search records')}
+        placeholder={t('Search records')}
         value={value}
+        size="small"
         onChange={onChange}
+        onBlur={onBlur}
+        onCompositionStart={onCompositionStart}
+        onCompositionEnd={onCompositionEnd}
+        ref={inputRef}
       />
-    </span>
+    </Space>
   );
 }
 
@@ -196,23 +304,22 @@ function SelectPageSize({
   current,
   onChange,
 }: SelectPageSizeRendererProps) {
+  const { Option } = Select;
+
   return (
-    <span
-      className="dt-select-page-size form-inline"
-      role="group"
-      aria-label={t('Select page size')}
-    >
-      <label htmlFor="pageSizeSelect" className="sr-only">
+    <Space direction="vertical" size={4} className="dt-select-page-size">
+      <VisuallyHidden htmlFor="pageSizeSelect">
         {t('Select page size')}
-      </label>
-      {t('Show')}{' '}
-      <select
+      </VisuallyHidden>
+      {t('Entries per page')}
+      <Select<number>
         id="pageSizeSelect"
-        className="form-control input-sm"
         value={current}
-        onChange={e => {
-          onChange(Number((e.target as HTMLSelectElement).value));
-        }}
+        onChange={value => onChange(value)}
+        size="small"
+        css={(theme: SupersetTheme) => css`
+          width: ${theme.sizeUnit * 30}px;
+        `}
         aria-label={t('Show entries per page')}
       >
         {options.map(option => {
@@ -220,19 +327,79 @@ function SelectPageSize({
             ? option
             : [option, option];
           return (
-            <option key={size} value={size}>
+            <Option key={size} value={Number(size)}>
               {text}
-            </option>
+            </Option>
           );
         })}
-      </select>{' '}
-      {t('entries per page')}
-    </span>
+      </Select>
+    </Space>
   );
 }
 
 const getNoResultsMessage = (filter: string) =>
   filter ? t('No matching records found') : t('No records found');
+
+/**
+ * Calculates the inclusive/exclusive temporal range for a bucket.
+ * standard SQL range pattern: [start, end)
+ */
+function getTimeRangeFromGranularity(
+  startTime: Date,
+  granularity: TimeGranularity,
+): [Date, Date] {
+  const time = startTime.getTime();
+  const date = startTime.getUTCDate();
+  const month = startTime.getUTCMonth();
+  const year = startTime.getUTCFullYear();
+
+  // Constants
+  const MS_IN_SECOND = 1000;
+  const MS_IN_MINUTE = 60 * MS_IN_SECOND;
+  const MS_IN_HOUR = 60 * MS_IN_MINUTE;
+
+  switch (granularity) {
+    case TimeGranularity.SECOND:
+      return [startTime, new Date(time + MS_IN_SECOND)];
+    case TimeGranularity.MINUTE:
+      return [startTime, new Date(time + MS_IN_MINUTE)];
+    case TimeGranularity.FIVE_MINUTES:
+      return [startTime, new Date(time + MS_IN_MINUTE * 5)];
+    case TimeGranularity.TEN_MINUTES:
+      return [startTime, new Date(time + MS_IN_MINUTE * 10)];
+    case TimeGranularity.FIFTEEN_MINUTES:
+      return [startTime, new Date(time + MS_IN_MINUTE * 15)];
+    case TimeGranularity.THIRTY_MINUTES:
+      return [startTime, new Date(time + MS_IN_MINUTE * 30)];
+    case TimeGranularity.HOUR:
+      return [startTime, new Date(time + MS_IN_HOUR)];
+    case TimeGranularity.DAY:
+    case TimeGranularity.DATE:
+      return [startTime, new Date(Date.UTC(year, month, date + 1))];
+    case TimeGranularity.WEEK:
+    case TimeGranularity.WEEK_STARTING_SUNDAY:
+    case TimeGranularity.WEEK_STARTING_MONDAY:
+      return [startTime, new Date(Date.UTC(year, month, date + 7))];
+    case TimeGranularity.WEEK_ENDING_SATURDAY:
+    case TimeGranularity.WEEK_ENDING_SUNDAY:
+      // Week-ending buckets are labeled by the bucket's final day.
+      return [
+        new Date(Date.UTC(year, month, date - 6)),
+        new Date(Date.UTC(year, month, date + 1)),
+      ];
+    case TimeGranularity.MONTH:
+      return [startTime, new Date(Date.UTC(year, month + 1, 1))];
+    case TimeGranularity.QUARTER:
+      return [
+        startTime,
+        new Date(Date.UTC(year, Math.floor(month / 3) * 3 + 3, 1)),
+      ];
+    case TimeGranularity.YEAR:
+      return [startTime, new Date(Date.UTC(year + 1, 0, 1))];
+    default:
+      return [startTime, new Date(Date.UTC(year, month, date + 1))];
+  }
+}
 
 export default function TableChart<D extends DataRecord = DataRecord>(
   props: TableChartTransformedProps<D> & {
@@ -265,18 +432,33 @@ export default function TableChart<D extends DataRecord = DataRecord>(
     onContextMenu,
     emitCrossFilters,
     isUsingTimeComparison,
+    headerGroups = [],
     basicColorFormatters,
     basicColorColumnFormatters,
+    hasServerPageLengthChanged,
+    serverPageLength,
+    slice_id,
+    columnLabelToNameMap = {},
   } = props;
-  const comparisonColumns = [
-    { key: 'all', label: t('Display all') },
-    { key: '#', label: '#' },
-    { key: '△', label: '△' },
-    { key: '%', label: '%' },
-  ];
+
+  const comparisonColumns = useMemo(
+    () => [
+      { key: 'all', label: t('Display all') },
+      { key: '#', label: '#' },
+      { key: '△', label: '△' },
+      { key: '%', label: '%' },
+    ],
+    [],
+  );
+
   const timestampFormatter = useCallback(
-    value => getTimeFormatterForGranularity(timeGrain)(value),
-    [timeGrain],
+    (value: DataRecordValue) =>
+      isRawRecords
+        ? String(value ?? '')
+        : getTimeFormatterForGranularity(timeGrain)(
+            value as number | Date | null | undefined,
+          ),
+    [timeGrain, isRawRecords],
   );
   const [tableSize, setTableSize] = useState<TableSize>({
     width: 0,
@@ -289,20 +471,46 @@ export default function TableChart<D extends DataRecord = DataRecord>(
     comparisonColumns[0].key,
   ]);
   const [hideComparisonKeys, setHideComparisonKeys] = useState<string[]>([]);
+  // recalculated totals to display when the search filter is applied (client-side pagination)
+  const [displayedTotals, setDisplayedTotals] = useState<D | undefined>(totals);
   const theme = useTheme();
+
+  useEffect(() => {
+    setDisplayedTotals(totals);
+  }, [totals]);
 
   // only take relevant page size options
   const pageSizeOptions = useMemo(() => {
     const getServerPagination = (n: number) => n <= rowCount;
-    return PAGE_SIZE_OPTIONS.filter(([n]) =>
-      serverPagination ? getServerPagination(n) : n <= 2 * data.length,
+    const baseOptions = (
+      serverPagination ? SERVER_PAGE_SIZE_OPTIONS : PAGE_SIZE_OPTIONS
     ) as SizeOption[];
-  }, [data.length, rowCount, serverPagination]);
+    const options = baseOptions.filter(([n]) =>
+      serverPagination ? getServerPagination(n) : n <= 2 * data.length,
+    );
+
+    if (serverPagination && serverPageLength) {
+      if (!options.some(([n]) => n === serverPageLength)) {
+        const optionInBase = baseOptions.find(([n]) => n === serverPageLength);
+        options.push(
+          optionInBase || [serverPageLength, String(serverPageLength)],
+        );
+      }
+    }
+
+    // Remove duplicates and sort ascending
+    const uniqueOptions = Array.from(
+      new Map(options.map(opt => [opt[0], opt])).values(),
+    );
+    return uniqueOptions.sort((a, b) => a[0] - b[0]);
+  }, [data.length, rowCount, serverPagination, serverPageLength]);
 
   const getValueRange = useCallback(
     function getValueRange(key: string, alignPositiveNegative: boolean) {
-      if (typeof data?.[0]?.[key] === 'number') {
-        const nums = data.map(row => row[key]) as number[];
+      const nums = data
+        ?.map(row => row?.[key])
+        .filter(value => typeof value === 'number') as number[];
+      if (nums.length > 0) {
         return (
           alignPositiveNegative
             ? [0, d3Max(nums.map(Math.abs))]
@@ -316,76 +524,104 @@ export default function TableChart<D extends DataRecord = DataRecord>(
 
   const isActiveFilterValue = useCallback(
     function isActiveFilterValue(key: string, val: DataRecordValue) {
-      return !!filters && filters[key]?.includes(val);
+      if (!filters || !filters[key]) return false;
+      return filters[key].some(filterVal => {
+        if (filterVal === val) return true;
+        // DateWithFormatter extends Date — compare by time value
+        // since memoization cache misses can create new instances
+        if (filterVal instanceof Date && val instanceof Date) {
+          return filterVal.getTime() === val.getTime();
+        }
+        return false;
+      });
     },
     [filters],
   );
 
-  const getCrossFilterDataMask = (key: string, value: DataRecordValue) => {
-    let updatedFilters = { ...(filters || {}) };
-    if (filters && isActiveFilterValue(key, value)) {
-      updatedFilters = {};
-    } else {
-      updatedFilters = {
-        [key]: [value],
-      };
-    }
-    if (
-      Array.isArray(updatedFilters[key]) &&
-      updatedFilters[key].length === 0
-    ) {
-      delete updatedFilters[key];
-    }
-
-    const groupBy = Object.keys(updatedFilters);
-    const groupByValues = Object.values(updatedFilters);
-    const labelElements: string[] = [];
-    groupBy.forEach(col => {
-      const isTimestamp = col === DTTM_ALIAS;
-      const filterValues = ensureIsArray(updatedFilters?.[col]);
-      if (filterValues.length) {
-        const valueLabels = filterValues.map(value =>
-          isTimestamp ? timestampFormatter(value) : value,
-        );
-        labelElements.push(`${valueLabels.join(', ')}`);
+  const getCrossFilterDataMask = useCallback(
+    (key: string, value: DataRecordValue) => {
+      let updatedFilters = { ...filters };
+      if (filters && isActiveFilterValue(key, value)) {
+        updatedFilters = {};
+      } else {
+        updatedFilters = {
+          [key]: [value],
+        };
       }
-    });
+      if (
+        Array.isArray(updatedFilters[key]) &&
+        updatedFilters[key].length === 0
+      ) {
+        delete updatedFilters[key];
+      }
 
-    return {
-      dataMask: {
-        extraFormData: {
-          filters:
-            groupBy.length === 0
-              ? []
-              : groupBy.map(col => {
-                  const val = ensureIsArray(updatedFilters?.[col]);
-                  if (!val.length)
+      const groupBy = Object.keys(updatedFilters);
+      const groupByValues = Object.values(updatedFilters);
+      const labelElements: string[] = [];
+      groupBy.forEach(col => {
+        const isTimestamp = col === DTTM_ALIAS;
+        const filterValues = ensureIsArray(updatedFilters?.[col]);
+        if (filterValues.length) {
+          const valueLabels = filterValues.map(value =>
+            isTimestamp ? timestampFormatter(value) : value,
+          );
+          labelElements.push(`${valueLabels.join(', ')}`);
+        }
+      });
+
+      return {
+        dataMask: {
+          extraFormData: {
+            filters:
+              groupBy.length === 0
+                ? []
+                : groupBy.map(col => {
+                    // Resolve adhoc column labels back to original column names
+                    // so that cross-filters work on the receiving chart
+                    const resolvedCol = columnLabelToNameMap[col] ?? col;
+                    const val = ensureIsArray(updatedFilters?.[col]);
+                    const column = columnsMeta.find(
+                      columnMeta => columnMeta.key === col,
+                    );
+                    if (
+                      !val.length ||
+                      val[0] === null ||
+                      (val[0] instanceof DateWithFormatter &&
+                        val[0].input === null)
+                    )
+                      return {
+                        col: resolvedCol,
+                        op: 'IS NULL' as const,
+                      };
                     return {
-                      col,
-                      op: 'IS NULL' as const,
+                      col: resolvedCol,
+                      op: 'IN' as const,
+                      val: val.map(el => getCrossFilterValue(el!, column)),
+                      grain: resolvedCol === DTTM_ALIAS ? timeGrain : undefined,
                     };
-                  return {
-                    col,
-                    op: 'IN' as const,
-                    val: val.map(el =>
-                      el instanceof Date ? el.getTime() : el!,
-                    ),
-                    grain: col === DTTM_ALIAS ? timeGrain : undefined,
-                  };
-                }),
+                  }),
+          },
+          filterState: {
+            label: labelElements.join(', '),
+            value: groupByValues.length ? groupByValues : null,
+            filters:
+              updatedFilters && Object.keys(updatedFilters).length
+                ? updatedFilters
+                : null,
+          },
         },
-        filterState: {
-          label: labelElements.join(', '),
-          value: groupByValues.length ? groupByValues : null,
-          filters:
-            updatedFilters && Object.keys(updatedFilters).length
-              ? updatedFilters
-              : null,
-        },
-      },
-      isCurrentValueSelected: isActiveFilterValue(key, value),
-    };
-  };
+        isCurrentValueSelected: isActiveFilterValue(key, value),
+      };
+    },
+    [
+      filters,
+      isActiveFilterValue,
+      timestampFormatter,
+      timeGrain,
+      columnLabelToNameMap,
+      columnsMeta,
+    ],
+  );
 
   const toggleFilter = useCallback(
     function toggleFilter(key: string, val: DataRecordValue) {
@@ -397,17 +633,21 @@ export default function TableChart<D extends DataRecord = DataRecord>(
     [emitCrossFilters, getCrossFilterDataMask, setDataMask],
   );
 
-  const getSharedStyle = (column: DataColumnMeta): CSSProperties => {
-    const { isNumeric, config = {} } = column;
-    const textAlign =
-      config.horizontalAlign ||
-      (isNumeric && !isUsingTimeComparison ? 'right' : 'left');
-    return {
-      textAlign,
-    };
-  };
+  const getSharedStyle = useCallback(
+    (column: DataColumnMeta): CSSProperties => {
+      const { isNumeric, config = {} } = column;
+      const textAlign =
+        config.horizontalAlign ||
+        (isNumeric && !isUsingTimeComparison ? 'right' : 'left');
+      return {
+        textAlign,
+      };
+    },
+    [isUsingTimeComparison],
+  );
 
-  const comparisonLabels = [t('Main'), '#', '△', '%'];
+  const comparisonLabels = useMemo(() => [t('Main'), '#', '△', '%'], []);
+
   const filteredColumnsMeta = useMemo(() => {
     if (!isUsingTimeComparison) {
       return columnsMeta;
@@ -418,7 +658,7 @@ export default function TableChart<D extends DataRecord = DataRecord>(
 
     return columnsMeta.filter(({ label, key }) => {
       // Extract the key portion after the space, assuming the format is always "label key"
-      const keyPortion = key.substring(label.length);
+      const keyPortion = getComparisonKeyPortion(key, label);
       const isKeyHidded = hideComparisonKeys.includes(keyPortion);
       const isLableMain = label === main;
 
@@ -439,79 +679,128 @@ export default function TableChart<D extends DataRecord = DataRecord>(
     selectedComparisonColumns,
   ]);
 
-  const handleContextMenu =
-    onContextMenu && !isRawRecords
-      ? (
-          value: D,
-          cellPoint: {
-            key: string;
-            value: DataRecordValue;
-            isMetric?: boolean;
-          },
-          clientX: number,
-          clientY: number,
-        ) => {
-          const drillToDetailFilters: BinaryQueryObjectFilterClause[] = [];
-          filteredColumnsMeta.forEach(col => {
-            if (!col.isMetric) {
-              const dataRecordValue = value[col.key];
+  const handleContextMenu = useMemo(() => {
+    if (onContextMenu && !isRawRecords) {
+      return (
+        value: D,
+        cellPoint: {
+          key: string;
+          value: DataRecordValue;
+          isMetric?: boolean;
+        },
+        clientX: number,
+        clientY: number,
+      ) => {
+        const drillToDetailFilters: BinaryQueryObjectFilterClause[] = [];
+        filteredColumnsMeta.forEach(col => {
+          if (!col.isMetric) {
+            const dataRecordValue = value[col.key];
+
+            // FIX: Explicitly handle NULL values for temporal and non-temporal columns
+            // DateWithFormatter objects wrap nulls, so we must check both
+            if (
+              dataRecordValue == null ||
+              (dataRecordValue instanceof DateWithFormatter &&
+                dataRecordValue.input == null)
+            ) {
+              drillToDetailFilters.push({
+                col: col.key,
+                op: 'IS NULL' as any,
+                val: null,
+              });
+            } else if (col.dataType === GenericDataType.Temporal && timeGrain) {
+              const startTime =
+                dataRecordValue instanceof Date
+                  ? dataRecordValue
+                  : new Date(dataRecordValue as string | number);
+
+              const [rangeStartTime, rangeEndTime] =
+                getTimeRangeFromGranularity(startTime, timeGrain);
+              const timeRangeValue = `${rangeStartTime.toISOString()} : ${rangeEndTime.toISOString()}`;
+
+              drillToDetailFilters.push({
+                col: col.key,
+                op: 'TEMPORAL_RANGE',
+                val: timeRangeValue,
+                grain: timeGrain,
+                formattedVal: formatColumnValue(col, dataRecordValue)[1],
+              });
+            } else {
+              // Non-temporal columns use exact match
+              const sanitizedValue = extractTextFromHTML(dataRecordValue);
               drillToDetailFilters.push({
                 col: col.key,
                 op: '==',
-                val: dataRecordValue as string | number | boolean,
-                formattedVal: formatColumnValue(col, dataRecordValue)[1],
+                val: sanitizedValue as string | number | boolean,
+                formattedVal: formatColumnValue(col, sanitizedValue)[1],
               });
             }
-          });
-          onContextMenu(clientX, clientY, {
-            drillToDetail: drillToDetailFilters,
-            crossFilter: cellPoint.isMetric
-              ? undefined
-              : getCrossFilterDataMask(cellPoint.key, cellPoint.value),
-            drillBy: cellPoint.isMetric
-              ? undefined
-              : {
-                  filters: [
-                    {
-                      col: cellPoint.key,
-                      op: '==',
-                      val: cellPoint.value as string | number | boolean,
-                    },
-                  ],
-                  groupbyFieldName: 'groupby',
-                },
-          });
-        }
-      : undefined;
-
-  const getHeaderColumns = (
-    columnsMeta: DataColumnMeta[],
-    enableTimeComparison?: boolean,
-  ) => {
-    const resultMap: Record<string, number[]> = {};
-
-    if (!enableTimeComparison) {
-      return resultMap;
+          }
+        });
+        onContextMenu(clientX, clientY, {
+          drillToDetail: drillToDetailFilters,
+          crossFilter: cellPoint.isMetric
+            ? undefined
+            : getCrossFilterDataMask(cellPoint.key, cellPoint.value),
+          drillBy: cellPoint.isMetric
+            ? undefined
+            : {
+                filters: [
+                  {
+                    col: cellPoint.key,
+                    op: (cellPoint.value == null ||
+                    (cellPoint.value instanceof DateWithFormatter &&
+                      cellPoint.value.input == null)
+                      ? 'IS NULL'
+                      : '==') as any,
+                    val: extractTextFromHTML(cellPoint.value),
+                  },
+                ],
+                groupbyFieldName: 'groupby',
+              },
+        });
+      };
     }
+    return undefined;
+  }, [
+    onContextMenu,
+    isRawRecords,
+    filteredColumnsMeta,
+    getCrossFilterDataMask,
+    timeGrain,
+  ]);
 
-    columnsMeta.forEach((element, index) => {
-      // Check if element's label is one of the comparison labels
-      if (comparisonLabels.includes(element.label)) {
-        // Extract the key portion after the space, assuming the format is always "label key"
-        const keyPortion = element.key.substring(element.label.length);
+  const getHeaderColumns = useCallback(
+    (columnsMeta: DataColumnMeta[], enableTimeComparison?: boolean) => {
+      const resultMap: Record<string, number[]> = {};
 
-        // If the key portion is not in the map, initialize it with the current index
-        if (!resultMap[keyPortion]) {
-          resultMap[keyPortion] = [index];
-        } else {
-          // Add the index to the existing array
-          resultMap[keyPortion].push(index);
-        }
+      if (!enableTimeComparison) {
+        return resultMap;
       }
-    });
 
-    return resultMap;
-  };
+      columnsMeta.forEach((element, index) => {
+        // Check if element's label is one of the comparison labels
+        if (comparisonLabels.includes(element.label)) {
+          // Extract the key portion after the space, assuming the format is always "label key"
+          const keyPortion = getComparisonKeyPortion(
+            element.key,
+            element.label,
+          );
+
+          // If the key portion is not in the map, initialize it with the current index
+          if (!resultMap[keyPortion]) {
+            resultMap[keyPortion] = [index];
+          } else {
+            // Add the index to the existing array
+            resultMap[keyPortion].push(index);
+          }
+        }
+      });
+
+      return resultMap;
+    },
+    [comparisonLabels],
+  );
 
   const renderTimeComparisonDropdown = (): JSX.Element => {
     const allKey = comparisonColumns[0].key;
@@ -541,52 +830,62 @@ export default function TableChart<D extends DataRecord = DataRecord>(
     return (
       <Dropdown
         placement="bottomRight"
-        visible={showComparisonDropdown}
-        onVisibleChange={(flag: boolean) => {
+        open={showComparisonDropdown}
+        onOpenChange={(flag: boolean) => {
           setShowComparisonDropdown(flag);
         }}
-        overlay={
-          <Menu
-            multiple
-            onClick={handleOnClick}
-            onBlur={handleOnBlur}
-            selectedKeys={selectedComparisonColumns}
-          >
-            <div
-              css={css`
-                max-width: 242px;
-                padding: 0 ${theme.gridUnit * 2}px;
-                color: ${theme.colors.grayscale.base};
-                font-size: ${theme.typography.sizes.s}px;
-              `}
-            >
-              {t(
-                'Select columns that will be displayed in the table. You can multiselect columns.',
-              )}
-            </div>
-            {comparisonColumns.map(column => (
-              <Menu.Item key={column.key}>
-                <span
+        menu={{
+          multiple: true,
+          onClick: handleOnClick,
+          onBlur: handleOnBlur,
+          selectedKeys: selectedComparisonColumns,
+          items: [
+            {
+              key: 'all',
+              label: (
+                <div
                   css={css`
-                    color: ${theme.colors.grayscale.dark2};
+                    max-width: 242px;
+                    padding: 0 ${theme.sizeUnit * 2}px;
+                    color: ${theme.colorText};
+                    font-size: ${theme.fontSizeSM}px;
                   `}
                 >
-                  {column.label}
-                </span>
-                <span
-                  css={css`
-                    float: right;
-                    font-size: ${theme.typography.sizes.s}px;
-                  `}
-                >
-                  {selectedComparisonColumns.includes(column.key) && (
-                    <CheckOutlined />
+                  {t(
+                    'Select columns that will be displayed in the table. You can multiselect columns.',
                   )}
-                </span>
-              </Menu.Item>
-            ))}
-          </Menu>
-        }
+                </div>
+              ),
+              type: 'group',
+              children: comparisonColumns.map(
+                (column: { key: string; label: string }) => ({
+                  key: column.key,
+                  label: (
+                    <>
+                      <span
+                        css={css`
+                          color: ${theme.colorText};
+                        `}
+                      >
+                        {column.label}
+                      </span>
+                      <span
+                        css={css`
+                          float: right;
+                          font-size: ${theme.fontSizeSM}px;
+                        `}
+                      >
+                        {selectedComparisonColumns.includes(column.key) && (
+                          <CheckOutlined />
+                        )}
+                      </span>
+                    </>
+                  ),
+                }),
+              ),
+            },
+          ],
+        }}
         trigger={['click']}
       >
         <span>
@@ -596,15 +895,180 @@ export default function TableChart<D extends DataRecord = DataRecord>(
     );
   };
 
+  // Compute visible columns before groupHeaderColumns to ensure index consistency.
+  // This filters out columns with config.visible === false.
+  const { visibleColumnsMeta, hasHeaderGroups } = useMemo(() => {
+    const visible = filteredColumnsMeta.filter(
+      col => col.config?.visible !== false,
+    );
+    const hasGroups = hasRenderableHeaderGroups(headerGroups, visible);
+    return {
+      visibleColumnsMeta: hasGroups
+        ? orderColumnsByHeaderGroups(visible, headerGroups)
+        : visible,
+      hasHeaderGroups: hasGroups,
+    };
+  }, [filteredColumnsMeta, headerGroups]);
+
+  // Use visibleColumnsMeta for groupHeaderColumns to ensure indices match the actual
+  // table columns. This fixes header misalignment when columns are filtered.
+  const groupHeaderColumns = useMemo(
+    () => getHeaderColumns(visibleColumnsMeta, isUsingTimeComparison),
+    [visibleColumnsMeta, getHeaderColumns, isUsingTimeComparison],
+  );
+
+  const groupingHeaderRowStyles = css`
+    th {
+      border-right: 1px solid ${theme.colorSplit};
+      text-align: center;
+    }
+    th:first-of-type {
+      border-left: none;
+    }
+    th:last-child {
+      border-right: none;
+    }
+  `;
+
+  const multiLevelHeaderRowStyles = css`
+    th {
+      border-right: 1px solid ${theme.colorSplit};
+    }
+    th:first-of-type {
+      border-left: none;
+    }
+    th[data-dimension-separator='true'] {
+      border-right: 2px solid ${theme.colorSplit};
+    }
+    th[data-last-column='true'] {
+      border-right: none;
+    }
+  `;
+
+  const getComparisonToggleKey = (
+    spanColumns: DataColumnMeta[],
+  ): string | undefined => {
+    const comparisonCols = spanColumns.filter(col =>
+      comparisonLabels.includes(col.label),
+    );
+    if (comparisonCols.length === 0) {
+      return undefined;
+    }
+    const keyPortion = getComparisonKeyPortion(
+      comparisonCols[0].key,
+      comparisonCols[0].label,
+    );
+    return comparisonCols.every(
+      col => getComparisonKeyPortion(col.key, col.label) === keyPortion,
+    )
+      ? keyPortion
+      : undefined;
+  };
+
+  const renderComparisonToggle = (comparisonKey: string) => (
+    <span
+      css={css`
+        float: right;
+        & svg {
+          color: ${theme.colorIcon} !important;
+        }
+      `}
+    >
+      {hideComparisonKeys.includes(comparisonKey) ? (
+        <PlusCircleOutlined
+          onClick={() =>
+            setHideComparisonKeys(
+              hideComparisonKeys.filter(k => k !== comparisonKey),
+            )
+          }
+        />
+      ) : (
+        <MinusCircleOutlined
+          onClick={() =>
+            setHideComparisonKeys([...hideComparisonKeys, comparisonKey])
+          }
+        />
+      )}
+    </span>
+  );
+
+  const renderMultiLevelHeaders = (): JSX.Element => {
+    const rows = buildHeaderGroupRows(
+      headerGroups,
+      visibleColumnsMeta.map(column => column.key),
+    );
+    return (
+      <>
+        {rows.map((row, rowIndex) => (
+          <tr
+            key={`multi-header-row-${rowIndex}`}
+            css={multiLevelHeaderRowStyles}
+          >
+            {row.map(cell => {
+              const lastColumn =
+                visibleColumnsMeta[cell.columnIndex + cell.colSpan - 1];
+              const hasDimensionSeparator = Boolean(
+                lastColumn &&
+                !lastColumn.isMetric &&
+                !lastColumn.isPercentMetric,
+              );
+              const spanColumns = visibleColumnsMeta.slice(
+                cell.columnIndex,
+                cell.columnIndex + cell.colSpan,
+              );
+              const comparisonKey = cell.label
+                ? getComparisonToggleKey(spanColumns)
+                : undefined;
+              return (
+                <th
+                  key={cell.key}
+                  colSpan={cell.colSpan}
+                  rowSpan={cell.rowSpan}
+                  data-last-column={cell.isLastColumn || undefined}
+                  data-dimension-separator={hasDimensionSeparator || undefined}
+                  style={{
+                    borderBottom: cell.label ? undefined : 0,
+                    textAlign: cell.labelAlign ?? 'center',
+                  }}
+                >
+                  {cell.label}
+                  {comparisonKey ? renderComparisonToggle(comparisonKey) : null}
+                </th>
+              );
+            })}
+          </tr>
+        ))}
+      </>
+    );
+  };
+
   const renderGroupingHeaders = (): JSX.Element => {
+    if (hasHeaderGroups) {
+      return renderMultiLevelHeaders();
+    }
+
     // TODO: Make use of ColumnGroup to render the aditional headers
     const headers: any = [];
     let currentColumnIndex = 0;
 
-    Object.entries(groupHeaderColumns || {}).forEach(([key, value]) => {
+    // Sort entries by their first column index to ensure correct left-to-right order.
+    // Object.entries() maintains insertion order, but when columns are filtered,
+    // the first occurrence of each metric might not match the visual column order.
+    const sortedEntries = Object.entries(groupHeaderColumns || {}).sort(
+      (a, b) => a[1][0] - b[1][0],
+    );
+
+    sortedEntries.forEach(([key, value]) => {
       // Calculate the number of placeholder columns needed before the current header
       const startPosition = value[0];
       const colSpan = value.length;
+      // Retrieve the originalLabel from the first column in this group.
+      // Use visibleColumnsMeta to ensure consistent indexing with the actual table columns.
+      const firstColumnInGroup = visibleColumnsMeta[startPosition];
+      const originalLabel = firstColumnInGroup
+        ? columnsMeta.find(col => col.key === firstColumnInGroup.key)
+            ?.originalLabel || key
+        : key;
 
       // Add placeholder <th> for columns before this header
       for (let i = currentColumnIndex; i < startPosition; i += 1) {
@@ -620,31 +1084,8 @@ export default function TableChart<D extends DataRecord = DataRecord>(
       // Add the current header <th>
       headers.push(
         <th key={`header-${key}`} colSpan={colSpan} style={{ borderBottom: 0 }}>
-          {key}
-          <span
-            css={css`
-              float: right;
-              & svg {
-                color: ${theme.colors.grayscale.base} !important;
-              }
-            `}
-          >
-            {hideComparisonKeys.includes(key) ? (
-              <PlusCircleOutlined
-                onClick={() =>
-                  setHideComparisonKeys(
-                    hideComparisonKeys.filter(k => k !== key),
-                  )
-                }
-              />
-            ) : (
-              <MinusCircleOutlined
-                onClick={() =>
-                  setHideComparisonKeys([...hideComparisonKeys, key])
-                }
-              />
-            )}
-          </span>
+          {originalLabel}
+          {renderComparisonToggle(key)}
         </th>,
       );
 
@@ -652,41 +1093,46 @@ export default function TableChart<D extends DataRecord = DataRecord>(
       currentColumnIndex = startPosition + colSpan;
     });
 
-    return (
-      <tr
-        css={css`
-          th {
-            border-right: 2px solid ${theme.colors.grayscale.light2};
-          }
-          th:first-child {
-            border-left: none;
-          }
-          th:last-child {
-            border-right: none;
-          }
-        `}
-      >
-        {headers}
-      </tr>
-    );
+    return <tr css={groupingHeaderRowStyles}>{headers}</tr>;
   };
 
-  const groupHeaderColumns = useMemo(
-    () => getHeaderColumns(filteredColumnsMeta, isUsingTimeComparison),
-    [filteredColumnsMeta, isUsingTimeComparison],
-  );
-
   const getColumnConfigs = useCallback(
-    (column: DataColumnMeta, i: number): ColumnWithLooseAccessor<D> => {
+    (
+      column: DataColumnMeta,
+      i: number,
+    ): ColumnWithLooseAccessor<D> & {
+      columnKey: string;
+      columnLabel: string;
+    } => {
       const {
         key,
-        label,
-        isNumeric,
+        label: originalLabel,
         dataType,
         isMetric,
         isPercentMetric,
         config = {},
+        description,
       } = column;
+      const label = config.customColumnName || originalLabel;
+      let displayLabel = label;
+
+      const isComparisonColumn = ['#', '△', '%', t('Main')].includes(
+        column.label,
+      );
+
+      if (isComparisonColumn) {
+        if (column.label === t('Main')) {
+          displayLabel = config.customColumnName || column.originalLabel || '';
+        } else if (config.customColumnName) {
+          displayLabel =
+            config.displayTypeIcon !== false
+              ? `${column.label} ${config.customColumnName}`
+              : config.customColumnName;
+        } else if (config.displayTypeIcon === false) {
+          displayLabel = '';
+        }
+      }
+
       const columnWidth = Number.isNaN(Number(config.columnWidth))
         ? config.columnWidth
         : Number(config.columnWidth);
@@ -706,7 +1152,6 @@ export default function TableChart<D extends DataRecord = DataRecord>(
       const { truncateLongCells } = config;
 
       const hasColumnColorFormatters =
-        isNumeric &&
         Array.isArray(columnColorFormatters) &&
         columnColorFormatters.length > 0;
 
@@ -714,13 +1159,11 @@ export default function TableChart<D extends DataRecord = DataRecord>(
         isUsingTimeComparison &&
         Array.isArray(basicColorFormatters) &&
         basicColorFormatters.length > 0;
-
+      const generalShowCellBars =
+        config.showCellBars === undefined ? showCellBars : config.showCellBars;
       const valueRange =
         !hasBasicColorFormatters &&
-        !hasColumnColorFormatters &&
-        (config.showCellBars === undefined
-          ? showCellBars
-          : config.showCellBars) &&
+        generalShowCellBars &&
         (isMetric || isRawRecords || isPercentMetric) &&
         getValueRange(key, alignPositiveNegative);
 
@@ -739,40 +1182,87 @@ export default function TableChart<D extends DataRecord = DataRecord>(
         }
       }
 
+      // Cache sanitized header ID to avoid recomputing it multiple times
+      const headerId = sanitizeHeaderId(column.originalLabel ?? column.key);
+
       return {
         id: String(i), // to allow duplicate column keys
         // must use custom accessor to allow `.` in column names
         // typing is incorrect in current version of `@types/react-table`
         // so we ask TS not to check.
+        columnKey: key,
+        columnLabel: label,
         accessor: ((datum: D) => datum[key]) as never,
         Cell: ({ value, row }: { value: DataRecordValue; row: Row<D> }) => {
-          const [isHtml, text] = formatColumnValue(column, value);
+          const [isHtml, text] = formatColumnValue(column, value, row.original);
           const html = isHtml && allowRenderHtml ? { __html: text } : undefined;
 
           let backgroundColor;
+          let color;
+          let backgroundColorCellBar;
+          let valueRangeFlag = true;
           let arrow = '';
           const originKey = column.key.substring(column.label.length).trim();
           if (!hasColumnColorFormatters && hasBasicColorFormatters) {
             backgroundColor =
-              basicColorFormatters[row.index][originKey]?.backgroundColor;
+              basicColorFormatters[row.index]?.[originKey]?.backgroundColor;
             arrow =
               column.label === comparisonLabels[0]
-                ? basicColorFormatters[row.index][originKey]?.mainArrow
+                ? basicColorFormatters[row.index]?.[originKey]?.mainArrow
                 : '';
           }
 
           if (hasColumnColorFormatters) {
-            columnColorFormatters!
-              .filter(formatter => formatter.column === column.key)
-              .forEach(formatter => {
-                const formatterResult =
-                  value || value === 0
-                    ? formatter.getColorFromValue(value as number)
-                    : false;
-                if (formatterResult) {
-                  backgroundColor = formatterResult;
+            const applyFormatter = (
+              formatter: ColorFormatters[number],
+              valueToFormat: any,
+            ) => {
+              const formatterResult =
+                formatter.getColorFromValue(valueToFormat);
+              if (!formatterResult) return;
+
+              if (
+                formatter.objectFormatting ===
+                  ObjectFormattingEnum.TEXT_COLOR ||
+                formatter.toTextColor
+              ) {
+                color = formatterResult;
+              } else if (
+                formatter.objectFormatting === ObjectFormattingEnum.CELL_BAR
+              ) {
+                if (generalShowCellBars)
+                  backgroundColorCellBar = forceHexAlpha(formatterResult);
+              } else {
+                backgroundColor = formatterResult;
+                valueRangeFlag = false;
+              }
+            };
+            columnColorFormatters
+              .filter(formatter => {
+                if (formatter.columnFormatting) {
+                  return formatter.columnFormatting === column.key;
                 }
+                return formatter.column === column.key;
+              })
+              .forEach(formatter => {
+                let valueToFormat;
+                if (formatter.columnFormatting) {
+                  valueToFormat = row.original[formatter.column];
+                } else {
+                  valueToFormat = value;
+                }
+                applyFormatter(formatter, valueToFormat);
               });
+
+            columnColorFormatters
+              .filter(
+                formatter =>
+                  formatter.columnFormatting ===
+                  ObjectFormattingEnum.ENTIRE_ROW,
+              )
+              .forEach(formatter =>
+                applyFormatter(formatter, row.original[formatter.column]),
+              );
           }
 
           if (
@@ -780,19 +1270,33 @@ export default function TableChart<D extends DataRecord = DataRecord>(
             basicColorColumnFormatters?.length > 0
           ) {
             backgroundColor =
-              basicColorColumnFormatters[row.index][column.key]
+              basicColorColumnFormatters[row.index]?.[column.key]
                 ?.backgroundColor || backgroundColor;
             arrow =
               column.label === comparisonLabels[0]
-                ? basicColorColumnFormatters[row.index][column.key]?.mainArrow
+                ? (basicColorColumnFormatters[row.index]?.[column.key]
+                    ?.mainArrow ?? arrow)
                 : '';
           }
-
+          const rowSurfaceColor =
+            row.index % 2 === 0 ? theme.colorBgLayout : theme.colorBgBase;
+          const resolvedTextColor = getTextColorForBackground(
+            { backgroundColor, color },
+            rowSurfaceColor,
+          );
           const StyledCell = styled.td`
             text-align: ${sharedStyle.textAlign};
             white-space: ${value instanceof Date ? 'nowrap' : undefined};
             position: relative;
+            font-weight: ${
+              color ? `${theme.fontWeightBold}` : `${theme.fontWeightNormal}`
+            };
             background: ${backgroundColor || undefined};
+            padding-left: ${
+              column.isChildColumn
+                ? `${theme.sizeUnit * 5}px`
+                : `${theme.sizeUnit}px`
+            };
           `;
 
           const cellBarStyles = css`
@@ -800,8 +1304,11 @@ export default function TableChart<D extends DataRecord = DataRecord>(
             height: 100%;
             display: block;
             top: 0;
-            ${valueRange &&
-            `
+            ${
+              valueRange &&
+              typeof value === 'number' &&
+              valueRangeFlag &&
+              `
                 width: ${`${cellWidth({
                   value: value as number,
                   valueRange,
@@ -812,45 +1319,63 @@ export default function TableChart<D extends DataRecord = DataRecord>(
                   valueRange,
                   alignPositiveNegative,
                 })}%`};
-                background-color: ${cellBackground({
-                  value: value as number,
-                  colorPositiveNegative,
-                })};
-              `}
+                background-color: ${
+                  backgroundColorCellBar ||
+                  cellBackground({
+                    value: value as number,
+                    colorPositiveNegative,
+                    theme,
+                  })
+                };
+              `
+            }
           `;
 
-          let arrowStyles = css`
-            color: ${basicColorFormatters &&
-            basicColorFormatters[row.index][originKey]?.arrowColor ===
-              ColorSchemeEnum.Green
-              ? theme.colors.success.base
-              : theme.colors.error.base};
-            margin-right: ${theme.gridUnit}px;
-          `;
+          // Plain inline style (rather than the `css` prop) so the arrow's
+          // color is guaranteed to apply regardless of whether the consuming
+          // app's build wires up the emotion JSX pragma for the `css` prop --
+          // notably, this codebase's own Jest/Babel config does not, which
+          // silently no-ops any `css` prop on a plain DOM element.
+          let arrowStyles: CSSProperties = {
+            color:
+              basicColorFormatters &&
+              basicColorFormatters[row.index]?.[originKey]?.arrowColor ===
+                ColorSchemeEnum.Green
+                ? theme.colorSuccess
+                : theme.colorError,
+            marginRight: theme.sizeUnit,
+          };
 
           if (
             basicColorColumnFormatters &&
             basicColorColumnFormatters?.length > 0
           ) {
-            arrowStyles = css`
-              color: ${basicColorColumnFormatters[row.index][column.key]
-                ?.arrowColor === ColorSchemeEnum.Green
-                ? theme.colors.success.base
-                : theme.colors.error.base};
-              margin-right: ${theme.gridUnit}px;
-            `;
+            const columnArrowColor =
+              basicColorColumnFormatters[row.index]?.[column.key]?.arrowColor;
+            if (columnArrowColor) {
+              arrowStyles = {
+                color:
+                  columnArrowColor === ColorSchemeEnum.Green
+                    ? theme.colorSuccess
+                    : theme.colorError,
+                marginRight: theme.sizeUnit,
+              };
+            }
           }
 
           const cellProps = {
-            'aria-labelledby': `header-${column.key}`,
+            'aria-labelledby': `header-${headerId}`,
             role: 'cell',
             // show raw number in title in case of numeric values
             title: typeof value === 'number' ? String(value) : undefined,
             onClick:
               emitCrossFilters && !valueRange && !isMetric
                 ? () => {
+                    const isFilterable = columnsMeta.find(
+                      (cm: DataColumnMeta) => cm.key === key,
+                    )?.isFilterable;
                     // allow selecting text in a cell
-                    if (!getSelectedText()) {
+                    if (!getSelectedText() && isFilterable !== false) {
                       toggleFilter(key, value);
                     }
                   }
@@ -869,24 +1394,32 @@ export default function TableChart<D extends DataRecord = DataRecord>(
             },
             className: [
               className,
-              value == null ? 'dt-is-null' : '',
+              value == null ||
+              (value instanceof DateWithFormatter && value.input == null)
+                ? 'dt-is-null'
+                : '',
               isActiveFilterValue(key, value) ? ' dt-is-active-filter' : '',
             ].join(' '),
+            style: resolvedTextColor
+              ? ({ color: resolvedTextColor } as CSSProperties)
+              : undefined,
             tabIndex: 0,
           };
           if (html) {
             if (truncateLongCells) {
-              // eslint-disable-next-line react/no-danger
               return (
                 <StyledCell {...cellProps}>
                   <div
                     className="dt-truncate-cell"
                     style={columnWidth ? { width: columnWidth } : undefined}
+                    // Safe: HTML is sanitized via formatColumnValue
+                    // eslint-disable-next-line react/no-danger
                     dangerouslySetInnerHTML={html}
                   />
                 </StyledCell>
               );
             }
+            // Safe: HTML is sanitized via formatColumnValue
             // eslint-disable-next-line react/no-danger
             return <StyledCell {...cellProps} dangerouslySetInnerHTML={html} />;
           }
@@ -899,7 +1432,9 @@ export default function TableChart<D extends DataRecord = DataRecord>(
                   /* The following classes are added to support custom CSS styling */
                   className={cx(
                     'cell-bar',
-                    isNumber(value) && value < 0 ? 'negative' : 'positive',
+                    typeof value === 'number' && value < 0
+                      ? 'negative'
+                      : 'positive',
                   )}
                   css={cellBarStyles}
                   role="presentation"
@@ -910,12 +1445,12 @@ export default function TableChart<D extends DataRecord = DataRecord>(
                   className="dt-truncate-cell"
                   style={columnWidth ? { width: columnWidth } : undefined}
                 >
-                  {arrow && <span css={arrowStyles}>{arrow}</span>}
+                  {arrow && <span style={arrowStyles}>{arrow}</span>}
                   {text}
                 </div>
               ) : (
                 <>
-                  {arrow && <span css={arrowStyles}>{arrow}</span>}
+                  {arrow && <span style={arrowStyles}>{arrow}</span>}
                   {text}
                 </>
               )}
@@ -924,8 +1459,10 @@ export default function TableChart<D extends DataRecord = DataRecord>(
         },
         Header: ({ column: col, onClick, style, onDragStart, onDrop }) => (
           <th
-            id={`header-${column.key}`}
-            title={t('Shift + Click to sort by multiple columns')}
+            id={`header-${headerId}`}
+            title={
+              description || t('Shift + Click to sort by multiple columns')
+            }
             className={[className, col.isSorted ? 'is-sorted' : ''].join(' ')}
             style={{
               ...sharedStyle,
@@ -937,7 +1474,6 @@ export default function TableChart<D extends DataRecord = DataRecord>(
                 col.toggleSortBy();
               }
             }}
-            role="columnheader button"
             onClick={onClick}
             data-column-name={col.id}
             {...(allowRearrangeColumns && {
@@ -966,21 +1502,22 @@ export default function TableChart<D extends DataRecord = DataRecord>(
                 alignItems: 'flex-end',
               }}
             >
-              <span data-column-name={col.id}>{label}</span>
+              <span data-column-name={col.id}>{displayLabel}</span>
               <SortIcon column={col} />
             </div>
           </th>
         ),
-        Footer: totals ? (
+
+        Footer: displayedTotals ? (
           i === 0 ? (
-            <th>
+            <th key={`footer-summary-${i}`}>
               <div
                 css={css`
                   display: flex;
                   align-items: center;
                   & svg {
-                    margin-left: ${theme.gridUnit}px;
-                    color: ${theme.colors.grayscale.dark1} !important;
+                    margin-left: ${theme.sizeUnit}px;
+                    color: ${theme.colorBorder} !important;
                   }
                 `}
               >
@@ -995,42 +1532,131 @@ export default function TableChart<D extends DataRecord = DataRecord>(
               </div>
             </th>
           ) : (
-            <td style={sharedStyle}>
-              <strong>{formatColumnValue(column, totals[key])[1]}</strong>
+            <td key={`footer-total-${i}`} style={sharedStyle}>
+              <strong>
+                {formatColumnValue(column, displayedTotals[key])[1]}
+              </strong>
             </td>
           )
         ) : undefined,
         sortDescFirst: sortDesc,
-        sortType: getSortTypeByDataType(dataType),
+        // Metrics and percent metrics always have numeric values; use numeric sort
+        // even if the backend reports the column type as String.
+        sortType:
+          isMetric || isPercentMetric
+            ? 'basic'
+            : getSortTypeByDataType(dataType),
       };
     },
     [
+      getSharedStyle,
       defaultAlignPN,
       defaultColorPN,
-      emitCrossFilters,
-      getValueRange,
-      isActiveFilterValue,
-      isRawRecords,
-      showCellBars,
-      sortDesc,
-      toggleFilter,
-      totals,
       columnColorFormatters,
-      columnOrderToggle,
+      isUsingTimeComparison,
+      basicColorFormatters,
+      showCellBars,
+      isRawRecords,
+      getValueRange,
+      emitCrossFilters,
+      comparisonLabels,
+      displayedTotals,
+      theme,
+      sortDesc,
+      groupHeaderColumns,
+      allowRenderHtml,
+      basicColorColumnFormatters,
+      isActiveFilterValue,
+      toggleFilter,
+      handleContextMenu,
+      allowRearrangeColumns,
     ],
   );
 
   const columns = useMemo(
-    () => filteredColumnsMeta.map(getColumnConfigs),
-    [filteredColumnsMeta, getColumnConfigs],
+    () => visibleColumnsMeta.map(getColumnConfigs),
+    [visibleColumnsMeta, getColumnConfigs],
   );
+
+  const [searchOptions, setSearchOptions] = useState<SearchOption[]>([]);
+
+  const handleFilteredDataChange = useCallback(
+    (rows: Row<D>[], searchText?: string) => {
+      if (!totals || serverPagination) {
+        return;
+      }
+
+      if (!searchText?.trim()) {
+        setDisplayedTotals(totals);
+        return;
+      }
+
+      const updatedTotals: Record<string, DataRecordValue> = { ...totals };
+
+      filteredColumnsMeta.forEach(column => {
+        if (column.isMetric || column.isPercentMetric) {
+          const aggregatedValue = rows.reduce<number>((acc, row) => {
+            const rawValue = row.original?.[column.key];
+            const numValue = Number(String(rawValue ?? '').replace(/,/g, ''));
+            return Number.isFinite(numValue) ? acc + numValue : acc;
+          }, 0);
+
+          updatedTotals[column.key] = aggregatedValue;
+        }
+      });
+
+      setDisplayedTotals(updatedTotals as D);
+    },
+    [filteredColumnsMeta, serverPagination, totals],
+  );
+
+  useEffect(() => {
+    const options = (
+      columns as unknown as ColumnWithLooseAccessor &
+        {
+          columnKey: string;
+          columnLabel: string;
+          sortType?: string;
+        }[]
+    )
+      .filter(col => col?.sortType === 'alphanumeric')
+      .map(column => ({
+        value: column.columnKey,
+        label: column.columnLabel,
+      }));
+
+    if (!isEqual(options, searchOptions)) {
+      setSearchOptions(options || []);
+    }
+  }, [columns, searchOptions]);
 
   const handleServerPaginationChange = useCallback(
     (pageNumber: number, pageSize: number) => {
-      updateExternalFormData(setDataMask, pageNumber, pageSize);
+      const modifiedOwnState = {
+        ...serverPaginationData,
+        currentPage: pageNumber,
+        pageSize,
+      };
+      updateTableOwnState(setDataMask, modifiedOwnState);
     },
-    [setDataMask],
+    [serverPaginationData, setDataMask],
   );
+
+  useEffect(() => {
+    if (hasServerPageLengthChanged) {
+      const modifiedOwnState = {
+        ...serverPaginationData,
+        currentPage: 0,
+        pageSize: serverPageLength,
+      };
+      updateTableOwnState(setDataMask, modifiedOwnState);
+    }
+  }, [
+    hasServerPageLengthChanged,
+    serverPageLength,
+    serverPaginationData,
+    setDataMask,
+  ]);
 
   const handleSizeChange = useCallback(
     ({ width, height }: { width: number; height: number }) => {
@@ -1067,6 +1693,86 @@ export default function TableChart<D extends DataRecord = DataRecord>(
 
   const { width: widthFromState, height: heightFromState } = tableSize;
 
+  const handleSortByChange = useCallback(
+    (sortBy: SortByItem[]) => {
+      if (!serverPagination) return;
+      const modifiedOwnState = {
+        ...serverPaginationData,
+        sortBy,
+      };
+      updateTableOwnState(setDataMask, modifiedOwnState);
+    },
+    [serverPagination, serverPaginationData, setDataMask],
+  );
+
+  const handleSearch = (searchText: string) => {
+    const modifiedOwnState = {
+      ...serverPaginationData,
+      searchColumn:
+        serverPaginationData?.searchColumn || searchOptions[0]?.value,
+      searchText,
+      currentPage: 0, // Reset to first page when searching
+    };
+    updateTableOwnState(setDataMask, modifiedOwnState);
+  };
+
+  const debouncedSearch = debounce(handleSearch, 800);
+
+  const handleChangeSearchCol = (searchCol: string) => {
+    if (!isEqual(searchCol, serverPaginationData?.searchColumn)) {
+      const modifiedOwnState = {
+        ...serverPaginationData,
+        searchColumn: searchCol,
+        searchText: '',
+      };
+      updateTableOwnState(setDataMask, modifiedOwnState);
+    }
+  };
+
+  // collect client-side filtered rows for export & push snapshot to ownState (guarded)
+  const [clientViewRows, setClientViewRows] = useState<DataRecord[]>([]);
+
+  const exportColumns = useMemo(
+    () =>
+      visibleColumnsMeta.map(col => ({
+        key: col.key,
+        label: col.config?.customColumnName || col.originalLabel || col.key,
+      })),
+    [visibleColumnsMeta],
+  );
+
+  // Use a ref to store previous clientViewRows and exportColumns for robust change detection
+  const prevClientViewRef = useRef<{
+    rows: DataRecord[];
+    columns: typeof exportColumns;
+  } | null>(null);
+  useEffect(() => {
+    if (serverPagination) return; // only for client-side mode
+    const prev = prevClientViewRef.current;
+    const rowsChanged = !prev || !isEqual(prev.rows, clientViewRows);
+    const columnsChanged = !prev || !isEqual(prev.columns, exportColumns);
+    if (rowsChanged || columnsChanged) {
+      prevClientViewRef.current = {
+        rows: clientViewRows,
+        columns: exportColumns,
+      };
+      updateTableOwnState(setDataMask, {
+        ...serverPaginationData,
+        clientView: {
+          rows: clientViewRows,
+          columns: exportColumns,
+          count: clientViewRows.length,
+        },
+      });
+    }
+  }, [
+    clientViewRows,
+    exportColumns,
+    serverPagination,
+    setDataMask,
+    serverPaginationData,
+  ]);
+
   return (
     <Styles>
       <DataTable<D>
@@ -1077,11 +1783,15 @@ export default function TableChart<D extends DataRecord = DataRecord>(
         pageSize={pageSize}
         serverPaginationData={serverPaginationData}
         pageSizeOptions={pageSizeOptions}
-        width={widthFromState}
-        height={heightFromState}
+        width={Math.max(0, widthFromState - theme.sizeUnit * 10)}
+        height={Math.max(0, heightFromState - theme.sizeUnit * 10)}
         serverPagination={serverPagination}
         onServerPaginationChange={handleServerPaginationChange}
         onColumnOrderChange={() => setColumnOrderToggle(!columnOrderToggle)}
+        resetColumnOrder={hasHeaderGroups}
+        initialSearchText={serverPaginationData?.searchText || ''}
+        sortByFromParent={serverPaginationData?.sortBy || []}
+        searchInputId={`${slice_id}-search`}
         // 9 page items in > 340px works well even for 100+ pages
         maxPageItemCount={width > 340 ? 9 : 7}
         noResults={getNoResultsMessage}
@@ -1090,11 +1800,20 @@ export default function TableChart<D extends DataRecord = DataRecord>(
         // not in use in Superset, but needed for unit tests
         sticky={sticky}
         renderGroupingHeaders={
-          !isEmpty(groupHeaderColumns) ? renderGroupingHeaders : undefined
+          !isEmpty(groupHeaderColumns) || hasHeaderGroups
+            ? renderGroupingHeaders
+            : undefined
         }
         renderTimeComparisonDropdown={
           isUsingTimeComparison ? renderTimeComparisonDropdown : undefined
         }
+        handleSortByChange={handleSortByChange}
+        onSearchColChange={handleChangeSearchCol}
+        manualSearch={serverPagination}
+        onSearchChange={debouncedSearch}
+        searchOptions={searchOptions}
+        onFilteredDataChange={handleFilteredDataChange}
+        onFilteredRowsChange={setClientViewRows}
       />
     </Styles>
   );

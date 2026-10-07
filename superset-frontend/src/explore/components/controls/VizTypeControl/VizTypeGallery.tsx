@@ -29,23 +29,23 @@ import {
 
 import Fuse from 'fuse.js';
 import cx from 'classnames';
+import { t } from '@apache-superset/core/translation';
 import {
-  t,
-  styled,
-  css,
   ChartMetadata,
-  SupersetTheme,
-  useTheme,
   chartLabelWeight,
   chartLabelExplanations,
 } from '@superset-ui/core';
-import { AntdCollapse } from 'src/components';
-import { Tooltip } from 'src/components/Tooltip';
-import { Input } from 'src/components/Input';
-import Label from 'src/components/Label';
-import { usePluginContext } from 'src/components/DynamicPlugins';
-import Icons from 'src/components/Icons';
+import {
+  styled,
+  css,
+  SupersetTheme,
+  useTheme,
+  isThemeDark,
+} from '@apache-superset/core/theme';
+import { Input, Collapse, Tooltip, Label } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
 import { nativeFilterGate } from 'src/dashboard/components/nativeFilters/utils';
+import { usePluginContext } from 'src/components';
 import scrollIntoView from 'scroll-into-view-if-needed';
 
 interface VizTypeGalleryProps {
@@ -103,30 +103,31 @@ const VizPickerLayout = styled.div<{ isSelectedVizMetadata: boolean }>`
 
 const SectionTitle = styled.h3`
   margin-top: 0;
-  margin-bottom: ${({ theme }) => theme.gridUnit * 2}px;
-  font-size: ${({ theme }) => theme.typography.sizes.l}px;
-  font-weight: ${({ theme }) => theme.typography.weights.bold};
-  line-height: ${({ theme }) => theme.gridUnit * 6}px;
+  margin-bottom: ${({ theme }) => theme.sizeUnit * 2}px;
+  font-size: ${({ theme }) => theme.fontSizeLG}px;
+  font-weight: ${({ theme }) => theme.fontWeightStrong};
+  line-height: ${({ theme }) => theme.sizeUnit * 6}px;
 `;
 
 const LeftPane = styled.div`
   grid-area: sidebar;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid ${({ theme }) => theme.colors.grayscale.light2};
+  border-right: 1px solid ${({ theme }) => theme.colorBorder};
   overflow: auto;
 
   .ant-collapse .ant-collapse-item {
     .ant-collapse-header {
-      font-size: ${({ theme }) => theme.typography.sizes.s}px;
-      color: ${({ theme }) => theme.colors.grayscale.base};
-      padding-left: ${({ theme }) => theme.gridUnit * 2}px;
-      padding-bottom: ${({ theme }) => theme.gridUnit}px;
+      font-size: ${({ theme }) => theme.fontSizeSM}px;
+      color: ${({ theme }) => theme.colorText};
+      padding-left: ${({ theme }) => theme.sizeUnit * 2}px;
+      padding-bottom: ${({ theme }) => theme.sizeUnit}px;
     }
-    .ant-collapse-content .ant-collapse-content-box {
+
+    .ant-collapse-panel .ant-collapse-body {
       display: flex;
       flex-direction: column;
-      padding: 0 ${({ theme }) => theme.gridUnit * 2}px;
+      padding: 0 ${({ theme }) => theme.sizeUnit * 2}px;
     }
   }
 `;
@@ -139,12 +140,12 @@ const RightPane = styled.div`
 const SearchWrapper = styled.div`
   ${({ theme }) => `
     grid-area: search;
-    margin-top: ${theme.gridUnit * 3}px;
-    margin-bottom: ${theme.gridUnit}px;
-    margin-left: ${theme.gridUnit * 3}px;
-    margin-right: ${theme.gridUnit * 3}px;
-    .antd5-input-affix-wrapper {
-      padding-left: ${theme.gridUnit * 2}px;
+    margin-top: ${theme.sizeUnit * 3}px;
+    margin-bottom: ${theme.sizeUnit}px;
+    margin-left: ${theme.sizeUnit * 3}px;
+    margin-right: ${theme.sizeUnit * 3}px;
+    .ant-input-affix-wrapper {
+      padding-left: ${theme.sizeUnit * 2}px;
     }
   `}
 `;
@@ -154,7 +155,7 @@ const InputIconAlignment = styled.div`
   display: flex;
   justify-content: center;
   align-items: center;
-  color: ${({ theme }) => theme.colors.grayscale.base};
+  color: ${({ theme }) => theme.colorIcon};
 `;
 
 const SelectorLabel = styled.button`
@@ -164,24 +165,25 @@ const SelectorLabel = styled.button`
     flex-direction: row;
     align-items: center;
     cursor: pointer;
-    margin: ${theme.gridUnit}px 0;
-    padding: 0 ${theme.gridUnit}px;
+    margin: ${theme.sizeUnit}px 0;
+    padding: 0 ${theme.sizeUnit}px;
     border-radius: ${theme.borderRadius}px;
     line-height: 2em;
     text-overflow: ellipsis;
     white-space: nowrap;
     position: relative;
+    color: ${theme.colorText};
 
     &:focus {
       outline: initial;
     }
 
     &.selected {
-      background-color: ${theme.colors.primary.base};
-      color: ${theme.colors.primary.light5};
+      background-color: ${theme.colorPrimary};
+      color: ${theme.colorTextLightSolid};
 
       svg {
-        color: ${theme.colors.primary.light5};
+        color: ${theme.colorTextLightSolid};
       }
 
       &:hover {
@@ -192,7 +194,7 @@ const SelectorLabel = styled.button`
     }
 
     & > span[role="img"] {
-      margin-right: ${theme.gridUnit * 2}px;
+      margin-right: ${theme.sizeUnit * 2}px;
     }
 
     .cancel {
@@ -206,23 +208,26 @@ const IconsPane = styled.div`
   display: grid;
   grid-template-columns: repeat(
     auto-fill,
-    ${({ theme }) => theme.gridUnit * THUMBNAIL_GRID_UNITS}px
+    ${({ theme }) => theme.sizeUnit * THUMBNAIL_GRID_UNITS}px
   );
   grid-auto-rows: max-content;
   justify-content: space-evenly;
-  grid-gap: ${({ theme }) => theme.gridUnit * 2}px;
+  grid-gap: ${({ theme }) => theme.sizeUnit * 2}px;
   justify-items: center;
-  // for some reason this padding doesn't seem to apply at the bottom of the container. Why is a mystery.
-  padding: ${({ theme }) => theme.gridUnit * 2}px;
+  /* top-align every tile so a longer chart name never pushes the thumbnails
+     of the other tiles in the same row upward */
+  align-items: start;
+  /* for some reason this padding doesn't seem to apply at the bottom of the container. Why is a mystery. */
+  padding: ${({ theme }) => theme.sizeUnit * 2}px;
 `;
 
 const DetailsPane = (theme: SupersetTheme) => css`
   grid-area: details;
-  border-top: 1px solid ${theme.colors.grayscale.light2};
+  border-top: 1px solid ${theme.colorBorder};
 `;
 
 const DetailsPopulated = (theme: SupersetTheme) => css`
-  padding: ${theme.gridUnit * 4}px;
+  padding: ${theme.sizeUnit * 4}px;
   display: grid;
   grid-template-columns: 1fr 1fr;
   grid-template-rows: auto auto 1fr;
@@ -236,15 +241,15 @@ const DetailsPopulated = (theme: SupersetTheme) => css`
 // (plus grid layout) enables the description to scroll while the header stays in place.
 const TagsWrapper = styled.div`
   grid-area: viz-tags;
-  width: ${({ theme }) => theme.gridUnit * 120}px;
-  padding-right: ${({ theme }) => theme.gridUnit * 14}px;
-  padding-bottom: ${({ theme }) => theme.gridUnit * 2}px;
+  width: ${({ theme }) => theme.sizeUnit * 120}px;
+  padding-right: ${({ theme }) => theme.sizeUnit * 14}px;
+  padding-bottom: ${({ theme }) => theme.sizeUnit * 2}px;
 `;
 
 const Description = styled.p`
   grid-area: description;
   overflow: auto;
-  padding-right: ${({ theme }) => theme.gridUnit * 14}px;
+  padding-right: ${({ theme }) => theme.sizeUnit * 14}px;
   margin: 0;
 `;
 
@@ -254,54 +259,71 @@ const Examples = styled.div`
   flex-direction: row;
   flex-wrap: nowrap;
   overflow: auto;
-  gap: ${({ theme }) => theme.gridUnit * 4}px;
+  gap: ${({ theme }) => theme.sizeUnit * 4}px;
 
   img {
     height: 100%;
-    border-radius: ${({ theme }) => theme.gridUnit}px;
-    border: 1px solid ${({ theme }) => theme.colors.grayscale.light2};
+    border-radius: ${({ theme }) => theme.borderRadius}px;
+    border: 1px solid ${({ theme }) => theme.colorBorder};
+    background-color: ${({ theme }) => theme.colorBgContainer};
   }
 `;
 
 const thumbnailContainerCss = (theme: SupersetTheme) => css`
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
   cursor: pointer;
-  width: ${theme.gridUnit * THUMBNAIL_GRID_UNITS}px;
-  position: relative;
+  width: ${theme.sizeUnit * THUMBNAIL_GRID_UNITS}px;
+  outline: none; /* Remove focus outline to show only selected state */
 
   img {
-    min-width: ${theme.gridUnit * THUMBNAIL_GRID_UNITS}px;
-    min-height: ${theme.gridUnit * THUMBNAIL_GRID_UNITS}px;
-    border: 1px solid ${theme.colors.grayscale.light2};
-    border-radius: ${theme.gridUnit}px;
-    transition: border-color ${theme.transitionTiming};
+    min-width: ${theme.sizeUnit * THUMBNAIL_GRID_UNITS}px;
+    min-height: ${theme.sizeUnit * THUMBNAIL_GRID_UNITS}px;
+    border: 1px solid ${theme.colorBorder};
+    border-radius: ${theme.borderRadius}px;
+    transition: border-color ${theme.motionDurationMid};
+    background-color: ${theme.colorBgContainer};
   }
 
   &.selected img {
-    border: 2px solid ${theme.colors.primary.light2};
+    border: 2px solid ${theme.colorPrimaryBorder};
   }
 
   &:hover:not(.selected) img {
-    border: 1px solid ${theme.colors.grayscale.light1};
+    border: 1px solid ${theme.colorBorder};
   }
 
   .viztype-label {
-    margin-top: ${theme.gridUnit * 2}px;
+    margin-top: ${theme.sizeUnit * 2}px;
     text-align: center;
+    /* reserve a fixed two-line block so every tile is the same height,
+       regardless of how long the chart name is. Longer names are clamped
+       with an ellipsis; the full name stays available via the title tooltip. */
+    line-height: ${theme.sizeUnit * 4}px;
+    height: ${theme.sizeUnit * 8}px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
   }
 `;
 
 const HighlightLabel = styled.div`
   ${({ theme }) => `
-    border: 1px solid ${theme.colors.primary.dark1};
+    border: 1px solid ${theme.colorPrimaryText};
     box-sizing: border-box;
-    border-radius: ${theme.gridUnit}px;
-    background: ${theme.colors.grayscale.light5};
-    line-height: ${theme.gridUnit * 2.5}px;
-    color: ${theme.colors.primary.dark1};
-    font-size: ${theme.typography.sizes.s}px;
-    font-weight: ${theme.typography.weights.bold};
+    border-radius: ${theme.borderRadius}px;
+    background: ${theme.colorBgContainer};
+    line-height: ${theme.sizeUnit * 2.5}px;
+    color: ${theme.colorPrimaryText};
+    font-size: ${theme.fontSizeSM}px;
+    font-weight: ${theme.fontWeightStrong};
     text-align: center;
-    padding: ${theme.gridUnit * 0.5}px ${theme.gridUnit}px;
+    padding: ${theme.sizeUnit * 0.5}px ${theme.sizeUnit}px;
     cursor: pointer;
 
     div {
@@ -310,15 +332,24 @@ const HighlightLabel = styled.div`
   `}
 `;
 
+// Wraps the thumbnail image so the "Featured" badge can be anchored to the
+// image itself rather than to the whole tile (whose height varies with the
+// chart-name length). line-height: 0 removes the inline-image descender gap.
+const ThumbnailImageWrapper = styled.div`
+  position: relative;
+  width: ${({ theme }) => theme.sizeUnit * THUMBNAIL_GRID_UNITS}px;
+  line-height: 0;
+`;
+
 const ThumbnailLabelWrapper = styled.div`
   position: absolute;
-  right: ${({ theme }) => theme.gridUnit}px;
-  top: ${({ theme }) => theme.gridUnit * 19}px;
+  right: ${({ theme }) => theme.sizeUnit}px;
+  bottom: ${({ theme }) => theme.sizeUnit}px;
 `;
 
 const TitleLabelWrapper = styled.div`
   display: inline-block !important;
-  margin-left: ${({ theme }) => theme.gridUnit * 2}px;
+  margin-left: ${({ theme }) => theme.sizeUnit * 2}px;
 `;
 
 interface ThumbnailProps {
@@ -335,41 +366,55 @@ const Thumbnail: FC<ThumbnailProps> = ({
   onDoubleClick,
 }) => {
   const theme = useTheme();
+  const isDarkMode = isThemeDark(theme);
   const { key, value: type } = entry;
   const isSelected = selectedViz === entry.key;
 
+  const handleFocus = () => {
+    // Auto-select chart when tabbed to
+    setSelectedViz(key);
+  };
+
   return (
-    <div
-      role="button"
+    <button
+      type="button"
       // using css instead of a styled component to preserve
       // the data-test attribute
       css={thumbnailContainerCss(theme)}
-      tabIndex={0}
       className={isSelected ? 'selected' : ''}
+      aria-pressed={isSelected}
       onClick={() => setSelectedViz(key)}
       onDoubleClick={onDoubleClick}
+      onFocus={handleFocus}
       data-test="viztype-selector-container"
     >
-      <img
-        alt={type.name}
-        width="100%"
-        className={`viztype-selector ${isSelected ? 'selected' : ''}`}
-        src={type.thumbnail}
-      />
+      <ThumbnailImageWrapper>
+        <img
+          alt={type.name}
+          width="100%"
+          className={`viztype-selector ${isSelected ? 'selected' : ''}`}
+          src={
+            isDarkMode && type.thumbnailDark
+              ? type.thumbnailDark
+              : type.thumbnail
+          }
+        />
+        {type.label && (
+          <ThumbnailLabelWrapper>
+            <HighlightLabel>
+              <div>{t(type.label)}</div>
+            </HighlightLabel>
+          </ThumbnailLabelWrapper>
+        )}
+      </ThumbnailImageWrapper>
       <div
         className="viztype-label"
         data-test={`${VIZ_TYPE_CONTROL_TEST_ID}__viztype-label`}
+        title={type.name}
       >
         {type.name}
       </div>
-      {type.label && (
-        <ThumbnailLabelWrapper>
-          <HighlightLabel>
-            <div>{t(type.label)}</div>
-          </HighlightLabel>
-        </ThumbnailLabelWrapper>
-      )}
-    </div>
+    </button>
   );
 };
 
@@ -418,14 +463,18 @@ const Selector: FC<{
 
   return (
     <SelectorLabel
+      aria-label={selector}
+      aria-selected={isSelected}
       ref={btnRef}
       key={selector}
       name={selector}
       className={cx(className, isSelected && 'selected')}
       onClick={() => onClick(selector, sectionId)}
+      tabIndex={0}
+      role="tab"
     >
       {icon}
-      {selector}
+      {t(selector)}
     </SelectorLabel>
   );
 };
@@ -436,6 +485,8 @@ const doesVizMatchSelector = (viz: ChartMetadata, selector: string) =>
   (viz.tags || []).indexOf(selector) > -1;
 
 export default function VizTypeGallery(props: VizTypeGalleryProps) {
+  const theme = useTheme();
+  const isDarkMode = isThemeDark(theme);
   const { selectedViz, onChange, onDoubleClick, className, denyList } = props;
   const { mountedPluginMetadata } = usePluginContext();
   const searchInputRef = useRef<HTMLInputElement>();
@@ -572,6 +623,13 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
     setIsSearchFocused(true);
   }, []);
 
+  // Auto-focus the search input when the modal opens
+  useEffect(() => {
+    if (searchInputRef.current) {
+      searchInputRef.current.focus();
+    }
+  }, []);
+
   const changeSearch: ChangeEventHandler<HTMLInputElement> = useCallback(
     event => setSearchInputValue(event.target.value),
     [],
@@ -618,7 +676,7 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
       },
       [Sections.Tags]: {
         title: t('Tags'),
-        icon: <Icons.Tags iconSize="m" />,
+        icon: <Icons.NumberOutlined iconSize="m" />,
         selectors: tags,
       },
     }),
@@ -656,12 +714,12 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
       className={className}
       isSelectedVizMetadata={Boolean(selectedVizMetadata)}
     >
-      <LeftPane>
+      <LeftPane aria-label={t('Choose chart type')} role="tablist">
         <Selector
-          css={({ gridUnit }) =>
+          css={({ sizeUnit }) =>
             // adjust style for not being inside a collapse
             css`
-              margin: ${gridUnit * 2}px;
+              margin: ${sizeUnit * 2}px;
               margin-bottom: 0;
             `
           }
@@ -676,10 +734,10 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
           onClick={clickSelector}
         />
         <Selector
-          css={({ gridUnit }) =>
+          css={({ sizeUnit }) =>
             // adjust style for not being inside a collapse
             css`
-              margin: ${gridUnit * 2}px;
+              margin: ${sizeUnit * 2}px;
               margin-bottom: 0;
             `
           }
@@ -693,37 +751,37 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
           }
           onClick={clickSelector}
         />
-        <AntdCollapse
-          expandIconPosition="right"
+        <Collapse
+          expandIconPosition="end"
           ghost
           defaultActiveKey={Sections.Category}
-        >
-          {Object.keys(sectionMap).map(sectionId => {
-            const section = sectionMap[sectionId];
+          items={Object.keys(sectionMap).map(sectionId => {
+            const section = sectionMap[sectionId as keyof typeof sectionMap];
 
-            return (
-              <AntdCollapse.Panel
-                header={<span className="header">{section.title}</span>}
-                key={sectionId}
-              >
-                {section.selectors.map((selector: string) => (
-                  <Selector
-                    key={selector}
-                    selector={selector}
-                    sectionId={sectionId}
-                    icon={section.icon}
-                    isSelected={
-                      !isActivelySearching &&
-                      selector === activeSelector &&
-                      sectionId === activeSection
-                    }
-                    onClick={clickSelector}
-                  />
-                ))}
-              </AntdCollapse.Panel>
-            );
+            return {
+              key: sectionId,
+              label: <span className="header">{section.title}</span>,
+              children: (
+                <>
+                  {section.selectors.map((selector: string) => (
+                    <Selector
+                      key={selector}
+                      selector={selector}
+                      sectionId={sectionId}
+                      icon={section.icon}
+                      isSelected={
+                        !isActivelySearching &&
+                        selector === activeSelector &&
+                        sectionId === activeSection
+                      }
+                      onClick={clickSelector}
+                    />
+                  ))}
+                </>
+              ),
+            };
           })}
-        </AntdCollapse>
+        />
       </LeftPane>
 
       <SearchWrapper>
@@ -737,13 +795,17 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
           data-test={`${VIZ_TYPE_CONTROL_TEST_ID}__search-input`}
           prefix={
             <InputIconAlignment>
-              <Icons.Search iconSize="m" />
+              <Icons.SearchOutlined iconSize="m" />
             </InputIconAlignment>
           }
           suffix={
             <InputIconAlignment>
               {searchInputValue && (
-                <Icons.XLarge iconSize="m" onClick={stopSearching} />
+                <Icons.CloseOutlined
+                  iconSize="m"
+                  onClick={stopSearching}
+                  aria-label={t('Clear search')}
+                />
               )}
             </InputIconAlignment>
           }
@@ -793,12 +855,20 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
             </SectionTitle>
             <TagsWrapper>
               {selectedVizMetadata?.tags.map(tag => (
-                <Label key={tag}>{tag}</Label>
+                <Label
+                  key={tag}
+                  css={({ sizeUnit }) => css`
+                    margin-bottom: ${sizeUnit * 2}px;
+                  `}
+                >
+                  {tag}
+                </Label>
               ))}
             </TagsWrapper>
             <Description>
-              {selectedVizMetadata?.description ||
-                t('No description available.')}
+              {t(
+                selectedVizMetadata?.description || 'No description available.',
+              )}
             </Description>
             <SectionTitle
               css={css`
@@ -819,7 +889,11 @@ export default function VizTypeGallery(props: VizTypeGalleryProps) {
               ).map(example => (
                 <img
                   key={example.url}
-                  src={example.url}
+                  src={
+                    isDarkMode && example.urlDark
+                      ? example.urlDark
+                      : example.url
+                  }
                   alt={example.caption}
                   title={example.caption}
                 />

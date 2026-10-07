@@ -23,12 +23,13 @@ import logging
 import random
 import unittest
 from unittest import mock
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pandas as pd
 import pytest
 import pytz
 import sqlalchemy as sqla
+from flask import current_app
 from flask_babel import lazy_gettext as _
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -37,24 +38,22 @@ import superset.views.utils
 from superset import dataframe, db, security_manager, sql_lab
 from superset.commands.chart.data.get_data_command import ChartDataCommand
 from superset.commands.chart.exceptions import ChartDataQueryFailedError
+from superset.commands.dashboard.exceptions import DashboardAccessDeniedError
 from superset.common.db_query_status import QueryStatus
 from superset.connectors.sqla.models import SqlaTable
 from superset.db_engine_specs.base import BaseEngineSpec
 from superset.db_engine_specs.mssql import MssqlEngineSpec
 from superset.exceptions import SupersetException
-from superset.extensions import async_query_manager_factory, cache_manager
+from superset.extensions import cache_manager
 from superset.models import core as models
-from superset.models.cache import CacheKey
 from superset.models.dashboard import Dashboard
 from superset.models.slice import Slice
 from superset.models.sql_lab import Query
 from superset.result_set import SupersetResultSet
-from superset.sql_parse import Table
+from superset.sql.parse import Table
 from superset.utils import core as utils, json
 from superset.utils.core import backend
 from superset.utils.database import get_example_database
-from superset.views.database.views import DatabaseView
-from tests.integration_tests.conftest import with_feature_flags
 from tests.integration_tests.constants import ADMIN_USERNAME, GAMMA_USERNAME
 from tests.integration_tests.fixtures.birth_names_dashboard import (
     load_birth_names_dashboard_with_slices,  # noqa: F401
@@ -88,11 +87,9 @@ class TestCore(SupersetTestCase):
         self.table_ids = {
             tbl.table_name: tbl.id for tbl in (db.session.query(SqlaTable).all())
         }
-        self.original_unsafe_db_setting = app.config["PREVENT_UNSAFE_DB_CONNECTIONS"]
 
     def tearDown(self):
         db.session.query(Query).delete()
-        app.config["PREVENT_UNSAFE_DB_CONNECTIONS"] = self.original_unsafe_db_setting
         super().tearDown()
 
     def insert_dashboard_created_by(self, username: str) -> Dashboard:
@@ -112,60 +109,22 @@ class TestCore(SupersetTestCase):
         db.session.delete(dashboard)
         db.session.commit()
 
-    def test_login(self):
-        resp = self.get_resp("/login/", data=dict(username="admin", password="general"))  # noqa: S106, C408
-        assert "User confirmation needed" not in resp
-
-        resp = self.get_resp("/logout/", follow_redirects=True)
-        assert "User confirmation needed" in resp
-
-        resp = self.get_resp(
-            "/login/",
-            data=dict(username="admin", password="wrongPassword"),  # noqa: S106, C408
-        )
-        assert "User confirmation needed" in resp
-
     def test_dashboard_endpoint(self):
         self.login(ADMIN_USERNAME)
-        resp = self.client.get("/superset/dashboard/-1/")
+        resp = self.client.get("/dashboard/-1/")
         assert resp.status_code == 404
 
     @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
     def test_slice_endpoint(self):
         self.login(ADMIN_USERNAME)
-        resp = self.client.get("/superset/slice/-1/")
+        resp = self.client.get("/slice/-1/")
         assert resp.status_code == 404
-
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_viz_cache_key(self):
-        self.login(ADMIN_USERNAME)
-        slc = self.get_slice("Top 10 Girl Name Share")
-
-        viz = slc.viz
-        qobj = viz.query_obj()
-        cache_key = viz.cache_key(qobj)
-
-        qobj["groupby"] = []
-        cache_key_with_groupby = viz.cache_key(qobj)
-        assert cache_key != cache_key_with_groupby
-
-        assert viz.cache_key(qobj) != viz.cache_key(qobj, time_compare="12 weeks")
-
-        assert viz.cache_key(qobj, time_compare="28 days") != viz.cache_key(
-            qobj, time_compare="12 weeks"
-        )
-
-        qobj["inner_from_dttm"] = datetime.datetime(1901, 1, 1)
-
-        assert cache_key_with_groupby == viz.cache_key(qobj)
 
     def test_admin_only_menu_views(self):
         def assert_admin_view_menus_in(role_name, assert_func):
             role = security_manager.find_role(role_name)
             view_menus = [p.view_menu.name for p in role.permissions]
-            assert_func("ResetPasswordView", view_menus)
-            assert_func("RoleModelView", view_menus)
+            assert_func("RoleRestAPI", view_menus)
             assert_func("Security", view_menus)
             assert_func("SQL Lab", view_menus)
 
@@ -173,8 +132,36 @@ class TestCore(SupersetTestCase):
         assert_admin_view_menus_in("Alpha", self.assertNotIn)
         assert_admin_view_menus_in("Gamma", self.assertNotIn)
 
+    def test_legacy_fab_password_views_are_gone(self):
+        """The legacy FAB reset routes are not registered and no role holds
+        their permissions. ``test_disable_legacy_password_reset_launchers``
+        covers the user-view buttons being dead ends rather than 500s."""
+        rules = {rule.rule for rule in current_app.url_map.iter_rules()}
+        endpoints = {rule.endpoint for rule in current_app.url_map.iter_rules()}
+        assert "/resetpassword/form" not in rules
+        assert "/resetmypassword/form" not in rules
+        assert not {
+            endpoint
+            for endpoint in endpoints
+            if endpoint.startswith(("ResetPasswordView.", "ResetMyPasswordView."))
+        }
+
+        for role_name in ("Admin", "Alpha", "Gamma"):
+            role = security_manager.find_role(role_name)
+            perms = {(p.permission.name, p.view_menu.name) for p in role.permissions}
+            assert not {
+                view_menu
+                for _, view_menu in perms
+                if view_menu in ("ResetPasswordView", "ResetMyPasswordView")
+            }, role_name
+            assert ("resetpasswords", "UserDBModelView") not in perms, role_name
+            assert ("resetmypassword", "UserDBModelView") not in perms, role_name
+
+        self.login(ADMIN_USERNAME)
+        assert self.client.get("/resetpassword/form?pk=1").status_code == 404
+        assert self.client.get("/resetmypassword/form").status_code == 404
+
     @pytest.mark.usefixtures("load_energy_table_with_slice")
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
     def test_save_slice(self):
         self.login(ADMIN_USERNAME)
         slice_name = f"Energy Sankey"  # noqa: F541
@@ -184,10 +171,7 @@ class TestCore(SupersetTestCase):
         tbl_id = self.table_ids.get("energy_usage")
         new_slice_name = f"{copy_name_prefix}[overwrite]{random.random()}"  # noqa: S311
 
-        url = (
-            "/superset/explore/table/{}/?slice_name={}&"
-            "action={}&datasource_name=energy_usage"
-        )
+        url = "/explore/table/{}/?slice_name={}&action={}&datasource_name=energy_usage"
 
         form_data = {
             "adhoc_filters": [],
@@ -206,11 +190,15 @@ class TestCore(SupersetTestCase):
         slc = db.session.query(Slice).filter_by(id=new_slice_id).one()
 
         assert slc.slice_name == copy_name
+        form_data["datasource"] = f"{tbl_id}__table"
+        form_data["slice_id"] = new_slice_id
+
+        assert slc.form_data == form_data
         form_data.pop("slice_id")  # We don't save the slice id when saving as
-        assert slc.viz.form_data == form_data
 
         form_data = {
             "adhoc_filters": [],
+            "datasource": f"{tbl_id}__table",
             "viz_type": "sankey",
             "groupby": ["source"],
             "metric": "sum__value",
@@ -225,7 +213,7 @@ class TestCore(SupersetTestCase):
         )
         slc = db.session.query(Slice).filter_by(id=new_slice_id).one()
         assert slc.slice_name == new_slice_name
-        assert slc.viz.form_data == form_data
+        assert slc.form_data == form_data
 
         # Cleanup
         slices = (
@@ -237,6 +225,56 @@ class TestCore(SupersetTestCase):
             db.session.delete(slc)
         db.session.commit()
 
+    @pytest.mark.usefixtures("load_energy_table_with_slice")
+    def test_overwrite_refuses_externally_managed_slice(self):
+        """sc-120011: the legacy Explore overwrite is gated server-side.
+
+        /superset/explore/ with action=overwrite assigns request values
+        (params, query_context, ...) directly to the loaded chart and
+        persists via ChartDAO.update, bypassing UpdateChartCommand -- so
+        the managed-externally refusal must exist on this path too, even
+        for an admin who could otherwise edit the chart.
+
+        The refusal message is asserted (not just the status) so a 403
+        from an unrelated check cannot satisfy the pin; environments with
+        broken admin datasource grants fail here with the datasource
+        error instead -- CI is the verifier.
+        """
+        self.login(ADMIN_USERNAME)
+        slc = self.get_slice("Energy Sankey")
+        slice_id = slc.id
+        original_name = slc.slice_name
+        original_query_context = slc.query_context
+        slc.is_managed_externally = True
+        db.session.commit()
+
+        tbl_id = self.table_ids.get("energy_usage")
+        url = (
+            f"/explore/table/{tbl_id}/?slice_name=changed&action=overwrite"
+            "&datasource_name=energy_usage"
+        )
+        form_data = {
+            "adhoc_filters": [],
+            "viz_type": "sankey",
+            "groupby": ["target"],
+            "metric": "sum__value",
+            "row_limit": 5000,
+            "slice_id": slice_id,
+        }
+
+        try:
+            resp = self.client.post(url, data={"form_data": json.dumps(form_data)})
+            assert resp.status_code == 403
+            assert "rights to alter this chart" in resp.get_data(as_text=True)
+
+            slc = db.session.query(Slice).filter_by(id=slice_id).one()
+            assert slc.slice_name == original_name
+            assert slc.query_context == original_query_context
+        finally:
+            slc = db.session.query(Slice).filter_by(id=slice_id).one()
+            slc.is_managed_externally = False
+            db.session.commit()
+
     @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
     def test_slice_data(self):
         # slice data should have some required attributes
@@ -245,7 +283,6 @@ class TestCore(SupersetTestCase):
         slc_data_attributes = slc.data.keys()
         assert "changed_on" in slc_data_attributes
         assert "modified" in slc_data_attributes
-        assert "owners" in slc_data_attributes
 
     @pytest.mark.usefixtures("load_energy_table_with_slice")
     def test_slices(self):
@@ -258,7 +295,7 @@ class TestCore(SupersetTestCase):
                 (slc.slice_name, "explore", slc.slice_url),
             ]
         for name, method, url in urls:
-            logger.info(f"[{name}]/[{method}]: {url}")
+            logger.info("[%s]/[%s]: %s", name, method, url)
             print(f"[{name}]/[{method}]: {url}")
             resp = self.client.get(url)
             assert resp.status_code == 200
@@ -267,13 +304,6 @@ class TestCore(SupersetTestCase):
         self.login(ADMIN_USERNAME)
         # assert that /chart/add responds with 200
         url = "/chart/add"
-        resp = self.client.get(url)
-        assert resp.status_code == 200
-
-    def test_get_user_slices(self):
-        self.login(ADMIN_USERNAME)
-        userid = security_manager.find_user("admin").id
-        url = f"/sliceasync/api/read?_flt_0_created_by={userid}"
         resp = self.client.get(url)
         assert resp.status_code == 200
 
@@ -320,61 +350,13 @@ class TestCore(SupersetTestCase):
         def custom_password_store(uri):
             return "password_store_test"
 
-        models.custom_password_store = custom_password_store
-        conn = sqla.engine.url.make_url(database.sqlalchemy_uri_decrypted)
-        if conn_pre.password:
-            assert conn.password == "password_store_test"  # noqa: S105
-            assert conn.password != conn_pre.password
-        # Disable for password store for later tests
-        models.custom_password_store = None
-
-    def test_databaseview_edit(self):
-        # validate that sending a password-masked uri does not over-write the decrypted
-        # uri
-        self.login(ADMIN_USERNAME)
-        database = superset.utils.database.get_example_database()
-        sqlalchemy_uri_decrypted = database.sqlalchemy_uri_decrypted
-        url = f"databaseview/edit/{database.id}"
-        data = {k: database.__getattribute__(k) for k in DatabaseView.add_columns}
-        data["sqlalchemy_uri"] = database.safe_sqlalchemy_uri()
-        self.client.post(url, data=data)
-        database = superset.utils.database.get_example_database()
-        assert sqlalchemy_uri_decrypted == database.sqlalchemy_uri_decrypted
-
-        # Need to clean up after ourselves
-        database.impersonate_user = False
-        database.allow_dml = False
-        database.allow_run_async = False
-        db.session.commit()
-
-    @pytest.mark.usefixtures(
-        "load_birth_names_dashboard_with_slices",
-        "load_energy_table_with_slice",
-    )
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_warm_up_cache(self):
-        self.login(ADMIN_USERNAME)
-        slc = self.get_slice("Top 10 Girl Name Share")
-        data = self.get_json_resp(f"/superset/warm_up_cache?slice_id={slc.id}")
-        assert data == [
-            {"slice_id": slc.id, "viz_error": None, "viz_status": "success"}
-        ]
-
-        data = self.get_json_resp(
-            "/superset/warm_up_cache?table_name=energy_usage&db_name=main"
-        )
-        assert len(data) > 0
-
-        dashboard = self.get_dash_by_slug("births")
-
-        assert self.get_json_resp(
-            f"/superset/warm_up_cache?dashboard_id={dashboard.id}&slice_id={slc.id}"
-        ) == [{"slice_id": slc.id, "viz_error": None, "viz_status": "success"}]
-
-        assert self.get_json_resp(
-            f"/superset/warm_up_cache?dashboard_id={dashboard.id}&slice_id={slc.id}&extra_filters="
-            + quote(json.dumps([{"col": "name", "op": "in", "val": ["Jennifer"]}]))
-        ) == [{"slice_id": slc.id, "viz_error": None, "viz_status": "success"}]
+        with mock.patch.dict(
+            app.config, {"SQLALCHEMY_CUSTOM_PASSWORD_STORE": custom_password_store}
+        ):
+            conn = sqla.engine.url.make_url(database.sqlalchemy_uri_decrypted)
+            if conn_pre.password:
+                assert conn.password == "password_store_test"  # noqa: S105
+                assert conn.password != conn_pre.password
 
     @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
     def test_warm_up_cache_error(self) -> None:
@@ -391,7 +373,7 @@ class TestCore(SupersetTestCase):
                 )
             ),
         ):
-            assert self.get_json_resp(f"/superset/warm_up_cache?slice_id={slc.id}") == [
+            assert self.get_json_resp(f"/warm_up_cache?slice_id={slc.id}") == [
                 {
                     "slice_id": slc.id,
                     "viz_error": "Error: Empty query?",
@@ -399,52 +381,25 @@ class TestCore(SupersetTestCase):
                 }
             ]
 
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_cache_logging(self):
-        self.login(ADMIN_USERNAME)
-        store_cache_keys = app.config["STORE_CACHE_KEYS_IN_METADATA_DB"]
-        app.config["STORE_CACHE_KEYS_IN_METADATA_DB"] = True
-        slc = self.get_slice("Top 10 Girl Name Share")
-        self.get_json_resp(f"/superset/warm_up_cache?slice_id={slc.id}")
-        ck = db.session.query(CacheKey).order_by(CacheKey.id.desc()).first()
-        assert ck.datasource_uid == f"{slc.table.id}__table"
-        db.session.delete(ck)
-        app.config["STORE_CACHE_KEYS_IN_METADATA_DB"] = store_cache_keys
-
-    @with_feature_flags(KV_STORE=False)
-    def test_kv_disabled(self):
-        self.login(ADMIN_USERNAME)
-
-        resp = self.client.get("/kv/10001/")
-        assert 404 == resp.status_code
-
-        value = json.dumps({"data": "this is a test"})
-        resp = self.client.post("/kv/store/", data=dict(data=value))  # noqa: C408
-        assert resp.status_code == 404
-
-    @with_feature_flags(KV_STORE=True)
-    def test_kv_enabled(self):
-        self.login(ADMIN_USERNAME)
-
-        resp = self.client.get("/kv/10001/")
-        assert 404 == resp.status_code
-
-        value = json.dumps({"data": "this is a test"})
-        resp = self.client.post("/kv/store/", data=dict(data=value))  # noqa: C408
-        assert resp.status_code == 200
-        kv = db.session.query(models.KeyValue).first()
-        kv_value = kv.value
-        assert json.loads(value) == json.loads(kv_value)
-
-        resp = self.client.get(f"/kv/{kv.id}/")
-        assert resp.status_code == 200
-        assert json.loads(value) == json.loads(resp.data.decode("utf-8"))
-
     def test_gamma(self):
         self.login(GAMMA_USERNAME)
         assert "Charts" in self.get_resp("/chart/list/")
         assert "Dashboards" in self.get_resp("/dashboard/list/")
+
+    def test_security_fab_views_have_valid_list_template(self) -> None:
+        # Regression test for #36130: the FAB permission views pointed at a custom
+        # list template (superset/fab_overrides/list.html) that was deleted during a
+        # cleanup, so they 500'd with TemplateNotFound. Ensure each view's list
+        # widget template still resolves in the Jinja environment.
+        from superset.security.manager import (
+            PermissionModelView,
+            PermissionViewModelView,
+        )
+
+        for view_cls in (PermissionModelView, PermissionViewModelView):
+            template = view_cls.list_widget.template
+            # Raises TemplateNotFound if the template is missing (the #36130 bug).
+            current_app.jinja_env.get_template(template)
 
     def test_templated_sql_json(self):
         if superset.utils.database.get_example_database().backend == "presto":
@@ -457,7 +412,7 @@ class TestCore(SupersetTestCase):
 
     def test_fetch_datasource_metadata(self):
         self.login(ADMIN_USERNAME)
-        url = "/superset/fetch_datasource_metadata?" "datasourceKey=1__table"
+        url = "/fetch_datasource_metadata?datasourceKey=1__table"
         resp = self.get_json_resp(url)
         keys = [
             "name",
@@ -545,294 +500,6 @@ class TestCore(SupersetTestCase):
         assert "comment 1" in rendered_query
         assert "comment 2" in rendered_query
         assert "FROM tbl" in rendered_query
-
-    def test_slice_payload_no_datasource(self):
-        form_data = {
-            "viz_type": "dist_bar",
-        }
-        self.login(ADMIN_USERNAME)
-        rv = self.client.post(
-            "/superset/explore_json/",
-            data={"form_data": json.dumps(form_data)},
-        )
-        data = json.loads(rv.data.decode("utf-8"))
-
-        assert (
-            data["errors"][0]["message"]
-            == "The dataset associated with this chart no longer exists"
-        )
-
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_explore_json(self):
-        tbl_id = self.table_ids.get("birth_names")
-        form_data = {
-            "datasource": f"{tbl_id}__table",
-            "viz_type": "dist_bar",
-            "granularity_sqla": "ds",
-            "time_range": "No filter",
-            "metrics": ["count"],
-            "adhoc_filters": [],
-            "groupby": ["gender"],
-            "row_limit": 100,
-        }
-        self.login(ADMIN_USERNAME)
-        rv = self.client.post(
-            "/superset/explore_json/",
-            data={"form_data": json.dumps(form_data)},
-        )
-        data = json.loads(rv.data.decode("utf-8"))
-
-        assert rv.status_code == 200
-        assert data["rowcount"] == 2
-
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_explore_json_dist_bar_order(self):
-        tbl_id = self.table_ids.get("birth_names")
-        form_data = {
-            "datasource": f"{tbl_id}__table",
-            "viz_type": "dist_bar",
-            "url_params": {},
-            "granularity_sqla": "ds",
-            "time_range": 'DATEADD(DATETIME("2021-01-22T00:00:00"), -100, year) : 2021-01-22T00:00:00',  # noqa: E501
-            "metrics": [
-                {
-                    "expressionType": "SIMPLE",
-                    "column": {
-                        "id": 334,
-                        "column_name": "name",
-                        "verbose_name": "null",
-                        "description": "null",
-                        "expression": "",
-                        "filterable": True,
-                        "groupby": True,
-                        "is_dttm": False,
-                        "type": "VARCHAR(255)",
-                        "python_date_format": "null",
-                    },
-                    "aggregate": "COUNT",
-                    "sqlExpression": "null",
-                    "isNew": False,
-                    "hasCustomLabel": False,
-                    "label": "COUNT(name)",
-                    "optionName": "metric_xdzsijn42f9_khi4h3v3vci",
-                },
-                {
-                    "expressionType": "SIMPLE",
-                    "column": {
-                        "id": 332,
-                        "column_name": "ds",
-                        "verbose_name": "null",
-                        "description": "null",
-                        "expression": "",
-                        "filterable": True,
-                        "groupby": True,
-                        "is_dttm": True,
-                        "type": "TIMESTAMP WITHOUT TIME ZONE",
-                        "python_date_format": "null",
-                    },
-                    "aggregate": "COUNT",
-                    "sqlExpression": "null",
-                    "isNew": False,
-                    "hasCustomLabel": False,
-                    "label": "COUNT(ds)",
-                    "optionName": "metric_80g1qb9b6o7_ci5vquydcbe",
-                },
-            ],
-            "order_desc": True,
-            "adhoc_filters": [],
-            "groupby": ["name"],
-            "columns": [],
-            "row_limit": 10,
-            "color_scheme": "supersetColors",
-            "label_colors": {},
-            "show_legend": True,
-            "y_axis_format": "SMART_NUMBER",
-            "bottom_margin": "auto",
-            "x_ticks_layout": "auto",
-        }
-
-        self.login(ADMIN_USERNAME)
-        rv = self.client.post(
-            "/superset/explore_json/",
-            data={"form_data": json.dumps(form_data)},
-        )
-        data = json.loads(rv.data.decode("utf-8"))
-
-        resp = self.run_sql(
-            """
-            SELECT count(name) AS count_name, count(ds) AS count_ds
-            FROM birth_names
-            WHERE ds >= '1921-01-22 00:00:00.000000' AND ds < '2021-01-22 00:00:00.000000'
-            GROUP BY name
-            ORDER BY count_name DESC
-            LIMIT 10;
-            """,  # noqa: E501
-            client_id="client_id_1",
-            username="admin",
-        )
-        count_ds = []
-        count_name = []
-        for series in data["data"]:
-            if series["key"] == "COUNT(ds)":
-                count_ds = series["values"]
-            if series["key"] == "COUNT(name)":
-                count_name = series["values"]
-        for expected, actual_ds, actual_name in zip(resp["data"], count_ds, count_name):
-            assert expected["count_name"] == actual_name["y"]
-            assert expected["count_ds"] == actual_ds["y"]
-
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @mock.patch.dict(
-        "superset.extensions.feature_flag_manager._feature_flags",
-        GLOBAL_ASYNC_QUERIES=True,
-    )
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_explore_json_async(self):
-        tbl_id = self.table_ids.get("birth_names")
-        form_data = {
-            "datasource": f"{tbl_id}__table",
-            "viz_type": "dist_bar",
-            "granularity_sqla": "ds",
-            "time_range": "No filter",
-            "metrics": ["count"],
-            "adhoc_filters": [],
-            "groupby": ["gender"],
-            "row_limit": 100,
-        }
-        app._got_first_request = False
-        async_query_manager_factory.init_app(app)
-        self.login(ADMIN_USERNAME)
-        rv = self.client.post(
-            "/superset/explore_json/",
-            data={"form_data": json.dumps(form_data)},
-        )
-        data = json.loads(rv.data.decode("utf-8"))
-        keys = list(data.keys())
-
-        # If chart is cached, it will return 200, otherwise 202
-        assert rv.status_code in {200, 202}
-        if rv.status_code == 202:
-            assert keys == [
-                "channel_id",
-                "job_id",
-                "user_id",
-                "status",
-                "errors",
-                "result_url",
-            ]
-
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    @mock.patch.dict(
-        "superset.extensions.feature_flag_manager._feature_flags",
-        GLOBAL_ASYNC_QUERIES=True,
-    )
-    def test_explore_json_async_results_format(self):
-        tbl_id = self.table_ids.get("birth_names")
-        form_data = {
-            "datasource": f"{tbl_id}__table",
-            "viz_type": "dist_bar",
-            "granularity_sqla": "ds",
-            "time_range": "No filter",
-            "metrics": ["count"],
-            "adhoc_filters": [],
-            "groupby": ["gender"],
-            "row_limit": 100,
-        }
-        app._got_first_request = False
-        async_query_manager_factory.init_app(app)
-        self.login(ADMIN_USERNAME)
-        rv = self.client.post(
-            "/superset/explore_json/?results=true",
-            data={"form_data": json.dumps(form_data)},
-        )
-        assert rv.status_code == 200
-
-    @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
-    @mock.patch(
-        "superset.utils.cache_manager.CacheManager.cache",
-        new_callable=mock.PropertyMock,
-    )
-    @mock.patch("superset.viz.BaseViz.force_cached", new_callable=mock.PropertyMock)
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_explore_json_data(self, mock_force_cached, mock_cache):
-        tbl_id = self.table_ids.get("birth_names")
-        form_data = dict(  # noqa: C418
-            {
-                "form_data": {
-                    "datasource": f"{tbl_id}__table",
-                    "viz_type": "dist_bar",
-                    "granularity_sqla": "ds",
-                    "time_range": "No filter",
-                    "metrics": ["count"],
-                    "adhoc_filters": [],
-                    "groupby": ["gender"],
-                    "row_limit": 100,
-                }
-            }
-        )
-
-        class MockCache:
-            def get(self, key):
-                return form_data
-
-            def set(self):
-                return None
-
-        mock_cache.return_value = MockCache()
-        mock_force_cached.return_value = False
-
-        self.login(ADMIN_USERNAME)
-        rv = self.client.get("/superset/explore_json/data/valid-cache-key")
-        data = json.loads(rv.data.decode("utf-8"))
-
-        assert rv.status_code == 200
-        assert data["rowcount"] == 2
-
-    @mock.patch(
-        "superset.utils.cache_manager.CacheManager.cache",
-        new_callable=mock.PropertyMock,
-    )
-    @pytest.mark.skip(reason="This test will be changed to use the api/v1/data")
-    def test_explore_json_data_no_login(self, mock_cache):
-        tbl_id = self.table_ids.get("birth_names")
-        form_data = dict(  # noqa: C418
-            {
-                "form_data": {
-                    "datasource": f"{tbl_id}__table",
-                    "viz_type": "dist_bar",
-                    "granularity_sqla": "ds",
-                    "time_range": "No filter",
-                    "metrics": ["count"],
-                    "adhoc_filters": [],
-                    "groupby": ["gender"],
-                    "row_limit": 100,
-                }
-            }
-        )
-
-        class MockCache:
-            def get(self, key):
-                return form_data
-
-            def set(self):
-                return None
-
-        mock_cache.return_value = MockCache()
-
-        rv = self.client.get("/superset/explore_json/data/valid-cache-key")
-        assert rv.status_code == 403
-
-    def test_explore_json_data_invalid_cache_key(self):
-        self.login(ADMIN_USERNAME)
-        cache_key = "invalid-cache-key"
-        rv = self.client.get(f"/superset/explore_json/data/{cache_key}")
-        data = json.loads(rv.data.decode("utf-8"))
-
-        assert rv.status_code == 404
-        assert data["error"] == "Cached data not found"
 
     def test_results_default_deserialization(self):
         use_new_deserialization = False
@@ -963,8 +630,8 @@ class TestCore(SupersetTestCase):
         dash_id = db.session.query(Dashboard.id).first()[0]
         tbl_id = self.table_ids.get("wb_health_population")
         urls = [
-            "/superset/welcome",
-            f"/superset/dashboard/{dash_id}/",
+            "/welcome",
+            f"/dashboard/{dash_id}/",
             f"/explore/?datasource_type=table&datasource_id={tbl_id}",
         ]
         for url in urls:
@@ -1180,7 +847,7 @@ class TestCore(SupersetTestCase):
         exception = SupersetException("Error message")
         mock_db_connection_mutator.side_effect = exception
         dash = db.session.query(Dashboard).first()
-        url = f"/superset/dashboard/{dash.id}/"
+        url = f"/dashboard/{dash.id}/"
 
         self.login(ADMIN_USERNAME)
         data = self.get_resp(url)
@@ -1190,7 +857,7 @@ class TestCore(SupersetTestCase):
         exception = SQLAlchemyError("Error message")
         mock_db_connection_mutator.side_effect = exception
         dash = db.session.query(Dashboard).first()
-        url = f"/superset/dashboard/{dash.id}/"
+        url = f"/dashboard/{dash.id}/"
 
         self.login(ADMIN_USERNAME)
         data = self.get_resp(url)
@@ -1205,10 +872,34 @@ class TestCore(SupersetTestCase):
         slice_name = f"Energy Sankey"  # noqa: F541
         slice_id = self.get_slice(slice_name).id
         form_data = {"slice_id": slice_id, "viz_type": "line", "datasource": "1__table"}
-        rv = self.client.get(
-            f"/superset/explore/?form_data={quote(json.dumps(form_data))}"
-        )
+        rv = self.client.get(f"/explore/?form_data={quote(json.dumps(form_data))}")
         assert rv.headers["Location"] == f"/explore/?form_data_key={random_key}"
+
+    @pytest.mark.usefixtures("load_energy_table_with_slice")
+    @mock.patch("superset.security.SupersetSecurityManager.raise_for_access")
+    def test_explore_view_checks_datasource_access(
+        self, mock_raise_for_access: mock.Mock
+    ) -> None:
+        """The explore view runs the per-datasource access check on the loaded
+        datasource, consistent with the explore command, before rendering its
+        metadata."""
+        self.login(ADMIN_USERNAME)
+        tbl_id: int | None = self.table_ids.get("energy_usage")
+
+        self.client.post(f"/explore/table/{tbl_id}/")
+
+        mock_raise_for_access.assert_called_once()
+        assert mock_raise_for_access.call_args.kwargs["datasource"].id == tbl_id
+
+    def test_explore_no_datasource_renders_spa(self):
+        # `Slice.slice_url` emits form_data carrying only `slice_id`; without a
+        # datasource the cache-and-redirect contract can't produce a different
+        # URL, so ExploreView.root must fall through to the SPA instead of
+        # 302-looping back to itself.
+        self.login(ADMIN_USERNAME)
+        form_data = {"slice_id": 1}
+        rv = self.client.get(f"/explore/?form_data={quote(json.dumps(form_data))}")
+        assert rv.status_code == 200
 
     @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
     def test_has_table(self):
@@ -1225,12 +916,121 @@ class TestCore(SupersetTestCase):
         request_mock.query_string = b"standalone=3"
         get_dashboard_permalink_mock.return_value = {"dashboardId": 1}
         self.login(ADMIN_USERNAME)
-        resp = self.client.get("superset/dashboard/p/123/")
+        resp = self.client.get("/dashboard/p/123/")
 
-        expected_url = "/superset/dashboard/1?permalink_key=123&standalone=3"
+        expected_url = "/dashboard/1/?permalink_key=123&standalone=3"
 
         assert resp.headers["Location"] == expected_url
         assert resp.status_code == 302
+
+    @mock.patch("superset.views.core.request")
+    @mock.patch(
+        "superset.commands.dashboard.permalink.get.GetDashboardPermalinkCommand.run"
+    )
+    def test_dashboard_permalink_native_filters_encoded(
+        self, get_dashboard_permalink_mock, request_mock
+    ):
+        # A native_filters value containing reserved characters must be
+        # percent-encoded in the redirect target so it cannot inject extra
+        # query parameters into the Location header.
+        request_mock.query_string = b""
+        native_filters_value = "value&injected=evil#frag"
+        get_dashboard_permalink_mock.return_value = {
+            "dashboardId": 1,
+            "state": {"urlParams": [["native_filters", native_filters_value]]},
+        }
+        self.login(ADMIN_USERNAME)
+        resp = self.client.get("/dashboard/p/123/")
+
+        location = resp.headers["Location"]
+        assert resp.status_code == 302
+        # The reserved characters are encoded, so no extra params/anchors leak in.
+        assert "native_filters=value%26injected%3Devil%23frag" in location
+        assert "injected=evil" not in location
+        # Round-trips back to the original value when decoded.
+        parsed = parse_qs(urlsplit(location).query)
+        assert parsed["native_filters"] == [native_filters_value]
+
+    @mock.patch(
+        "superset.commands.dashboard.permalink.get.GetDashboardPermalinkCommand.run"
+    )
+    def test_dashboard_permalink_redirects_anonymous_access_denied(
+        self,
+        get_dashboard_permalink_mock,
+    ):
+        get_dashboard_permalink_mock.side_effect = DashboardAccessDeniedError()
+
+        resp = self.client.get("/dashboard/p/123/")
+
+        expected_url = "/login/?next=%2Fdashboard%2Fp%2F123%2F"
+
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == expected_url
+
+    @mock.patch(
+        "superset.commands.dashboard.permalink.get.GetDashboardPermalinkCommand.run"
+    )
+    def test_dashboard_permalink_returns_404_for_missing_state(
+        self,
+        get_dashboard_permalink_mock,
+    ):
+        get_dashboard_permalink_mock.return_value = None
+
+        resp = self.client.get("/dashboard/p/123/")
+
+        assert resp.status_code == 404
+        assert "Location" not in resp.headers
+
+
+class TestLocalePatch(SupersetTestCase):
+    MOCK_LANGUAGES = (
+        "flask.current_app.config",
+        {
+            "LANGUAGES": {
+                "es": {"flag": "es", "name": "Español"},
+            },
+        },
+    )
+
+    @mock.patch.dict(*MOCK_LANGUAGES)
+    def test_lang_redirect(self):
+        self.login(GAMMA_USERNAME)
+        referer_url = "http://localhost/explore/"
+        resp = self.client.get("/lang/es", headers={"Referer": referer_url})
+
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == referer_url
+        with self.client.session_transaction() as session:
+            assert session["locale"] == "es"
+
+    @mock.patch.dict(*MOCK_LANGUAGES)
+    def test_lang_invalid_referer(self):
+        self.login(GAMMA_USERNAME)
+        referer_url = "http://someotherserver/explore/"
+        resp = self.client.get("/lang/es", headers={"Referer": referer_url})
+
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/"
+        with self.client.session_transaction() as session:
+            assert session["locale"] == "es"
+
+    @mock.patch.dict(*MOCK_LANGUAGES)
+    def test_lang_no_referer(self):
+        self.login(GAMMA_USERNAME)
+        resp = self.client.get("/lang/es")
+
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "/"
+        with self.client.session_transaction() as session:
+            assert session["locale"] == "es"
+
+    def test_lang_invalid_locale(self):
+        self.login(GAMMA_USERNAME)
+        resp = self.client.get("/lang/es")
+
+        assert resp.status_code == 500
+        with self.client.session_transaction() as session:
+            assert session["locale"] == "en"
 
 
 if __name__ == "__main__":

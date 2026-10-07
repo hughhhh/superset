@@ -16,8 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 
 import HoverMenu from 'src/dashboard/components/menu/HoverMenu';
 
@@ -26,15 +25,15 @@ test('should render a div.hover-menu', () => {
   expect(container.querySelector('.hover-menu')).toBeInTheDocument();
 });
 
-test('should call onHover when mouse enters and leaves', () => {
+test('should call onHover when mouse enters and leaves', async () => {
   const onHover = jest.fn();
   render(<HoverMenu onHover={onHover} />);
 
   const hoverMenu = screen.getByTestId('hover-menu');
 
-  userEvent.hover(hoverMenu);
+  await userEvent.hover(hoverMenu);
   expect(onHover).toHaveBeenCalledWith({ isHovered: true });
 
-  userEvent.unhover(hoverMenu);
+  await userEvent.unhover(hoverMenu);
   expect(onHover).toHaveBeenCalledWith({ isHovered: false });
 });

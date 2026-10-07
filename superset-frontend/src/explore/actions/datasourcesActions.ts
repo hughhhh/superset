@@ -20,10 +20,25 @@
 import { Dispatch, AnyAction } from 'redux';
 import { ThunkDispatch } from 'redux-thunk';
 import { Dataset } from '@superset-ui/chart-controls';
-import { SupersetClient, getClientErrorObject } from '@superset-ui/core';
+import {
+  Currency,
+  SupersetClient,
+  getClientErrorObject,
+} from '@superset-ui/core';
 import { addDangerToast } from 'src/components/MessageToasts/actions';
 import { updateFormDataByDatasource } from './exploreActions';
 import { ExplorePageState } from '../types';
+
+interface SaveDatasetRequest {
+  data: {
+    schema?: string;
+    sql?: string;
+    dbId?: number;
+    templateParams?: string;
+    datasourceName: string;
+    columns: unknown[];
+  };
+}
 
 export const SET_DATASOURCE = 'SET_DATASOURCE';
 export interface SetDatasource {
@@ -39,8 +54,25 @@ export function changeDatasource(newDatasource: Dataset) {
     const {
       explore: { datasource: prevDatasource },
     } = getState();
-    dispatch(setDatasource(newDatasource));
-    dispatch(updateFormDataByDatasource(prevDatasource, newDatasource));
+    // Recompute currency_formats from the updated metrics, mirroring the
+    // logic in hydrateExplore. The raw API response does not carry this
+    // derived field, so without this step any currency change made via
+    // Edit Dataset would not be reflected in the chart preview.
+    const datasourceWithCurrencyFormats: Dataset = {
+      ...newDatasource,
+      currency_formats: Object.fromEntries(
+        (newDatasource.metrics ?? [])
+          .filter(metric => !!metric.currency)
+          .map((metric): [string, Currency] => [
+            metric.metric_name,
+            metric.currency!,
+          ]),
+      ),
+    };
+    dispatch(setDatasource(datasourceWithCurrencyFormats));
+    dispatch(
+      updateFormDataByDatasource(prevDatasource, datasourceWithCurrencyFormats),
+    );
   };
 }
 
@@ -51,7 +83,7 @@ export function saveDataset({
   templateParams,
   datasourceName,
   columns,
-}: Omit<SqlLabPostRequest['data'], 'dbId'> & { database: { id: number } }) {
+}: Omit<SaveDatasetRequest['data'], 'dbId'> & { database: { id: number } }) {
   return async function (dispatch: ThunkDispatch<any, undefined, AnyAction>) {
     // Create a dataset object
     try {

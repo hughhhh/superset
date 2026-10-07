@@ -18,8 +18,13 @@
  */
 
 import { FeatureFlag, VizType } from '@superset-ui/core';
-import userEvent from '@testing-library/user-event';
-import { act, render, screen, within } from 'spec/helpers/testing-library';
+import {
+  act,
+  render,
+  screen,
+  userEvent,
+  within,
+} from 'spec/helpers/testing-library';
 import AddSliceCard from './AddSliceCard';
 
 jest.mock('src/components/DynamicPlugins', () => ({
@@ -72,9 +77,14 @@ test('does not render the tooltip with anchors', async () => {
       datasourceName="datasource-name"
     />,
   );
-  userEvent.hover(screen.getByRole('link', { name: 'datasource-name' }));
-  expect(await screen.findByRole('tooltip')).toBeInTheDocument();
-  const tooltip = await screen.findByRole('tooltip');
+  await userEvent.hover(screen.getByRole('link', { name: 'datasource-name' }));
+  // The useState mock forces every TruncatedTextWithTooltip to render its
+  // tooltip, so multiple role="tooltip" nodes exist. Target the datasource
+  // tooltip specifically by its accessible name.
+  const tooltip = await screen.findByRole('tooltip', {
+    name: 'datasource-name',
+  });
+  expect(tooltip).toBeInTheDocument();
   expect(within(tooltip).queryByRole('link')).not.toBeInTheDocument();
   mock.mockRestore();
 });

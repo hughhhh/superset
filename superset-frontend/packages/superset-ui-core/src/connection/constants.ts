@@ -19,11 +19,14 @@
 
 import { FetchRetryOptions } from './types';
 
-export const DEFAULT_BASE_URL = 'http://localhost';
+export const DEFAULT_APP_ROOT = '';
 
 // HTTP status codes
 export const HTTP_STATUS_OK = 200;
 export const HTTP_STATUS_NOT_MODIFIED = 304;
+export const HTTP_STATUS_BAD_REQUEST = 400;
+export const HTTP_STATUS_UNAUTHORIZED = 401;
+export const CSRF_ERROR_TYPE = 'CSRF_ERROR';
 
 // Namespace for Cache API
 export const CACHE_AVAILABLE = 'caches' in window;
@@ -32,7 +35,7 @@ export const CACHE_KEY = '@SUPERSET-UI/CONNECTION';
 export const DEFAULT_FETCH_RETRY_OPTIONS: FetchRetryOptions = {
   retries: 3,
   retryDelay: 1000,
-  retryOn: [503],
+  retryOn: [502, 503, 504],
 };
 
 export const COMMON_ERR_MESSAGES = {

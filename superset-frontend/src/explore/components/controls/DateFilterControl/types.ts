@@ -16,6 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { ReactNode } from 'react';
+import type { PartitionFilterMapping } from '@superset-ui/chart-controls';
+
 export type SelectOptionType = {
   value: string;
   label: string;
@@ -80,10 +83,12 @@ export type CommonRangeType =
 
 export const PreviousCalendarWeek = 'previous calendar week';
 export const PreviousCalendarMonth = 'previous calendar month';
+export const PreviousCalendarQuarter = 'previous calendar quarter';
 export const PreviousCalendarYear = 'previous calendar year';
 export type CalendarRangeType =
   | typeof PreviousCalendarWeek
   | typeof PreviousCalendarMonth
+  | typeof PreviousCalendarQuarter
   | typeof PreviousCalendarYear;
 
 export const CurrentDay = 'Current day';
@@ -110,6 +115,17 @@ export interface DateFilterControlProps {
   value?: string;
   onOpenPopover?: () => void;
   onClosePopover?: () => void;
-  overlayStyle?: 'Modal' | 'Popover';
   isOverflowingFilterBar?: boolean;
+  hovered?: boolean;
+  description?: ReactNode;
+  label?: ReactNode;
+  tooltipOnClick?: () => void;
+  /**
+   * The dataset's partition filter mapping, injected by the control's
+   * `mapStateToProps` and already gated there: it is `null` unless *this* time
+   * range is mirrored onto the partition column. The control renders it as-is,
+   * so nothing further has to be checked here.
+   */
+  partitionMapping?: PartitionFilterMapping | null;
+  displayFormat?: string;
 }

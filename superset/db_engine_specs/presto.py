@@ -26,25 +26,26 @@ from collections import defaultdict, deque
 from datetime import datetime
 from re import Pattern
 from textwrap import dedent
-from typing import Any, cast, Optional, TYPE_CHECKING
+from typing import Any, Callable, cast, Optional, TYPE_CHECKING
 from urllib import parse
 
 import pandas as pd
-from flask import current_app
+from flask import current_app as app
 from flask_babel import gettext as __, lazy_gettext as _
 from packaging.version import Version
-from sqlalchemy import Column, literal_column, types
-from sqlalchemy.engine.base import Engine
+from sqlalchemy import Column, literal_column, text, types
+from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.engine.result import Row as ResultRow
 from sqlalchemy.engine.url import URL
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.sql.expression import ColumnClause, Select
 
 from superset import cache_manager, db, is_feature_enabled
 from superset.common.db_query_status import QueryStatus
 from superset.constants import TimeGrain
-from superset.databases.utils import make_url_safe
-from superset.db_engine_specs.base import BaseEngineSpec
+from superset.db_engine_specs.base import BaseEngineSpec, DatabaseCategory
+from superset.db_engine_specs.exceptions import SupersetDBAPIProgrammingError
 from superset.errors import SupersetErrorType
 from superset.exceptions import SupersetTemplateException
 from superset.models.sql_lab import Query
@@ -63,9 +64,8 @@ from superset.utils import core as utils, json
 from superset.utils.core import GenericDataType
 
 if TYPE_CHECKING:
-    # prevent circular imports
     from superset.models.core import Database
-    from superset.sql_parse import Table
+    from superset.sql.parse import Table
 
     with contextlib.suppress(ImportError):  # pyhive may not be installed
         from pyhive.presto import Cursor
@@ -78,6 +78,7 @@ SCHEMA_DOES_NOT_EXIST_REGEX = re.compile(
     "line (?P<location>.+?): .*Schema '(?P<schema_name>.+?)' does not exist"
 )
 CONNECTION_ACCESS_DENIED_REGEX = re.compile("Access Denied: Invalid credentials")
+CONNECTION_ACCESS_DENIED_401_REGEX = re.compile(r"Unexpected status code 401")
 CONNECTION_INVALID_HOSTNAME_REGEX = re.compile(
     r"Failed to establish a new connection: \[Errno 8\] nodename nor servname "
     "provided, or not known"
@@ -163,8 +164,35 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
     A base class that share common functions between Presto and Trino
     """
 
+    # The engine's default text comparison is binary, so a mirrored
+    # ``partition_col = T(v)`` agrees with the ``col = v`` it stands in for.
+    binary_string_comparison = True
     supports_dynamic_schema = True
-    supports_catalog = supports_dynamic_catalog = True
+    supports_catalog = supports_dynamic_catalog = supports_cross_catalog_queries = True
+
+    encrypted_extra_sensitive_fields = {
+        "$.auth_params.password": "Password",
+        "$.auth_params.token": "JWT Token",
+        "$.connect_args.requests_kwargs.jwt": "JWT Token",
+    }
+    # Not set here: GROUPING SETS support is opted in per-concrete-engine
+    # (``PrestoEngineSpec``, ``TrinoEngineSpec``) rather than on this shared
+    # base, since Hive-family descendants (``HiveEngineSpec``, ``SparkEngineSpec``,
+    # ``DatabricksHiveEngineSpec``) have not been verified against this query
+    # pattern and should not silently inherit it.
+    # Presto/Trino don't reliably support IS true/false on computed boolean
+    # expressions (e.g. columns defined as `(expiration = 1) AS expiration`),
+    # which raises a query error. Use = true/false instead.
+    use_equality_for_boolean_filters = True
+
+    # Presto/Trino's coordinator sends query results as JSON, which has no
+    # literal for NaN/Infinity/-Infinity, so REAL/DOUBLE columns holding
+    # those values arrive as quoted strings. Coerce them back to real
+    # floats so numeric post-processing (e.g. a pivot's mean) doesn't choke
+    # on a string value.
+    column_type_mutators: dict[types.TypeEngine, Callable[[Any], Any]] = {
+        types.FLOAT: lambda val: float(val) if isinstance(val, str) else val
+    }
 
     column_type_mappings = (
         (
@@ -321,7 +349,8 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
         """
         Get all catalogs.
         """
-        return {catalog for (catalog,) in inspector.bind.execute("SHOW CATALOGS")}
+        with inspector.engine.connect() as conn:
+            return {catalog for (catalog,) in conn.execute(text("SHOW CATALOGS"))}
 
     @classmethod
     def adjust_engine_params(
@@ -493,7 +522,10 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
         if filters:
             l = []  # noqa: E741
             for field, value in filters.items():
-                l.append(f"{field} = '{value}'")
+                # Escape single quotes so a ``'`` in the caller-supplied value
+                # cannot break out of the SQL string literal. See #41869.
+                escaped_value: str = str(value).replace("'", "''")
+                l.append(f"{field} = '{escaped_value}'")
             where_clause = "WHERE " + " AND ".join(l)
 
         # Partition select syntax changed in v0.199, so check here.
@@ -545,7 +577,7 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
             column.get("column_name"): column.get("type") for column in columns or []
         }
 
-        for col_name, value in zip(col_names, values):
+        for col_name, value in zip(col_names, values, strict=False):
             col_type = column_type_by_name.get(col_name)
 
             if isinstance(col_type, str):
@@ -631,6 +663,7 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
         cls,
         database: Database,
         table: Table,
+        indexes: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Returns the latest (max) partition value for a table
@@ -655,16 +688,24 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
         >>> latest_sub_partition('sub_partition_table', event_type='click')
         '2018-01-01'
         """
-        indexes = database.get_indexes(table)
+        if indexes is None:
+            indexes = database.get_indexes(table)
+
+        if not indexes:
+            raise SupersetTemplateException(
+                f"Error getting partition for {table}. "
+                "Verify that this table has a partition."
+            )
+
         part_fields = indexes[0]["column_names"]
-        for k in kwargs.keys():  # pylint: disable=consider-iterating-dictionary
-            if k not in k in part_fields:  # pylint: disable=comparison-with-itself
-                msg = f"Field [{k}] is not part of the portioning key"
+        for k in kwargs:
+            if k not in part_fields:
+                msg: str = f"Field [{k}] is not part of the partitioning key"
                 raise SupersetTemplateException(msg)
         if len(kwargs.keys()) != len(part_fields) - 1:
             # pylint: disable=consider-using-f-string
             msg = (
-                "A filter needs to be specified for {} out of the " "{} fields."
+                "A filter needs to be specified for {} out of the {} fields."
             ).format(len(part_fields) - 1, len(part_fields))
             raise SupersetTemplateException(msg)
 
@@ -698,11 +739,14 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
         :return: list of column objects
         """
         full_table_name = cls.quote_table(table, inspector.engine.dialect)
-        return inspector.bind.execute(f"SHOW COLUMNS FROM {full_table_name}").fetchall()
+        with inspector.engine.connect() as conn:
+            return conn.execute(text(f"SHOW COLUMNS FROM {full_table_name}")).fetchall()
 
     @classmethod
     def _create_column_info(
-        cls, name: str, data_type: types.TypeEngine
+        cls,
+        name: str,
+        data_type: types.TypeEngine,
     ) -> ResultSetColumnType:
         """
         Create column info object
@@ -713,7 +757,7 @@ class PrestoBaseEngineSpec(BaseEngineSpec, metaclass=ABCMeta):
         return {
             "column_name": name,
             "name": name,
-            "type": f"{data_type}",
+            "type": data_type,
             "is_dttm": None,
             "type_generic": None,
         }
@@ -893,6 +937,48 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
     engine = "presto"
     engine_name = "Presto"
     allows_alias_to_source_column = False
+    supports_grouping_sets = True
+
+    metadata = {
+        "description": "Presto is a distributed SQL query engine for big data.",
+        "logo": "presto-og.png",
+        "homepage_url": "https://prestodb.io/",
+        "categories": [DatabaseCategory.QUERY_ENGINES, DatabaseCategory.OPEN_SOURCE],
+        "pypi_packages": ["pyhive"],
+        "install_instructions": 'pip install "apache-superset[presto]"',
+        "version_requirements": (
+            "PyHive 0.7.0 or later is required for SQLAlchemy 2. "
+            "PyHive 0.6.5 imports the removed sqlalchemy.databases module."
+        ),
+        "connection_string": "presto://{hostname}:{port}/{database}",
+        "default_port": 8080,
+        "parameters": {
+            "hostname": "Presto coordinator hostname",
+            "port": "Presto coordinator port (default 8080)",
+            "database": "Catalog name",
+        },
+        "drivers": [
+            {
+                "name": "PyHive",
+                "pypi_package": "pyhive",
+                "connection_string": "presto://{hostname}:{port}/{database}",
+                "is_recommended": True,
+            },
+        ],
+    }
+
+    @classmethod
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: dict[str, Any] | None = None
+    ) -> str | None:
+        sqla_type = cls.get_sqla_column_type(target_type)
+
+        if isinstance(sqla_type, types.Date):
+            return f"DATE '{dttm.date().isoformat()}'"
+        if isinstance(sqla_type, types.TIMESTAMP):
+            return f"""TIMESTAMP '{dttm.isoformat(timespec="milliseconds", sep=" ")}'"""
+
+        return None
 
     custom_errors: dict[Pattern[str], tuple[str, SupersetErrorType, dict[str, Any]]] = {
         COLUMN_DOES_NOT_EXIST_REGEX: (
@@ -923,6 +1009,11 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
             __('Either the username "%(username)s" or the password is incorrect.'),
             SupersetErrorType.CONNECTION_ACCESS_DENIED_ERROR,
             {},
+        ),
+        CONNECTION_ACCESS_DENIED_401_REGEX: (
+            __("Unexpected HTTP 401 response. Check your credentials."),
+            SupersetErrorType.CONNECTION_ACCESS_DENIED_ERROR,
+            {"invalid_credentials": True},
         ),
         CONNECTION_INVALID_HOSTNAME_REGEX: (
             __('The hostname "%(hostname)s" cannot be resolved.'),
@@ -955,33 +1046,25 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
         return version is not None and Version(version) >= Version("0.319")
 
     @classmethod
-    def update_impersonation_config(  # pylint: disable=too-many-arguments
+    def impersonate_user(
         cls,
         database: Database,
-        connect_args: dict[str, Any],
-        uri: str,
         username: str | None,
-        access_token: str | None,
-    ) -> None:
-        """
-        Update a configuration dictionary
-        that can set the correct properties for impersonating users
+        user_token: str | None,
+        url: URL,
+        engine_kwargs: dict[str, Any],
+    ) -> tuple[URL, dict[str, Any]]:
+        if username is None:
+            return url, engine_kwargs
 
-        :param connect_args: the Database object
-        :param connect_args: config to be updated
-        :param uri: URI string
-        :param username: Effective username
-        :param access_token: Personal access token for OAuth2
-        :return: None
-        """
-        url = make_url_safe(uri)
+        url = url.set(username=username)
+
         backend_name = url.get_backend_name()
-
-        # Must be Presto connection, enable impersonation, and set optional param
-        # auth=LDAP|KERBEROS
-        # Set principal_username=$effective_username
-        if backend_name == "presto" and username is not None:
+        connect_args = engine_kwargs.setdefault("connect_args", {})
+        if backend_name == "presto":
             connect_args["principal_username"] = username
+
+        return url, engine_kwargs
 
     @classmethod
     def get_table_names(
@@ -1106,7 +1189,7 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
         cls,
         database: Database,
         table: Table,
-        engine: Engine,
+        dialect: Dialect,
         limit: int = 100,
         show_cols: bool = False,
         indent: bool = True,
@@ -1130,7 +1213,7 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
         return super().select_star(
             database,
             table,
-            engine,
+            dialect,
             limit,
             show_cols,
             indent,
@@ -1174,6 +1257,7 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
         all_columns: list[ResultSetColumnType] = []
         expanded_columns = []
         current_array_level = None
+        unnested_rows: dict[int, int] = defaultdict(int)
         while to_process:
             column, level = to_process.popleft()
             if column["column_name"] not in [
@@ -1187,7 +1271,7 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
             # added by the first. every time we change a level in the nested arrays
             # we reinitialize this.
             if level != current_array_level:
-                unnested_rows: dict[int, int] = defaultdict(int)
+                unnested_rows = defaultdict(int)
                 current_array_level = level
 
             name = column["column_name"]
@@ -1240,7 +1324,7 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
                     if isinstance(values, str):
                         values = cast(Optional[list[Any]], destringify(values))
                         row[name] = values
-                    for value, col in zip(values or [], expanded):
+                    for value, col in zip(values or [], expanded, strict=False):
                         row[col["column_name"]] = value
 
         data = [
@@ -1258,26 +1342,31 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
     ) -> dict[str, Any]:
         metadata = {}
 
-        if indexes := database.get_indexes(table):
-            col_names, latest_parts = cls.latest_partition(
-                database,
-                table,
-                show_first=True,
-                indexes=indexes,
-            )
-
-            if not latest_parts:
-                latest_parts = tuple([None] * len(col_names))
-
-            metadata["partitions"] = {
-                "cols": sorted(indexes[0].get("column_names", [])),
-                "latest": dict(zip(col_names, latest_parts)),
-                "partitionQuery": cls._partition_query(
-                    table=table,
+        try:
+            if indexes := database.get_indexes(table):
+                col_names, latest_parts = cls.latest_partition(
+                    database,
+                    table,
+                    show_first=True,
                     indexes=indexes,
-                    database=database,
-                ),
-            }
+                )
+
+                if not latest_parts:
+                    latest_parts = tuple([None] * len(col_names))
+
+                metadata["partitions"] = {
+                    "cols": sorted(indexes[0].get("column_names", [])),
+                    "latest": dict(zip(col_names, latest_parts, strict=False)),
+                    "partitionQuery": cls._partition_query(
+                        table=table,
+                        indexes=indexes,
+                        database=database,
+                    ),
+                }
+        except NoSuchTableError as ex:
+            raise SupersetDBAPIProgrammingError(
+                "Table doesn't seem to exist on the database"
+            ) from ex
 
         metadata["view"] = cast(
             Any,
@@ -1328,7 +1417,7 @@ class PrestoEngineSpec(PrestoBaseEngineSpec):
 
         query_id = query.id
         poll_interval = query.database.connect_args.get(
-            "poll_interval", current_app.config["PRESTO_POLL_INTERVAL"]
+            "poll_interval", app.config["PRESTO_POLL_INTERVAL"]
         )
         logger.info("Query %i: Polling the cursor for progress", query_id)
         polled = cursor.poll()

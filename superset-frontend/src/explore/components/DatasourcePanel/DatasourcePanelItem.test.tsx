@@ -16,182 +16,196 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { useDraggable } from '@dnd-kit/core';
 import {
   columns,
   metrics,
 } from 'src/explore/components/DatasourcePanel/fixtures';
-import { fireEvent, render, within } from 'spec/helpers/testing-library';
-import DatasourcePanelItem from './DatasourcePanelItem';
+import { screen, userEvent, render } from 'spec/helpers/testing-library';
+import DatasourcePanelItem, {
+  DatasourcePanelItemRowProps,
+} from './DatasourcePanelItem';
+import { FoldersEditorItemType } from 'src/components/Datasource/types';
+import { DndItemType } from '../DndItemType';
+import { MetricItem, ColumnItem } from './types';
 
-const mockData = {
-  metricSlice: metrics,
-  columnSlice: columns,
-  totalMetrics: Math.max(metrics.length, 10),
-  totalColumns: Math.max(columns.length, 13),
+jest.mock('@dnd-kit/core', () => ({
+  ...jest.requireActual('@dnd-kit/core'),
+  useDraggable: jest.fn(),
+}));
+
+const mockUseDraggable = useDraggable as jest.Mock;
+const actualUseDraggable = jest.requireActual('@dnd-kit/core').useDraggable;
+
+const mockData: DatasourcePanelItemRowProps = {
+  flattenedItems: [
+    { type: 'header', depth: 0, folderId: '1', height: 50 },
+    ...metrics.map((m, idx) => ({
+      type: 'item' as const,
+      depth: 0,
+      folderId: '1',
+      height: 32,
+      index: idx,
+      item: { ...m, type: FoldersEditorItemType.Metric } as MetricItem,
+    })),
+    { type: 'divider', depth: 0, folderId: '1', height: 16 },
+    { type: 'header', depth: 0, folderId: '2', height: 50 },
+    ...columns.map((m, idx) => ({
+      type: 'item' as const,
+      depth: 0,
+      folderId: '2',
+      height: 32,
+      index: idx,
+      item: { ...m, type: FoldersEditorItemType.Column } as ColumnItem,
+    })),
+  ],
+  folderMap: new Map([
+    [
+      '1',
+      {
+        id: '1',
+        isCollapsed: false,
+        name: 'Metrics',
+        items: metrics.map(
+          m => ({ ...m, type: FoldersEditorItemType.Metric }) as MetricItem,
+        ),
+        totalItems: metrics.length,
+        showingItems: metrics.length,
+      },
+    ],
+    [
+      '2',
+      {
+        id: '2',
+        isCollapsed: false,
+        name: 'Columns',
+        items: columns.map(
+          c => ({ ...c, type: FoldersEditorItemType.Column }) as ColumnItem,
+        ),
+        totalItems: columns.length,
+        showingItems: columns.length,
+      },
+    ],
+  ]),
   width: 300,
-  showAllMetrics: false,
-  onShowAllMetricsChange: jest.fn(),
-  showAllColumns: false,
-  onShowAllColumnsChange: jest.fn(),
-  collapseMetrics: false,
-  onCollapseMetricsChange: jest.fn(),
-  collapseColumns: false,
-  onCollapseColumnsChange: jest.fn(),
-  hiddenMetricCount: 0,
-  hiddenColumnCount: 0,
+  onToggleCollapse: jest.fn(),
+  collapsedFolderIds: new Set(),
 };
 
+beforeEach(() => {
+  mockUseDraggable.mockReset();
+  mockUseDraggable.mockImplementation(actualUseDraggable);
+});
+
+const setup = (
+  data: DatasourcePanelItemRowProps = mockData,
+  initialState: Record<string, unknown> = { explore: {} },
+) =>
+  render(
+    <>
+      {data.flattenedItems.map((_, index) => (
+        <DatasourcePanelItem
+          // eslint-disable-next-line react/no-array-index-key -- test fixture has no stable id
+          key={index}
+          index={index}
+          style={{}}
+          ariaAttributes={{
+            role: 'listitem',
+            'aria-posinset': index + 1,
+            'aria-setsize': data.flattenedItems.length,
+          }}
+          {...data}
+        />
+      ))}
+    </>,
+    { useDnd: true, useRedux: true, initialState },
+  );
+
 test('renders each item accordingly', () => {
-  const { getByText, getByTestId, rerender, container } = render(
-    <DatasourcePanelItem index={0} data={mockData} style={{}} />,
-    { useDnd: true },
-  );
+  setup();
+  expect(screen.getByText('Metrics')).toBeInTheDocument();
+  expect(screen.getByText('metric_end_certified')).toBeInTheDocument();
+  expect(screen.getByText('metric_end')).toBeInTheDocument();
 
-  expect(getByText('Metrics')).toBeInTheDocument();
-  rerender(<DatasourcePanelItem index={1} data={mockData} style={{}} />);
-  expect(
-    getByText(
-      `Showing ${mockData.metricSlice.length} of ${mockData.totalMetrics}`,
-    ),
-  ).toBeInTheDocument();
-  mockData.metricSlice.forEach((metric, metricIndex) => {
-    rerender(
-      <DatasourcePanelItem
-        index={metricIndex + 2}
-        data={mockData}
-        style={{}}
-      />,
-    );
-    expect(getByTestId('DatasourcePanelDragOption')).toBeInTheDocument();
-    expect(
-      within(getByTestId('DatasourcePanelDragOption')).getByText(
-        metric.metric_name,
-      ),
-    ).toBeInTheDocument();
-  });
-  rerender(
-    <DatasourcePanelItem
-      index={2 + mockData.metricSlice.length}
-      data={mockData}
-      style={{}}
-    />,
-  );
-  expect(container).toHaveTextContent('');
+  expect(screen.getByText('Columns')).toBeInTheDocument();
+  expect(screen.getByText('bootcamp_attend')).toBeInTheDocument();
+  expect(screen.getByText('calc_first_time_dev')).toBeInTheDocument();
+  expect(screen.getByText('aaaaaaaaaaa')).toBeInTheDocument();
 
-  const startIndexOfColumnSection = mockData.metricSlice.length + 3;
-  rerender(
-    <DatasourcePanelItem
-      index={startIndexOfColumnSection}
-      data={mockData}
-      style={{}}
-    />,
-  );
-  expect(getByText('Columns')).toBeInTheDocument();
-  rerender(
-    <DatasourcePanelItem
-      index={startIndexOfColumnSection + 1}
-      data={mockData}
-      style={{}}
-    />,
-  );
-  expect(
-    getByText(
-      `Showing ${mockData.columnSlice.length} of ${mockData.totalColumns}`,
-    ),
-  ).toBeInTheDocument();
-  mockData.columnSlice.forEach((column, columnIndex) => {
-    rerender(
-      <DatasourcePanelItem
-        index={startIndexOfColumnSection + columnIndex + 2}
-        data={mockData}
-        style={{}}
-      />,
-    );
-    expect(getByTestId('DatasourcePanelDragOption')).toBeInTheDocument();
-    expect(
-      within(getByTestId('DatasourcePanelDragOption')).getByText(
-        column.column_name,
-      ),
-    ).toBeInTheDocument();
-  });
+  expect(screen.getByTestId('datasource-panel-divider')).toBeInTheDocument();
+  expect(screen.getAllByTestId('DatasourcePanelDragOption').length).toEqual(5);
 });
 
-test('can collapse metrics and columns', () => {
-  mockData.onCollapseMetricsChange.mockClear();
-  mockData.onCollapseColumnsChange.mockClear();
-  const { queryByText, getByRole, rerender } = render(
-    <DatasourcePanelItem index={0} data={mockData} style={{}} />,
-    { useDnd: true },
-  );
-  fireEvent.click(getByRole('button'));
-  expect(mockData.onCollapseMetricsChange).toHaveBeenCalled();
-  expect(mockData.onCollapseColumnsChange).not.toHaveBeenCalled();
-
-  const startIndexOfColumnSection = mockData.metricSlice.length + 3;
-  rerender(
-    <DatasourcePanelItem
-      index={startIndexOfColumnSection}
-      data={mockData}
-      style={{}}
-    />,
-  );
-  fireEvent.click(getByRole('button'));
-  expect(mockData.onCollapseColumnsChange).toHaveBeenCalled();
-
-  rerender(
-    <DatasourcePanelItem
-      index={1}
-      data={{
-        ...mockData,
-        collapseMetrics: true,
-      }}
-      style={{}}
-    />,
-  );
-  expect(
-    queryByText(
-      `Showing ${mockData.metricSlice.length} of ${mockData.totalMetrics}`,
-    ),
-  ).not.toBeInTheDocument();
-
-  rerender(
-    <DatasourcePanelItem
-      index={2}
-      data={{
-        ...mockData,
-        collapseMetrics: true,
-      }}
-      style={{}}
-    />,
-  );
-  expect(queryByText('Columns')).toBeInTheDocument();
+test('can collapse metrics and columns', async () => {
+  setup();
+  await userEvent.click(screen.getAllByRole('button')[0]);
+  expect(mockData.onToggleCollapse).toHaveBeenCalled();
 });
 
-test('shows ineligible items count', () => {
-  const hiddenColumnCount = 3;
-  const hiddenMetricCount = 1;
-  const dataWithHiddenItems = {
-    ...mockData,
-    hiddenColumnCount,
-    hiddenMetricCount,
-  };
-  const { getByText, rerender } = render(
-    <DatasourcePanelItem index={1} data={dataWithHiddenItems} style={{}} />,
-    { useDnd: true },
-  );
-  expect(
-    getByText(`${hiddenMetricCount} ineligible item(s) are hidden`),
-  ).toBeInTheDocument();
+test('folder drag handle is a separate element from the collapse toggle', async () => {
+  setup();
 
-  const startIndexOfColumnSection = mockData.metricSlice.length + 3;
-  rerender(
-    <DatasourcePanelItem
-      index={startIndexOfColumnSection + 1}
-      data={dataWithHiddenItems}
-      style={{}}
-    />,
+  const toggleButtons = screen
+    .getAllByRole('button', { name: /Metrics/ })
+    .filter(el => el.tagName === 'BUTTON');
+  expect(toggleButtons).toHaveLength(1);
+  const [toggleButton] = toggleButtons;
+  const dragHandle = screen.getByRole('button', {
+    name: 'Drag Metrics folder',
+  });
+
+  expect(toggleButton).not.toBe(dragHandle);
+  expect(toggleButton.tagName).toBe('BUTTON');
+
+  await userEvent.click(toggleButton);
+  expect(mockData.onToggleCollapse).toHaveBeenCalledWith('1');
+});
+
+test('folder drag payload excludes columns filtered out by compatibleDimensions', () => {
+  setup(mockData, {
+    explore: {
+      compatibility: {
+        status: 'verified',
+        metrics: [],
+        dimensions: [columns[0].column_name],
+      },
+    },
+  });
+
+  const folderHeaderCalls = mockUseDraggable.mock.calls.filter(
+    ([opts]) => opts.data.type === DndItemType.Folder,
   );
-  expect(
-    getByText(`${hiddenColumnCount} ineligible item(s) are hidden`),
-  ).toBeInTheDocument();
+  const columnsFolderCall = folderHeaderCalls.find(
+    ([opts]) => opts.data.name === 'Columns',
+  );
+
+  expect(columnsFolderCall![0].data.items).toEqual([
+    expect.objectContaining({
+      type: DndItemType.Column,
+      value: expect.objectContaining({ column_name: columns[0].column_name }),
+    }),
+  ]);
+  expect(columnsFolderCall![0].disabled).toBe(false);
+});
+
+test('folder header is not draggable when every item is filtered out', () => {
+  setup(mockData, {
+    explore: {
+      compatibility: {
+        status: 'verified',
+        metrics: [],
+        dimensions: ['non-existent-column'],
+      },
+    },
+  });
+
+  const folderHeaderCalls = mockUseDraggable.mock.calls.filter(
+    ([opts]) => opts.data.type === DndItemType.Folder,
+  );
+  const columnsFolderCall = folderHeaderCalls.find(
+    ([opts]) => opts.data.name === 'Columns',
+  );
+
+  expect(columnsFolderCall![0].data.items).toEqual([]);
+  expect(columnsFolderCall![0].disabled).toBe(true);
 });

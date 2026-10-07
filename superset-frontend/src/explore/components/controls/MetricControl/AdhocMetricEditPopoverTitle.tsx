@@ -25,9 +25,10 @@ import {
   FC,
 } from 'react';
 
-import { t, styled } from '@superset-ui/core';
-import { Input } from 'src/components/Input';
-import { Tooltip } from 'src/components/Tooltip';
+import { t } from '@apache-superset/core/translation';
+import { css, styled, useTheme } from '@apache-superset/core/theme';
+import { Input, Tooltip } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
 
 const TitleLabel = styled.span`
   display: inline-block;
@@ -37,7 +38,7 @@ const TitleLabel = styled.span`
 const StyledInput = styled(Input)`
   border-radius: ${({ theme }) => theme.borderRadius};
   height: 26px;
-  padding-left: ${({ theme }) => theme.gridUnit * 2.5}px;
+  padding-left: ${({ theme }) => theme.sizeUnit * 2.5}px;
 `;
 
 export interface AdhocMetricEditPopoverTitleProps {
@@ -54,6 +55,7 @@ const AdhocMetricEditPopoverTitle: FC<AdhocMetricEditPopoverTitleProps> = ({
   isEditDisabled,
   onChange,
 }) => {
+  const theme = useTheme();
   const [isHovered, setIsHovered] = useState(false);
   const [isEditMode, setIsEditMode] = useState(false);
 
@@ -62,7 +64,10 @@ const AdhocMetricEditPopoverTitle: FC<AdhocMetricEditPopoverTitleProps> = ({
   const handleMouseOver = useCallback(() => setIsHovered(true), []);
   const handleMouseOut = useCallback(() => setIsHovered(false), []);
   const handleClick = useCallback(() => setIsEditMode(true), []);
-  const handleBlur = useCallback(() => setIsEditMode(false), []);
+  const handleBlur = useCallback(() => {
+    setIsHovered(false);
+    setIsEditMode(false);
+  }, []);
 
   const handleKeyPress = useCallback(
     (ev: KeyboardEvent<HTMLInputElement>) => {
@@ -108,23 +113,31 @@ const AdhocMetricEditPopoverTitle: FC<AdhocMetricEditPopoverTitleProps> = ({
 
   return (
     <Tooltip placement="top" title={t('Click to edit label')}>
-      <span
+      <button
+        type="button"
+        css={css`
+          appearance: none;
+          border: none;
+          background: none;
+          padding: 0;
+          font: inherit;
+          cursor: pointer;
+        `}
         className="AdhocMetricEditPopoverTitle inline-editable"
         data-test="AdhocMetricEditTitle#trigger"
         onMouseOver={handleMouseOver}
         onMouseOut={handleMouseOut}
+        onFocus={handleMouseOver}
         onClick={handleClick}
         onBlur={handleBlur}
-        role="button"
-        tabIndex={0}
       >
         <TitleLabel>{title?.label || defaultLabel}</TitleLabel>
         &nbsp;
-        <i
-          className="fa fa-pencil"
-          style={{ color: isHovered ? 'black' : 'grey' }}
+        <Icons.EditOutlined
+          iconColor={isHovered ? theme.colorPrimary : theme.colorIcon}
+          iconSize="m"
         />
-      </span>
+      </button>
     </Tooltip>
   );
 };

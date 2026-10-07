@@ -16,10 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { render, screen } from 'spec/helpers/testing-library';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 
 import MetricDefinitionOption from 'src/explore/components/controls/MetricControl/MetricDefinitionOption';
-import userEvent from '@testing-library/user-event';
 
 type MetricDefinitionOptionProps = {
   option: {
@@ -45,7 +44,7 @@ test('renders a given saved metric and display SQL expression popover when hover
 
   // Grab calculator icon and mock mouse hovering over it
   const calculatorIcon = await screen.findByLabelText('calculator');
-  userEvent.hover(calculatorIcon);
+  await userEvent.hover(calculatorIcon);
   expect(await screen.findByText('SQL expression')).toBeInTheDocument();
 });
 

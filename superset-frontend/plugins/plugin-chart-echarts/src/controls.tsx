@@ -16,18 +16,25 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { t, VizType } from '@superset-ui/core';
+import { t } from '@apache-superset/core/translation';
+import { VizType } from '@superset-ui/core';
 import {
   ControlPanelsContainerProps,
   ControlSetItem,
   ControlSetRow,
   ControlSubSectionHeader,
+  CustomControlItem,
   DEFAULT_SORT_SERIES_DATA,
   SORT_SERIES_CHOICES,
   sharedControls,
 } from '@superset-ui/chart-controls';
-import { DEFAULT_LEGEND_FORM_DATA, StackControlOptions } from './constants';
+import {
+  DEFAULT_LEGEND_FORM_DATA,
+  StackControlOptions,
+  StackControlOptionsWithoutStream,
+} from './constants';
 import { DEFAULT_FORM_DATA } from './Timeseries/constants';
+import { BarValueLabelPosition } from './Timeseries/types';
 import { defaultXAxis } from './defaults';
 
 const { legendMargin, legendOrientation, legendType, showLegend } =
@@ -66,7 +73,7 @@ const legendTypeControl: ControlSetItem = {
     label: t('Type'),
     choices: [
       ['scroll', t('Scroll')],
-      ['plain', t('Plain')],
+      ['plain', t('List')],
     ],
     default: legendType,
     renderTrigger: true,
@@ -96,22 +103,113 @@ const legendOrientationControl: ControlSetItem = {
   },
 };
 
+export const legendSortControl: ControlSetItem = {
+  name: 'legendSort',
+  config: {
+    type: 'SelectControl',
+    label: t('Sort legend'),
+    default: null,
+    renderTrigger: true,
+    choices: [
+      ['asc', t('Label ascending')],
+      ['desc', t('Label descending')],
+      [null, t('Sort by data')],
+    ],
+    description: t('Changes the sort value of the items in the legend only'),
+    visibility: ({ controls }: ControlPanelsContainerProps) =>
+      Boolean(controls?.show_legend?.value),
+  },
+};
+
 export const legendSection: ControlSetRow[] = [
   [<ControlSubSectionHeader>{t('Legend')}</ControlSubSectionHeader>],
   [showLegendControl],
   [legendTypeControl],
   [legendOrientationControl],
   [legendMarginControl],
+  [legendSortControl],
 ];
 
 export const showValueControl: ControlSetItem = {
   name: 'show_value',
   config: {
     type: 'CheckboxControl',
-    label: t('Show Value'),
+    label: t('Show value'),
     default: false,
     renderTrigger: true,
     description: t('Show series values on the chart'),
+  },
+};
+
+// Bar-only: fit-aware placement (Auto avoids/suppresses colliding labels on
+// stacked segments) plus explicit end/center/base positions. Wired into
+// showValueSectionWithoutStream (Bar charts) instead of labelPositionControl
+// below, which stays the generic picker for every other "Show value" chart.
+export const valueLabelPositionControl: ControlSetItem = {
+  name: 'value_label_position',
+  config: {
+    type: 'SelectControl',
+    freeForm: false,
+    clearable: false,
+    label: t('Value label position'),
+    choices: [
+      [BarValueLabelPosition.Auto, t('Auto')],
+      [BarValueLabelPosition.InsideEnd, t('Inside End')],
+      [BarValueLabelPosition.OutsideEnd, t('Outside End')],
+      [BarValueLabelPosition.InsideCenter, t('Inside Center')],
+      [BarValueLabelPosition.InsideBase, t('Inside Base')],
+    ],
+    default: DEFAULT_FORM_DATA.valueLabelPosition,
+    renderTrigger: true,
+    description: t('Choose where to display values relative to the bars'),
+    visibility: ({ controls }: ControlPanelsContainerProps) =>
+      Boolean(controls?.show_value?.value),
+  },
+};
+
+export const labelPositionControl: ControlSetItem = {
+  name: 'label_position',
+  config: {
+    type: 'SelectControl',
+    freeForm: false,
+    label: t('Label Position'),
+    choices: [
+      ['auto', t('Auto')],
+      ['top', t('Top')],
+      ['inside', t('Inside')],
+      ['bottom', t('Bottom')],
+      ['left', t('Left')],
+      ['right', t('Right')],
+    ],
+    default: 'auto',
+    renderTrigger: true,
+    description: t('Position of the data label relative to the data point'),
+    visibility: ({ controls }: ControlPanelsContainerProps) =>
+      Boolean(controls?.show_value?.value),
+  },
+};
+
+export const colorByPrimaryAxisControl: ControlSetItem = {
+  name: 'color_by_primary_axis',
+  config: {
+    type: 'CheckboxControl',
+    label: t('Color By X-Axis'),
+    default: false,
+    renderTrigger: true,
+    description: t('Color bars by x-axis'),
+    visibility: ({ controls }: { controls: any }) =>
+      (!controls?.stack?.value || controls?.stack?.value === null) &&
+      (!controls?.groupby?.value || controls?.groupby?.value?.length === 0),
+    shouldMapStateToProps: () => true,
+    mapStateToProps: (state: any) => {
+      const isHorizontal = state?.controls?.orientation?.value === 'horizontal';
+      return {
+        label: isHorizontal ? t('Color By Y-Axis') : t('Color By X-Axis'),
+        description: isHorizontal
+          ? t('Color bars by y-axis')
+          : t('Color bars by x-axis'),
+      };
+    },
   },
 };
 
@@ -124,6 +222,14 @@ export const stackControl: ControlSetItem = {
     choices: StackControlOptions,
     default: null,
     description: t('Stack series on top of each other'),
+  },
+};
+
+export const stackControlWithoutStream: ControlSetItem = {
+  ...stackControl,
+  config: {
+    ...stackControl.config,
+    choices: StackControlOptionsWithoutStream,
   },
 };
 
@@ -162,14 +268,30 @@ export const percentageThresholdControl: ControlSetItem = {
 
 export const showValueSection: ControlSetRow[] = [
   [showValueControl],
+  [labelPositionControl],
   [stackControl],
   [onlyTotalControl],
   [percentageThresholdControl],
 ];
 
+export const colorByPrimaryAxisSection: ControlSetRow[] = [
+  [colorByPrimaryAxisControl],
+];
+
 export const showValueSectionWithoutStack: ControlSetRow[] = [
   [showValueControl],
+  [labelPositionControl],
   [onlyTotalControl],
+];
+
+// Bar charts (the only consumer of this section) use the fit-aware
+// valueLabelPositionControl instead of the generic labelPositionControl.
+export const showValueSectionWithoutStream: ControlSetRow[] = [
+  [showValueControl],
+  [valueLabelPositionControl],
+  [stackControlWithoutStream],
+  [onlyTotalControl],
+  [percentageThresholdControl],
 ];
 
 const richTooltipControl: ControlSetItem = {
@@ -185,12 +307,20 @@ const richTooltipControl: ControlSetItem = {
   },
 };
 
-const tooltipTimeFormatControl: ControlSetItem = {
+export const tooltipTimeFormatControl: ControlSetItem = {
   name: 'tooltipTimeFormat',
   config: {
     ...sharedControls.x_axis_time_format,
     label: t('Tooltip time format'),
-    default: 'smart_date',
+    clearable: false,
+  },
+};
+
+export const tooltipValuesFormatControl: CustomControlItem = {
+  name: 'tooltipValuesFormat',
+  config: {
+    ...sharedControls.y_axis_format,
+    label: t('Number format'),
     clearable: false,
   },
 };
@@ -203,7 +333,7 @@ const tooltipSortByMetricControl: ControlSetItem = {
     renderTrigger: true,
     default: false,
     description: t(
-      'Whether to sort tooltip by the selected metric in descending order.',
+      'Whether to sort tooltip by the selected metric in descending order. On stacked charts, values are shown in ascending order.',
     ),
     visibility: ({ controls }: ControlPanelsContainerProps) =>
       Boolean(controls?.rich_tooltip?.value),
@@ -230,12 +360,33 @@ const tooltipPercentageControl: ControlSetItem = {
     type: 'CheckboxControl',
     label: t('Show percentage'),
     renderTrigger: true,
-    default: true,
+    default: false,
     description: t('Whether to display the percentage value in the tooltip'),
     visibility: ({ controls, form_data }: ControlPanelsContainerProps) =>
       Boolean(controls?.rich_tooltip?.value) &&
       !controls?.contributionMode?.value &&
       form_data.viz_type !== VizType.MixedTimeseries,
+  },
+};
+
+const tooltipTruncationControl: ControlSetItem = {
+  name: 'tooltipTruncation',
+  config: {
+    type: 'SelectControl',
+    freeForm: false,
+    label: t('Truncate labels'),
+    renderTrigger: true,
+    default: 'end',
+    clearable: false,
+    choices: [
+      ['off', t('Off')],
+      ['end', t('End')],
+      ['start', t('Start')],
+      ['middle', t('Middle')],
+    ],
+    description: t(
+      'Where to place the ellipsis when a tooltip label is too long. Choose Off to always show the full label, or Start when labels share a common prefix.',
+    ),
   },
 };
 
@@ -246,6 +397,7 @@ export const richTooltipSection: ControlSetRow[] = [
   [tooltipPercentageControl],
   [tooltipSortByMetricControl],
   [tooltipTimeFormatControl],
+  [tooltipTruncationControl],
 ];
 
 const sortSeriesType: ControlSetItem = {
@@ -289,6 +441,38 @@ export const xAxisLabelRotation = {
     default: defaultXAxis.xAxisLabelRotation,
     renderTrigger: true,
     description: t('Input field supports custom rotation. e.g. 30 for 30°'),
+  },
+};
+
+export const xAxisLabelInterval = {
+  name: 'xAxisLabelInterval',
+  config: {
+    type: 'SelectControl',
+    freeForm: false,
+    clearable: false,
+    label: t('X Axis Label Interval'),
+    choices: [
+      ['auto', t('Auto')],
+      ['0', t('All')],
+    ],
+    default: defaultXAxis.xAxisLabelInterval,
+    renderTrigger: true,
+    description: t('Choose how many X-Axis labels to show'),
+  },
+};
+
+export const forceMaxInterval = {
+  name: 'force_max_interval',
+  config: {
+    type: 'CheckboxControl',
+    label: t('Force Time Grain as Max Interval'),
+    renderTrigger: true,
+    default: false,
+    description: t(
+      'Forces selected Time Grain as the maximum interval for X Axis Labels',
+    ),
+    visibility: ({ controls }: ControlPanelsContainerProps) =>
+      Boolean(controls?.time_grain_sqla?.value),
   },
 };
 
@@ -340,6 +524,28 @@ export const minorTicks: ControlSetItem = {
   },
 };
 
+export const axisTicks: ControlSetItem = {
+  name: 'axisTicks',
+  config: {
+    type: 'CheckboxControl',
+    label: t('Axis ticks'),
+    default: true,
+    renderTrigger: true,
+    description: t('Show the main ticks on axes.'),
+  },
+};
+
+export const gridlines: ControlSetItem = {
+  name: 'gridlines',
+  config: {
+    type: 'CheckboxControl',
+    label: t('Gridlines'),
+    default: true,
+    renderTrigger: true,
+    description: t('Draw split lines for the main value axis ticks.'),
+  },
+};
+
 export const forceCategorical: ControlSetItem = {
   name: 'forceCategorical',
   config: {
@@ -348,5 +554,15 @@ export const forceCategorical: ControlSetItem = {
     default: false,
     renderTrigger: true,
     description: t('Make the x-axis categorical'),
+  },
+};
+
+export const showExtraControls: CustomControlItem = {
+  name: 'show_extra_controls',
+  config: {
+    type: 'CheckboxControl',
+    label: t('Extra Controls'),
+    renderTrigger: true,
+    default: false,
   },
 };

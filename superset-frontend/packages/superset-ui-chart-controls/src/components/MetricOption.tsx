@@ -18,17 +18,17 @@
  */
 import { useState, ReactNode, useLayoutEffect, RefObject } from 'react';
 
+import { Metric } from '@superset-ui/core';
+import { css, styled, SupersetTheme } from '@apache-superset/core/theme';
 import {
-  css,
-  styled,
-  Metric,
   SafeMarkdown,
-  SupersetTheme,
-} from '@superset-ui/core';
-import InfoTooltipWithTrigger from './InfoTooltipWithTrigger';
+  Typography,
+  // TODO: somehow doesn't work with our main Tooltip (?)
+  RawAntdTooltip as Tooltip,
+  InfoTooltip,
+} from '@superset-ui/core/components';
 import { ColumnTypeLabel } from './ColumnTypeLabel/ColumnTypeLabel';
 import CertifiedIconWithTooltip from './CertifiedIconWithTooltip';
-import Tooltip from './Tooltip';
 import { getMetricTooltipNode } from './labelUtils';
 import { SQLPopover } from './SQLPopover';
 
@@ -37,18 +37,32 @@ const FlexRowContainer = styled.div`
   display: flex;
 
   > svg {
-    margin-right: ${({ theme }) => theme.gridUnit}px;
+    margin-right: ${({ theme }) => theme.sizeUnit}px;
   }
 `;
 
 export interface MetricOptionProps {
-  metric: Omit<Metric, 'id'> & { label?: string };
+  metric: Omit<Metric, 'id' | 'uuid'> & { label?: string };
   openInNewWindow?: boolean;
   showFormula?: boolean;
   showType?: boolean;
   url?: string;
   labelRef?: RefObject<any>;
   shouldShowTooltip?: boolean;
+}
+
+/**
+ * `url` is an arbitrary caller-supplied string rendered as an href. Only
+ * http(s) and relative URLs become links; other schemes degrade to plain
+ * text.
+ */
+function isSafeHref(url: string): boolean {
+  try {
+    const { protocol } = new URL(url, window.location.origin);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 export function MetricOption({
@@ -61,23 +75,26 @@ export function MetricOption({
   url = '',
 }: MetricOptionProps) {
   const verbose = metric.verbose_name || metric.metric_name || metric.label;
-  const link = url ? (
-    <a href={url} target={openInNewWindow ? '_blank' : ''} rel="noreferrer">
-      {verbose}
-    </a>
-  ) : (
-    verbose
-  );
 
   const label = (
     <span
       className="option-label metric-option-label"
       css={(theme: SupersetTheme) => css`
-        margin-right: ${theme.gridUnit}px;
+        margin-right: ${theme.sizeUnit}px;
       `}
       ref={labelRef}
     >
-      {link}
+      {url && isSafeHref(url) ? (
+        <Typography.Link
+          href={url}
+          target={openInNewWindow ? '_blank' : ''}
+          rel="noreferrer"
+        >
+          {verbose}
+        </Typography.Link>
+      ) : (
+        verbose
+      )}
     </span>
   );
 
@@ -92,7 +109,7 @@ export function MetricOption({
 
   return (
     <FlexRowContainer className="metric-option">
-      {showType && <ColumnTypeLabel type="expression" />}
+      {showType && <ColumnTypeLabel type="metric" />}
       {shouldShowTooltip ? (
         <Tooltip id="metric-name-tooltip" title={tooltipText}>
           {label}
@@ -111,15 +128,13 @@ export function MetricOption({
         />
       )}
       {warningMarkdown && (
-        <InfoTooltipWithTrigger
-          className="text-warning"
-          icon="warning"
+        <InfoTooltip
+          type="warning"
           tooltip={<SafeMarkdown source={warningMarkdown} />}
           label={`warn-${metric.metric_name}`}
-          iconsStyle={{ marginLeft: 0 }}
+          iconStyle={{ marginLeft: 0 }}
           {...(metric.error_text && {
-            className: 'text-danger',
-            icon: 'exclamation-circle',
+            type: 'error',
           })}
         />
       )}

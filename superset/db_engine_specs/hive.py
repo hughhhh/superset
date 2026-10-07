@@ -29,9 +29,9 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from flask import current_app, g
+from flask import current_app as app, g
 from sqlalchemy import Column, text, types
-from sqlalchemy.engine.base import Engine
+from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.engine.url import URL
 from sqlalchemy.sql.expression import ColumnClause, Select
@@ -39,18 +39,15 @@ from sqlalchemy.sql.expression import ColumnClause, Select
 from superset import db
 from superset.common.db_query_status import QueryStatus
 from superset.constants import TimeGrain
-from superset.databases.utils import make_url_safe
-from superset.db_engine_specs.base import BaseEngineSpec
+from superset.db_engine_specs.base import BaseEngineSpec, DatabaseCategory
 from superset.db_engine_specs.presto import PrestoEngineSpec
 from superset.exceptions import SupersetException
 from superset.extensions import cache_manager
 from superset.models.sql_lab import Query
-from superset.sql_parse import Table
+from superset.sql.parse import Table
 from superset.superset_typing import ResultSetColumnType
 
 if TYPE_CHECKING:
-    # prevent circular imports
-
     from superset.models.core import Database
 
 logger = logging.getLogger(__name__)
@@ -69,7 +66,7 @@ def upload_to_s3(filename: str, upload_prefix: str, table: Table) -> str:
     import boto3  # pylint: disable=all
     from boto3.s3.transfer import TransferConfig  # pylint: disable=all
 
-    bucket_path = current_app.config["CSV_TO_HIVE_UPLOAD_S3_BUCKET"]
+    bucket_path = app.config["CSV_TO_HIVE_UPLOAD_S3_BUCKET"]
 
     if not bucket_path:
         logger.info("No upload bucket specified")
@@ -97,7 +94,39 @@ class HiveEngineSpec(PrestoEngineSpec):
     allows_alias_to_source_column = True
     allows_hidden_orderby_agg = False
 
+    # Unlike the ANSI-compliant Presto/Trino this spec is otherwise based on,
+    # HiveQL and Spark SQL quote identifiers with backticks; double quotes are
+    # treated as string literals by default.
+    identifier_quote_start: str = "`"
+    identifier_quote_end: str = "`"
+
     supports_dynamic_schema = True
+    supports_cross_catalog_queries = False
+
+    # Epoch-integer partition keys are the common Hive layout, and the
+    # one-argument form takes the bound being mirrored rather than "now".
+    partition_value_transform_default = "unix_timestamp(:value)"
+    # Explicitly opt out (overriding the inherited PrestoEngineSpec value):
+    # Hive/Spark's GROUPING SETS + GROUPING() marker semantics have not been
+    # verified against this query pattern, so fall back to one query per
+    # rollup level instead of assuming native support.
+    supports_grouping_sets: bool = False
+
+    metadata = {
+        "description": (
+            "Apache Hive is a data warehouse infrastructure built on Hadoop."
+        ),
+        "logo": "apache-hive.svg",
+        "homepage_url": "https://hive.apache.org/",
+        "categories": [
+            DatabaseCategory.APACHE_PROJECTS,
+            DatabaseCategory.QUERY_ENGINES,
+            DatabaseCategory.OPEN_SOURCE,
+        ],
+        "pypi_packages": ["pyhive"],
+        "connection_string": "hive://hive@{hostname}:{port}/{database}",
+        "default_port": 10000,
+    }
 
     # When running `SHOW FUNCTIONS`, what is the name of the column with the
     # function names?
@@ -192,13 +221,24 @@ class HiveEngineSpec(PrestoEngineSpec):
 
         if to_sql_kwargs["if_exists"] == "fail":
             # Ensure table doesn't already exist.
+            escaped_table = (
+                table.table.replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            # Hive LIKE uses backslash as the escape character. Python needs \\\\
+            # to produce the two-character SQL literal \\ (a single backslash).
+            escape_clause = " ESCAPE '\\\\'"
             if table.schema:
+                escaped_schema = table.schema.replace("`", "``")
                 table_exists = not database.get_df(
-                    f"SHOW TABLES IN {table.schema} LIKE '{table.table}'"
+                    f"SHOW TABLES IN `{escaped_schema}`"
+                    f" LIKE '{escaped_table}'{escape_clause}"
                 ).empty
             else:
                 table_exists = not database.get_df(
-                    f"SHOW TABLES LIKE '{table.table}'"
+                    f"SHOW TABLES LIKE '{escaped_table}'{escape_clause}"
                 ).empty
 
             if table_exists:
@@ -209,7 +249,8 @@ class HiveEngineSpec(PrestoEngineSpec):
                 catalog=table.catalog,
                 schema=table.schema,
             ) as engine:
-                engine.execute(f"DROP TABLE IF EXISTS {str(table)}")
+                with engine.begin() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {str(table)}"))
 
         def _get_hive_type(dtype: np.dtype[Any]) -> str:
             hive_type_by_dtype = {
@@ -226,7 +267,7 @@ class HiveEngineSpec(PrestoEngineSpec):
         )
 
         with tempfile.NamedTemporaryFile(
-            dir=current_app.config["UPLOAD_FOLDER"], suffix=".parquet"
+            dir=app.config["UPLOAD_FOLDER"], suffix=".parquet"
         ) as file:
             pq.write_table(pa.Table.from_pandas(df), where=file.name)
 
@@ -235,22 +276,25 @@ class HiveEngineSpec(PrestoEngineSpec):
                 catalog=table.catalog,
                 schema=table.schema,
             ) as engine:
-                engine.execute(
-                    text(
-                        f"""
-                        CREATE TABLE {str(table)} ({schema_definition})
-                        STORED AS PARQUET
-                        LOCATION :location
-                        """
-                    ),
-                    location=upload_to_s3(
-                        filename=file.name,
-                        upload_prefix=current_app.config[
-                            "CSV_TO_HIVE_UPLOAD_DIRECTORY_FUNC"
-                        ](database, g.user, table.schema),
-                        table=table,
-                    ),
-                )
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            CREATE TABLE {str(table)} ({schema_definition})
+                            STORED AS PARQUET
+                            LOCATION :location
+                            """
+                        ),
+                        {
+                            "location": upload_to_s3(
+                                filename=file.name,
+                                upload_prefix=app.config[
+                                    "CSV_TO_HIVE_UPLOAD_DIRECTORY_FUNC"
+                                ](database, g.user, table.schema),
+                                table=table,
+                            ),
+                        },
+                    )
 
     @classmethod
     def convert_dttm(
@@ -261,8 +305,9 @@ class HiveEngineSpec(PrestoEngineSpec):
         if isinstance(sqla_type, types.Date):
             return f"CAST('{dttm.date().isoformat()}' AS DATE)"
         if isinstance(sqla_type, types.TIMESTAMP):
-            return f"""CAST('{dttm
-                .isoformat(sep=" ", timespec="microseconds")}' AS TIMESTAMP)"""
+            return f"""CAST('{
+                dttm.isoformat(sep=" ", timespec="microseconds")
+            }' AS TIMESTAMP)"""
         return None
 
     @classmethod
@@ -273,10 +318,37 @@ class HiveEngineSpec(PrestoEngineSpec):
         catalog: str | None = None,
         schema: str | None = None,
     ) -> tuple[URL, dict[str, Any]]:
-        if schema:
-            uri = uri.set(database=parse.quote(schema, safe=""))
+        """
+        Return the URI and connection arguments unchanged.
 
+        This overrides the Presto implementation, whose ``catalog/schema`` URI
+        convention doesn't apply to PyHive URLs. The URI must also not be
+        rewritten to point at the selected schema: PyHive issues ``USE`` on the
+        URI database at connect time, so on backends where the URI database
+        selects a catalog (e.g. Spark Thrift Server) rewriting it would be seen
+        as a catalog change and break table resolution. Schema selection is
+        handled by :meth:`get_prequeries` instead.
+        """
         return uri, connect_args
+
+    @classmethod
+    def get_prequeries(
+        cls,
+        database: Database,
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> list[str]:
+        """
+        Return a ``USE`` statement to select the schema for new connections.
+
+        A plain single-identifier ``USE`` is valid on both HiveServer2 and
+        Spark Thrift Server, and on the latter it resolves within the current
+        catalog rather than replacing it.
+        """
+        if schema:
+            escaped_schema = schema.replace("`", "``")
+            return [f"USE `{escaped_schema}`"]
+        return []
 
     @classmethod
     def get_schema_from_engine_params(
@@ -402,12 +474,13 @@ class HiveEngineSpec(PrestoEngineSpec):
                     last_log_line = len(log_lines)
                 if needs_commit:
                     db.session.commit()  # pylint: disable=consider-using-transaction
-            if sleep_interval := current_app.config.get("HIVE_POLL_INTERVAL"):
+            if sleep_interval := app.config.get("HIVE_POLL_INTERVAL"):
                 logger.warning(
-                    "HIVE_POLL_INTERVAL is deprecated and will be removed in 3.0. Please use DB_POLL_INTERVAL_SECONDS instead"  # noqa: E501
+                    "HIVE_POLL_INTERVAL is deprecated and will be removed in 3.0. "
+                    "Please use DB_POLL_INTERVAL_SECONDS instead"
                 )
             else:
-                sleep_interval = current_app.config["DB_POLL_INTERVAL_SECONDS"].get(
+                sleep_interval = app.config["DB_POLL_INTERVAL_SECONDS"].get(
                     cls.engine, 5
                 )
             time.sleep(sleep_interval)
@@ -440,7 +513,7 @@ class HiveEngineSpec(PrestoEngineSpec):
             # table is not partitioned
             return None
         if values is not None and columns is not None:
-            for col_name, value in zip(col_names, values):
+            for col_name, value in zip(col_names, values, strict=False):
                 for clm in columns:
                     if clm.get("name") == col_name:
                         query = query.where(Column(col_name) == value)
@@ -482,9 +555,12 @@ class HiveEngineSpec(PrestoEngineSpec):
         order_by: list[tuple[str, bool]] | None = None,
         filters: dict[Any, Any] | None = None,
     ) -> str:
-        full_table_name = (
-            f"{table.schema}.{table.table}" if table.schema else table.table
-        )
+        escaped_table = table.table.replace("`", "``")
+        if table.schema:
+            escaped_schema = table.schema.replace("`", "``")
+            full_table_name = f"`{escaped_schema}`.`{escaped_table}`"
+        else:
+            full_table_name = f"`{escaped_table}`"
         return f"SHOW PARTITIONS {full_table_name}"
 
     @classmethod
@@ -492,17 +568,20 @@ class HiveEngineSpec(PrestoEngineSpec):
         cls,
         database: Database,
         table: Table,
-        engine: Engine,
+        dialect: Dialect,
         limit: int = 100,
         show_cols: bool = False,
         indent: bool = True,
         latest_partition: bool = True,
         cols: list[ResultSetColumnType] | None = None,
     ) -> str:
+        # remove catalog from table name if it exists
+        table = Table(table.table, table.schema, None)
+
         return super(PrestoEngineSpec, cls).select_star(
             database,
             table,
-            engine,
+            dialect,
             limit,
             show_cols,
             indent,
@@ -511,53 +590,25 @@ class HiveEngineSpec(PrestoEngineSpec):
         )
 
     @classmethod
-    def get_url_for_impersonation(
-        cls,
-        url: URL,
-        impersonate_user: bool,
-        username: str | None,
-        access_token: str | None,
-    ) -> URL:
-        """
-        Return a modified URL with the username set.
-
-        :param url: SQLAlchemy URL object
-        :param impersonate_user: Flag indicating if impersonation is enabled
-        :param username: Effective username
-        """
-        # Do nothing in the URL object since instead this should modify
-        # the configuration dictionary. See get_configuration_for_impersonation
-        return url
-
-    @classmethod
-    def update_impersonation_config(  # pylint: disable=too-many-arguments
+    def impersonate_user(
         cls,
         database: Database,
-        connect_args: dict[str, Any],
-        uri: str,
         username: str | None,
-        access_token: str | None,
-    ) -> None:
-        """
-        Update a configuration dictionary
-        that can set the correct properties for impersonating users
-        :param database: the Database Object
-        :param connect_args:
-        :param uri: URI string
-        :param impersonate_user: Flag indicating if impersonation is enabled
-        :param username: Effective username
-        :return: None
-        """
-        url = make_url_safe(uri)
-        backend_name = url.get_backend_name()
+        user_token: str | None,
+        url: URL,
+        engine_kwargs: dict[str, Any],
+    ) -> tuple[URL, dict[str, Any]]:
+        if username is None:
+            return url, engine_kwargs
 
-        # Must be Hive connection, enable impersonation, and set optional param
-        # auth=LDAP|KERBEROS
-        # this will set hive.server2.proxy.user=$effective_username on connect_args['configuration']  # noqa: E501
-        if backend_name == "hive" and username is not None:
+        backend_name = url.get_backend_name()
+        connect_args = engine_kwargs.setdefault("connect_args", {})
+        if backend_name == "hive":
             configuration = connect_args.get("configuration", {})
             configuration["hive.server2.proxy.user"] = username
             connect_args["configuration"] = configuration
+
+        return url, engine_kwargs
 
     @staticmethod
     def execute(  # type: ignore
@@ -637,7 +688,8 @@ class HiveEngineSpec(PrestoEngineSpec):
         sql = "SHOW VIEWS"
 
         if schema:
-            sql += f" IN `{schema}`"
+            escaped_schema = schema.replace("`", "``")
+            sql += f" IN `{escaped_schema}`"
 
         with database.get_raw_connection(schema=schema) as conn:
             cursor = conn.cursor()

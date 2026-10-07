@@ -18,17 +18,18 @@
  */
 
 import { ErrorLevel, ErrorSource, ErrorTypeEnum } from '@superset-ui/core';
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
-import ErrorMessageWithStackTrace from './ErrorMessageWithStackTrace';
-import BasicErrorAlert from './BasicErrorAlert';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
+import { ErrorMessageWithStackTrace } from './ErrorMessageWithStackTrace';
+import { BasicErrorAlert } from './BasicErrorAlert';
 
 jest.mock(
-  'src/components/Icons/Icon',
+  '@superset-ui/core/components/Icons/AsyncIcon',
   () =>
-    ({ fileName }: { fileName: string }) => (
-      <span role="img" aria-label={fileName.replace('_', '-')} />
-    ),
+    ({ fileName }: { fileName: string }) =>
+      (
+        // eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- mirrors AsyncIcon's real span+role="img" shape
+        <span role="img" aria-label={fileName.replace('_', '-')} />
+      ),
 );
 
 const mockedProps = {
@@ -43,20 +44,32 @@ test('should render', () => {
   expect(container).toBeInTheDocument();
 });
 
-test('should render the stacktrace', () => {
+test('should render the stacktrace', async () => {
   render(<ErrorMessageWithStackTrace {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(screen.getByText('Stacktrace')).toBeInTheDocument();
 });
 
-test('should render the link', () => {
+test('should render the link', async () => {
   render(<ErrorMessageWithStackTrace {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   const link = screen.getByRole('link');
-  expect(link).toHaveTextContent('(Request Access)');
+  expect(link).toHaveTextContent('Request Access');
   expect(link).toHaveAttribute('href', mockedProps.link);
+});
+
+test('should render a close button by default', () => {
+  render(<ErrorMessageWithStackTrace {...mockedProps} />);
+  expect(screen.getByRole('button', { name: /close/i })).toBeInTheDocument();
+});
+
+test('should not render a close button when closable is false', () => {
+  render(<ErrorMessageWithStackTrace {...mockedProps} closable={false} />);
+  expect(
+    screen.queryByRole('button', { name: /close/i }),
+  ).not.toBeInTheDocument();
 });
 
 test('should render the fallback', () => {

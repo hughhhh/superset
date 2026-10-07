@@ -16,10 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { render } from '@testing-library/react';
-import '@testing-library/jest-dom'; // For advanced DOM assertions
+import { render, screen } from 'spec/helpers/testing-library';
 import { CurrentCalendarFrame } from '../components/CurrentCalendarFrame';
-import { CurrentWeek } from '../types';
+import { CurrentDay, CurrentWeek } from '../types';
 
 const mockOnChange = jest.fn();
 
@@ -33,4 +32,10 @@ test('returns null if value is not a valid CurrentRangeType', () => {
     <CurrentCalendarFrame onChange={mockOnChange} value="InvalidValue" />,
   );
   expect(container.childNodes.length).toBe(0);
+});
+
+test('selects the radio button matching the current value', () => {
+  render(<CurrentCalendarFrame onChange={mockOnChange} value={CurrentDay} />);
+
+  expect(screen.getByRole('radio', { name: CurrentDay })).toBeChecked();
 });

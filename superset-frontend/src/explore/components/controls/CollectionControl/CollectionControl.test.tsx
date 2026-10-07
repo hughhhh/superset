@@ -16,12 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import userEvent from '@testing-library/user-event';
-import { render, screen } from 'spec/helpers/testing-library';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import CollectionControl from '.';
 
 jest.mock('@superset-ui/chart-controls', () => ({
-  InfoTooltipWithTrigger: (props: any) => (
+  InfoTooltip: (props: any) => (
     <button
       onClick={props.onClick}
       type="button"
@@ -106,10 +105,10 @@ test('Should have add button', async () => {
   render(<CollectionControl {...props} />);
 
   expect(
-    await screen.findByRole('button', { name: 'plus-large' }),
+    await screen.findByRole('button', { name: 'plus' }),
   ).toBeInTheDocument();
   expect(props.onChange).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'plus-large' }));
+  await userEvent.click(screen.getByRole('button', { name: 'plus' }));
   expect(props.onChange).toHaveBeenCalledWith([
     { key: 'hrYAZ5iBH' },
     undefined,
@@ -120,18 +119,27 @@ test('Should have remove button', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
 
-  expect(
-    await screen.findByRole('button', { name: 'remove-item' }),
-  ).toBeInTheDocument();
+  const removeButton = await screen.findByRole('img', { name: 'close' });
+  expect(removeButton).toBeInTheDocument();
   expect(props.onChange).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'remove-item' }));
+  const buttonElement = removeButton.closest('button');
+  expect(buttonElement).not.toBeNull();
+  await userEvent.click(buttonElement!);
   expect(props.onChange).toHaveBeenCalledWith([]);
 });
 
 test('Should have SortableDragger icon', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
-  expect(await screen.findByLabelText('drag')).toBeVisible();
+  expect(await screen.findByLabelText('Drag to reorder')).toBeVisible();
+});
+
+test('Drag activator exposes aria-label="Drag to reorder"', async () => {
+  const props = createProps();
+  render(<CollectionControl {...props} />);
+  const dragActivator = await screen.findByLabelText('Drag to reorder');
+  expect(dragActivator).toHaveAttribute('aria-label', 'Drag to reorder');
+  expect(dragActivator.tagName).toBe('BUTTON');
 });
 
 test('Should call Control component', async () => {
@@ -140,6 +148,6 @@ test('Should call Control component', async () => {
 
   expect(await screen.findByTestId('TestControl')).toBeInTheDocument();
   expect(props.onChange).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByTestId('TestControl'));
+  await userEvent.click(screen.getByTestId('TestControl'));
   expect(props.onChange).toHaveBeenCalledWith([{ key: 'hrYAZ5iBH' }]);
 });

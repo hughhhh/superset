@@ -17,39 +17,52 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import sys
 import urllib
 from datetime import datetime
 from re import Pattern
-from typing import Any, TYPE_CHECKING, TypedDict
+from typing import Any, Callable, TYPE_CHECKING, TypedDict
 
 import pandas as pd
 from apispec import APISpec
 from apispec.ext.marshmallow import MarshmallowPlugin
-from deprecation import deprecated
+from flask import current_app, g, has_app_context, has_request_context
 from flask_babel import gettext as __
 from marshmallow import fields, Schema
 from marshmallow.exceptions import ValidationError
-from sqlalchemy import column, types
+from sqlalchemy import column, func, types
 from sqlalchemy.engine.base import Engine
+from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.engine.url import URL
-from sqlalchemy.sql import sqltypes
+from sqlalchemy.sql import column as sql_column, select, sqltypes
+from sqlalchemy.sql.expression import table as sql_table
 
 from superset.constants import TimeGrain
 from superset.databases.schemas import encrypted_field_properties, EncryptedString
 from superset.databases.utils import make_url_safe
-from superset.db_engine_specs.base import BaseEngineSpec, BasicPropertiesType
+from superset.db_engine_specs.base import (
+    BaseEngineSpec,
+    BasicPropertiesType,
+    DatabaseCategory,
+)
 from superset.db_engine_specs.exceptions import SupersetDBAPIConnectionError
 from superset.errors import SupersetError, SupersetErrorType
 from superset.exceptions import SupersetException
-from superset.sql.parse import SQLScript
-from superset.sql_parse import Table
-from superset.superset_typing import ResultSetColumnType
+from superset.sql.parse import SQLScript, Table
+from superset.superset_typing import FetchedRows, ResultSetColumnType
 from superset.utils import core as utils, json
-from superset.utils.hashing import md5_sha_from_str
+from superset.utils.hashing import hash_from_str
+
+if TYPE_CHECKING:
+    from sqlalchemy.sql.expression import Select
+
+logger = logging.getLogger(__name__)
 
 try:
+    import google.auth
     from google.cloud import bigquery
     from google.oauth2 import service_account
 
@@ -66,6 +79,100 @@ except ModuleNotFoundError:
 
 if TYPE_CHECKING:
     from superset.models.core import Database  # pragma: no cover
+
+
+logger = logging.getLogger()
+
+
+# BigQuery string escape sequences keyed off documented escapes in
+# https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#string_and_bytes_literals.
+# Backslash MUST be first so subsequent escapes don't double-escape their own
+# backslash.  ``\?``, ``\"`` and ``\``` are valid BigQuery escapes but
+# intentionally omitted because those characters do not require escaping
+# inside a single-quoted literal.  ``\0`` is NOT a valid BigQuery escape
+# (octal escapes require exactly three digits); the null byte instead falls
+# through to the ``\xhh`` fallback below.
+_BIGQUERY_STRING_ESCAPES = {
+    "\\": "\\\\",
+    "'": "\\'",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\v": "\\v",
+    "\a": "\\a",
+}
+
+
+def _process_string_literal(value: str) -> str:
+    """
+    Escape a string value for use as a BigQuery SQL literal.
+
+    BigQuery requires backslash escaping for single quotes inside string
+    literals (``'O\\'Brien'``).  Doubled single quotes (``'O''Brien'``) are
+    **not** valid — BigQuery parses them as two concatenated string literals
+    without whitespace, causing a syntax error:
+    ``concatenated string literals must be separated by whitespace``.
+
+    BigQuery also forbids literal newlines, carriage returns, and other
+    control characters inside a quoted string; those must be written using
+    escape sequences (``\\n``, ``\\r``, ``\\t`` …).  Control characters
+    without a named escape are emitted as a ``\\xhh`` hex escape; printable
+    Unicode passes through unchanged because BigQuery accepts UTF-8 inside
+    string literals.
+
+    The upstream ``sqlalchemy-bigquery`` dialect relies on Python's ``repr()``
+    to quote values, which switches to double-quote delimiters when the
+    string contains an apostrophe (e.g. ``repr("O'Brien")`` → ``"O'Brien"``).
+    Double-quoted tokens inside compiled SQL would be parsed as identifiers,
+    so the query also fails.  This helper always produces a single-quoted
+    literal.
+    """
+    parts = []
+    for ch in value:
+        escape = _BIGQUERY_STRING_ESCAPES.get(ch)
+        if escape is not None:
+            parts.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            parts.append(f"\\x{ord(ch):02x}")
+        else:
+            parts.append(ch)
+    return f"'{''.join(parts)}'"
+
+
+def _monkeypatch_bigquery_string_literal() -> None:
+    """
+    Patch the sqlalchemy-bigquery dialect so that string literals containing
+    apostrophes are rendered correctly when ``literal_binds=True``.
+
+    Without this patch, a filter value like ``O'Brien`` is compiled as the
+    double-quoted identifier ``"O'Brien"`` instead of the single-quoted literal
+    ``'O\\'Brien'``, causing BigQuery to return a syntax error.
+
+    This follows the same pattern used for the Databricks dialect fix in
+    ``superset/db_engine_specs/databricks.py``.
+    """
+    try:
+        from sqlalchemy_bigquery import BigQueryDialect
+
+        class BigQuerySafeString(types.TypeDecorator):
+            impl = types.String
+            cache_ok = True
+
+            def literal_processor(self, dialect: Any) -> Callable[[str], str]:
+                if dialect.name == "bigquery":
+                    return _process_string_literal
+                return super().literal_processor(dialect)
+
+        BigQueryDialect.colspecs[types.String] = BigQuerySafeString
+
+    except ImportError:
+        pass
+
+
+_monkeypatch_bigquery_string_literal()
+
 
 CONNECTION_DATABASE_PERMISSIONS_REGEX = re.compile(
     "Access Denied: Project (?P<project_name>.+?): User does not have "
@@ -92,6 +199,11 @@ SYNTAX_ERROR_REGEX = re.compile(
 
 ma_plugin = MarshmallowPlugin()
 
+# Initial sample size for the progressive fetch in ``fetch_data``. Reading a
+# small first batch lets us measure the row size before deciding how many
+# more rows fit within ``BQ_FETCH_MAX_MB``.
+_BQ_INITIAL_SAMPLE_ROWS = 1000
+
 
 class BigQueryParametersSchema(Schema):
     credentials_info = EncryptedString(
@@ -113,12 +225,69 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
 
     engine = "bigquery"
     engine_name = "Google BigQuery"
+    # The engine's default text comparison is binary, so a mirrored
+    # ``partition_col = T(v)`` agrees with the ``col = v`` it stands in for.
+    binary_string_comparison = True
     max_column_name_length = 128
     disable_ssh_tunneling = True
+
+    # BigQuery quotes identifiers with backticks rather than ANSI double quotes,
+    # and escapes an embedded backtick with a backslash rather than by
+    # doubling it (GoogleSQL, unlike MySQL/MariaDB backticks).
+    identifier_quote_start: str = "`"
+    identifier_quote_end: str = "`"
+    identifier_quote_escape_by_doubling: bool = False
 
     parameters_schema = BigQueryParametersSchema()
     default_driver = "bigquery"
     sqlalchemy_uri_placeholder = "bigquery://{project_id}"
+
+    metadata = {
+        "description": (
+            "Google BigQuery is a serverless, highly scalable data warehouse."
+        ),
+        "logo": "google-big-query.svg",
+        "homepage_url": "https://cloud.google.com/bigquery/",
+        "categories": [
+            DatabaseCategory.CLOUD_GCP,
+            DatabaseCategory.ANALYTICAL_DATABASES,
+            DatabaseCategory.PROPRIETARY,
+        ],
+        "pypi_packages": ["sqlalchemy-bigquery"],
+        "connection_string": "bigquery://{project_id}",
+        "install_instructions": (
+            'echo "sqlalchemy-bigquery" >> ./docker/requirements-local.txt'
+        ),
+        "authentication_methods": [
+            {
+                "name": "Service Account JSON",
+                "description": (
+                    "Upload service account credentials JSON or paste in Secure Extra"
+                ),
+                "secure_extra": {
+                    "credentials_info": {
+                        "type": "service_account",
+                        "project_id": "...",
+                        "private_key_id": "...",
+                        "private_key": "...",
+                        "client_email": "...",
+                        "client_id": "...",
+                        "auth_uri": "...",
+                        "token_uri": "...",
+                    }
+                },
+            },
+        ],
+        "notes": (
+            "Create a Service Account via GCP console with access to "
+            "BigQuery datasets. For CSV/Excel uploads, also install pandas_gbq."
+        ),
+        "warnings": [
+            "Google BigQuery Python SDK is not compatible with gevent. "
+            "Use a worker type other than gevent when deploying with gunicorn.",
+        ],
+        "docs_url": "https://github.com/googleapis/python-bigquery-sqlalchemy",
+    }
 
     # BigQuery doesn't maintain context when running multiple statements in the
     # same cursor, so we need to run all statements at once
@@ -126,11 +295,15 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
 
     allows_hidden_cc_in_orderby = True
 
-    supports_catalog = supports_dynamic_catalog = True
+    supports_catalog = supports_dynamic_catalog = supports_cross_catalog_queries = True
+    supports_dynamic_schema = True
+    supports_grouping_sets = True
 
     # when editing the database, mask this field in `encrypted_extra`
     # pylint: disable=invalid-name
-    encrypted_extra_sensitive_fields = {"$.credentials_info.private_key"}
+    encrypted_extra_sensitive_fields = {
+        "$.credentials_info.private_key": "Service Account Private Key",
+    }
 
     """
     https://www.python.org/dev/peps/pep-0249/#arraysize
@@ -240,13 +413,106 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         return None
 
     @classmethod
-    def fetch_data(cls, cursor: Any, limit: int | None = None) -> list[tuple[Any, ...]]:
-        data = super().fetch_data(cursor, limit)
-        # Support type BigQuery Row, introduced here PR #4071
-        # google.cloud.bigquery.table.Row
-        if data and type(data[0]).__name__ == "Row":
-            data = [r.values() for r in data]  # type: ignore
-        return data
+    def fetch_data(cls, cursor: Any, limit: int | None = None) -> list[tuple[Any, ...]]:  # noqa: C901
+        """
+        Progressive fetch for BigQuery to prevent browser memory overload.
+
+        Samples a first batch to estimate row size, then extrapolates the
+        total number of rows that fit within ``BQ_FETCH_MAX_MB``.
+        Falls back to the parent implementation if the initial read fails.
+        Errors after consuming rows propagate instead of returning partial data.
+        """
+        # ``BQ_FETCH_MAX_MB`` has a default in ``config.py``, so use bracket
+        # access in-context — a missing key should surface as a loud KeyError
+        # rather than be silently masked by a duplicated default here. The
+        # 200 fallback is only used when running outside an app context
+        # (e.g., direct unit-test calls to ``fetch_data``).
+        max_mb: int = (
+            current_app.config["BQ_FETCH_MAX_MB"] if has_app_context() else 200
+        )
+        max_bytes = max_mb * 1024 * 1024
+
+        first_batch: list[Any] = []
+        try:
+            initial_batch_size = (
+                min(_BQ_INITIAL_SAMPLE_ROWS, limit)
+                if limit
+                else _BQ_INITIAL_SAMPLE_ROWS
+            )
+            first_batch = cursor.fetchmany(initial_batch_size)
+
+            if not first_batch:
+                if has_request_context():
+                    g.bq_memory_limited = False
+                    g.bq_memory_limited_row_count = 0
+                return []
+
+            # Support BigQuery Row objects (PR #4071)
+            if type(first_batch[0]).__name__ == "Row":
+                first_batch = [r.values() for r in first_batch]
+
+            # Estimate how many rows fit in the memory budget.
+            # Sum container + element sizes (one level deep) for a better
+            # estimate. Most BigQuery cell values are primitives (str, int,
+            # float, date), so one level captures the dominant allocation.
+            first_batch_bytes = sum(
+                sys.getsizeof(row) + sum(sys.getsizeof(v) for v in row)
+                for row in first_batch
+            )
+            rows_fetched = len(first_batch)
+            avg_bytes_per_row = first_batch_bytes / rows_fetched
+            total_rows_for_target = int(max_bytes / avg_bytes_per_row)
+
+            if limit:
+                total_rows_for_target = min(limit, total_rows_for_target)
+
+            remaining_rows = total_rows_for_target - rows_fetched
+
+            # First batch already covers the budget or the result set
+            if rows_fetched < initial_batch_size or remaining_rows <= 0:
+                # A full sample can also be the entire result. Confirm an omitted
+                # row; a bounded cursor leaves its own EOF probe to the executor.
+                memory_limited = (
+                    remaining_rows <= 0
+                    and rows_fetched == initial_batch_size
+                    and bool(cursor.fetchmany(1))
+                )
+                if has_request_context():
+                    g.bq_memory_limited = memory_limited
+                    g.bq_memory_limited_row_count = len(first_batch)
+                return FetchedRows(first_batch, truncated=memory_limited)
+
+            # Fetch one extra row to confirm truncation without false positives
+            second_batch: list[Any] = cursor.fetchmany(remaining_rows + 1) or []
+            if second_batch and type(second_batch[0]).__name__ == "Row":
+                second_batch = [r.values() for r in second_batch]
+
+            # Truncation is confirmed only when more rows exist beyond the budget
+            memory_limited = len(second_batch) > remaining_rows
+            if memory_limited:
+                second_batch = second_batch[:remaining_rows]
+
+            data = first_batch + second_batch
+
+            if has_request_context():
+                g.bq_memory_limited = memory_limited
+                g.bq_memory_limited_row_count = len(data)
+            return FetchedRows(data, truncated=memory_limited)
+
+        except Exception as ex:  # pylint: disable=broad-except
+            # A forward-only cursor cannot replay the consumed sample. Falling
+            # back after an estimation, second-batch, or EOF-probe failure would
+            # silently discard it and return only the remaining rows as success.
+            if first_batch:
+                raise cls.get_dbapi_mapped_exception(ex) from ex
+            # An initial read failure leaves no buffered rows to lose.
+            data = super().fetch_data(cursor, limit)
+            if data and type(data[0]).__name__ == "Row":
+                data = [r.values() for r in data]  # type: ignore
+            if has_request_context():
+                g.bq_memory_limited = False
+                g.bq_memory_limited_row_count = len(data) if data else 0
+            return data
 
     @staticmethod
     def _mutate_label(label: str) -> str:
@@ -259,7 +525,7 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         :param label: Expected expression label
         :return: Conditionally mutated label
         """
-        label_hashed = "_" + md5_sha_from_str(label)
+        label_hashed = "_" + hash_from_str(label)
 
         # if label starts with number, add underscore as first character
         label_mutated = "_" + label if re.match(r"^\d", label) else label
@@ -281,45 +547,86 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         :param label: expected expression label
         :return: truncated label
         """
-        return "_" + md5_sha_from_str(label)
+        return "_" + hash_from_str(label)
 
     @classmethod
-    @deprecated(deprecated_in="3.0")
-    def normalize_indexes(cls, indexes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """
-        Normalizes indexes for more consistency across db engines
-
-        :param indexes: Raw indexes as returned by SQLAlchemy
-        :return: cleaner, more aligned index definition
-        """
-        normalized_idxs = []
-        # Fixing a bug/behavior observed in pybigquery==0.4.15 where
-        # the index's `column_names` == [None]
-        # Here we're returning only non-None indexes
-        for ix in indexes:
-            column_names = ix.get("column_names") or []
-            ix["column_names"] = [col for col in column_names if col is not None]
-            if ix["column_names"]:
-                normalized_idxs.append(ix)
-        return normalized_idxs
-
-    @classmethod
-    def get_indexes(
+    def where_latest_partition(
         cls,
         database: Database,
-        inspector: Inspector,
         table: Table,
-    ) -> list[dict[str, Any]]:
-        """
-        Get the indexes associated with the specified schema/table.
+        query: Select,
+        columns: list[ResultSetColumnType] | None = None,
+    ) -> Select | None:
+        if partition_column := cls.get_time_partition_column(database, table):
+            max_partition_id = cls.get_max_partition_id(database, table)
+            query = query.where(
+                column(partition_column) == func.PARSE_DATE("%Y%m%d", max_partition_id)
+            )
 
-        :param database: The database to inspect
-        :param inspector: The SQLAlchemy inspector
-        :param table: The table instance to inspect
-        :returns: The indexes
-        """
+        return query
 
-        return cls.normalize_indexes(inspector.get_indexes(table.table, table.schema))
+    @classmethod
+    def get_max_partition_id(
+        cls,
+        database: Database,
+        table: Table,
+    ) -> Select | None:
+        # Compose schema from catalog and schema
+        schema_parts = []
+        if table.catalog:
+            schema_parts.append(table.catalog)
+        if table.schema:
+            schema_parts.append(table.schema)
+        schema_parts.append("INFORMATION_SCHEMA")
+        schema = ".".join(schema_parts)
+        # Define a virtual table reference to INFORMATION_SCHEMA.PARTITIONS
+        partitions_table = sql_table(
+            "PARTITIONS",
+            sql_column("partition_id"),
+            sql_column("table_name"),
+            schema=schema,
+        )
+
+        # Build the query
+        query = select(
+            func.max(partitions_table.c.partition_id).label("max_partition_id")
+        ).where(partitions_table.c.table_name == table.table)
+
+        # Compile to BigQuery SQL
+        compiled_query = query.compile(
+            dialect=database.get_dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+
+        # Run the query and handle result
+        with database.get_raw_connection(
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as conn:
+            cursor = conn.cursor()
+            cursor.execute(str(compiled_query))
+            if row := cursor.fetchone():
+                return row[0]
+        return None
+
+    @classmethod
+    def get_time_partition_column(
+        cls,
+        database: Database,
+        table: Table,
+    ) -> str | None:
+        with cls.get_engine(
+            database, catalog=table.catalog, schema=table.schema
+        ) as engine:
+            client = cls._get_client(engine, database)
+            table_ref = f"{table.schema}.{table.table}"
+            if table.catalog:
+                table_ref = f"{table.catalog}.{table_ref}"
+            bq_table = client.get_table(table_ref)
+
+            if bq_table.time_partitioning:
+                return bq_table.time_partitioning.field
+        return None
 
     @classmethod
     def get_extra_table_metadata(
@@ -327,23 +634,38 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         database: Database,
         table: Table,
     ) -> dict[str, Any]:
-        indexes = database.get_indexes(table)
-        if not indexes:
-            return {}
-        partitions_columns = [
-            index.get("column_names", [])
-            for index in indexes
-            if index.get("name") == "partition"
-        ]
-        cluster_columns = [
-            index.get("column_names", [])
-            for index in indexes
-            if index.get("name") == "clustering"
-        ]
-        return {
-            "partitions": {"cols": partitions_columns},
-            "clustering": {"cols": cluster_columns},
-        }
+        payload = {}
+        partition_column = cls.get_time_partition_column(database, table)
+        with cls.get_engine(
+            database, catalog=table.catalog, schema=table.schema
+        ) as engine:
+            if partition_column:
+                max_partition_id = cls.get_max_partition_id(database, table)
+                sql = cls.select_star(
+                    database,
+                    table,
+                    engine.dialect,
+                    indent=False,
+                    show_cols=False,
+                    latest_partition=True,
+                )
+                payload.update(
+                    {
+                        "partitions": {
+                            "cols": [partition_column],
+                            "latest": {partition_column: max_partition_id},
+                            "partitionQuery": sql,
+                        },
+                        "indexes": [
+                            {
+                                "name": "partitioned",
+                                "cols": [partition_column],
+                                "type": "partitioned",
+                            }
+                        ],
+                    }
+                )
+        return payload
 
     @classmethod
     def epoch_to_dttm(cls) -> str:
@@ -352,6 +674,10 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
     @classmethod
     def epoch_ms_to_dttm(cls) -> str:
         return "TIMESTAMP_MILLIS({col})"
+
+    @classmethod
+    def epoch_us_to_dttm(cls) -> str:
+        return "TIMESTAMP_MICROS({col})"
 
     @classmethod
     def df_to_sql(
@@ -422,10 +748,21 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
                 "Could not import libraries needed to connect to BigQuery."
             )
 
-        credentials = service_account.Credentials.from_service_account_info(
-            engine.dialect.credentials_info
-        )
-        return bigquery.Client(credentials=credentials)
+        project: str | None = engine.url.host or None
+
+        if credentials_info := engine.dialect.credentials_info:
+            credentials = service_account.Credentials.from_service_account_info(
+                credentials_info
+            )
+            return bigquery.Client(credentials=credentials, project=project)
+
+        try:
+            credentials = google.auth.default()[0]
+            return bigquery.Client(credentials=credentials, project=project)
+        except google.auth.exceptions.DefaultCredentialsError as ex:
+            raise SupersetDBAPIConnectionError(
+                "The database credentials could not be found."
+            ) from ex
 
     @classmethod
     def estimate_query_cost(  # pylint: disable=too-many-arguments
@@ -445,7 +782,7 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         :param sql: SQL query with possibly multiple statements
         :param source: Source of the query (eg, "sql_lab")
         """
-        extra = database.get_extra() or {}
+        extra = database.get_extra(source) or {}
         if not cls.get_allow_cost_estimate(extra):
             raise SupersetException("Database does not support cost estimation")
 
@@ -455,6 +792,7 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
             database,
             catalog=catalog,
             schema=schema,
+            source=source,
         ) as engine:
             client = cls._get_client(engine, database)
             return [
@@ -466,7 +804,7 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
             ]
 
     @classmethod
-    def get_default_catalog(cls, database: Database) -> str | None:
+    def get_default_catalog(cls, database: Database) -> str:
         """
         Get the default catalog.
         """
@@ -496,7 +834,17 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         """
         engine: Engine
         with database.get_sqla_engine() as engine:
-            client = cls._get_client(engine, database)
+            try:
+                client = cls._get_client(engine, database)
+            except SupersetDBAPIConnectionError:
+                logger.warning(
+                    "Could not connect to database to get catalogs due to missing "
+                    "credentials. This is normal in certain circustances, for example, "
+                    "doing an import."
+                )
+                # return {} here, since it will be repopulated when creds are added
+                return set()
+
             projects = client.list_projects()
 
         return {project.project_id for project in projects}
@@ -509,10 +857,40 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         catalog: str | None = None,
         schema: str | None = None,
     ) -> tuple[URL, dict[str, Any]]:
-        if catalog:
-            uri = uri.set(host=catalog, database="")
+        if not uri.host:
+            # Triple-slash form (e.g., bigquery:///project): project is in database.
+            default_catalog = uri.database
+            default_schema = None
+        else:
+            # Standard forms: bigquery://project, bigquery://project/dataset
+            default_catalog = uri.host
+            default_schema = uri.database or None  # coerce empty string to None
+
+        uri = uri.set(
+            host=catalog or default_catalog,
+            database=schema or default_schema,
+        )
 
         return uri, connect_args
+
+    @classmethod
+    def get_schema_from_engine_params(
+        cls,
+        sqlalchemy_uri: URL,
+        connect_args: dict[str, Any],
+    ) -> str | None:
+        """
+        Return the default dataset encoded in a ``bigquery://project/dataset`` URI.
+
+        The BigQuery SQLAlchemy driver uses the URL ``database`` component as the
+        default dataset, but only when ``host`` (the project) is also present.
+        The triple-slash form ``bigquery:///project`` puts the project in
+        ``database`` with no host, so we guard against misidentifying it as a
+        dataset.
+        """
+        if sqlalchemy_uri.host and sqlalchemy_uri.database:
+            return sqlalchemy_uri.database
+        return None
 
     @classmethod
     def get_allow_cost_estimate(cls, extra: dict[str, Any]) -> bool:
@@ -639,7 +1017,7 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         cls,
         database: Database,
         table: Table,
-        engine: Engine,
+        dialect: Dialect,
         limit: int = 100,
         show_cols: bool = False,
         indent: bool = True,
@@ -699,7 +1077,7 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
         return super().select_star(
             database,
             table,
-            engine,
+            dialect,
             limit,
             show_cols,
             indent,
@@ -746,3 +1124,92 @@ class BigQueryEngineSpec(BaseEngineSpec):  # pylint: disable=too-many-public-met
             # If for some reason we get an exception, for example, no new line
             # We will return the original exception
             return exception
+
+    @staticmethod
+    def _information_schema_ref(schema: str, catalog: str | None) -> str:
+        escaped_schema = schema.replace("`", "``")
+        if catalog:
+            escaped_catalog = catalog.replace("`", "``")
+            return f"`{escaped_catalog}.{escaped_schema}.INFORMATION_SCHEMA.TABLES`"
+        return f"`{escaped_schema}.INFORMATION_SCHEMA.TABLES`"
+
+    @classmethod
+    def get_materialized_view_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
+        """
+        Get all materialized views from BigQuery.
+
+        BigQuery materialized views are not returned by the standard
+        get_view_names() method, so we need to query INFORMATION_SCHEMA directly.
+        """
+        if not schema:
+            return set()
+
+        catalog = database.get_default_catalog()
+        information_schema = cls._information_schema_ref(schema, catalog)
+        query = f"""
+        SELECT table_name
+        FROM {information_schema}
+        WHERE table_type = 'MATERIALIZED VIEW'
+        """  # noqa: S608
+
+        materialized_views = set()
+        try:
+            with database.get_raw_connection(catalog=catalog, schema=schema) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                materialized_views = {row[0] for row in cursor.fetchall()}
+        except Exception:
+            # If we can't fetch materialized views, return empty set
+            logger.warning(
+                "Unable to fetch materialized views for schema %s",
+                schema,
+                exc_info=True,
+            )
+
+        return materialized_views
+
+    @classmethod
+    def get_view_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
+        """
+        Get all views from BigQuery, excluding materialized views.
+
+        BigQuery's standard view discovery includes materialized views,
+        but we want to separate them for proper categorization.
+        """
+        if not schema:
+            return set()
+
+        catalog = database.get_default_catalog()
+        information_schema = cls._information_schema_ref(schema, catalog)
+        query = f"""
+        SELECT table_name
+        FROM {information_schema}
+        WHERE table_type = 'VIEW'
+        """  # noqa: S608
+
+        views = set()
+        try:
+            with database.get_raw_connection(catalog=catalog, schema=schema) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                views = {row[0] for row in cursor.fetchall()}
+        except Exception:
+            # If we can't fetch views, fall back to the default implementation
+            logger.warning(
+                "Unable to fetch views for schema %s, falling back to default",
+                schema,
+                exc_info=True,
+            )
+            return super().get_view_names(database, inspector, schema)
+
+        return views
