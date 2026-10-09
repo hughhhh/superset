@@ -34,17 +34,15 @@ under the License.
 [![Storybook](https://img.shields.io/badge/storybook-live-ff4785.svg)](https://superset-storybook.netlify.app)
 [![Bundle Analyzer](https://img.shields.io/badge/bundle%20analyzer-nightly-8dd6f9.svg)](https://superset-bundle-analyzer.netlify.app)
 
-<picture width="500">
+<picture>
   <source
-    width="600"
     media="(prefers-color-scheme: dark)"
-    src="https://superset.apache.org/img/superset-logo-horiz-dark.svg"
-    alt="Superset logo (dark)"
+    srcset="https://superset.apache.org/img/superset-logo-horiz-dark.svg"
   />
   <img
     width="600"
     src="https://superset.apache.org/img/superset-logo-horiz-apache.svg"
-    alt="Superset logo (light)"
+    alt="Superset logo"
   />
 </picture>
 
