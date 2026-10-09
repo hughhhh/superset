@@ -17,7 +17,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-10-05 23:38+0000\n"
+"POT-Creation-Date: 2026-10-09 03:23+0000\n"
 "PO-Revision-Date: 2016-05-02 08:49-0700\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: en\n"
@@ -26,7 +26,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.17.0\n"
+"Generated-By: Babel 2.18.0\n"
 
 #, python-format
 msgid ""
@@ -268,12 +268,6 @@ msgid "%(object)s does not exist in this database."
 msgstr ""
 
 #, python-format
-msgid ""
-"%(partition)s is hidden from Explore, but no filter is mirrored onto it —"
-" queries will scan every partition until a column is mapped."
-msgstr ""
-
-#, python-format
 msgid "%(prefix)s %(title)s"
 msgstr ""
 
@@ -464,6 +458,12 @@ msgid ""
 "%s items could not be tagged because you don’t have edit permissions to "
 "all selected objects."
 msgstr ""
+
+#, python-format
+msgid "%s key"
+msgid_plural "%s keys"
+msgstr[0] ""
+msgstr[1] ""
 
 #, python-format
 msgid "%s metric"
@@ -1067,6 +1067,16 @@ msgstr ""
 msgid "A partition value transform cannot call %(functions)s."
 msgstr ""
 
+msgid ""
+"A partition value transform cannot change data. It is evaluated against "
+"the database to check that it mirrors, so it has to be a read."
+msgstr ""
+
+msgid ""
+"A partition value transform cannot contain a MySQL executable comment, "
+"which the database executes and every validator reads as a comment."
+msgstr ""
+
 msgid "A partition value transform cannot contain a sub-query."
 msgstr ""
 
@@ -1107,6 +1117,11 @@ msgid "A rule with this name already exists."
 msgstr ""
 
 msgid ""
+"A semantic view's provider query is produced when the chart runs and "
+"returned with its data."
+msgstr ""
+
+msgid ""
 "A set of parameters that become available in the query using Jinja "
 "templating syntax"
 msgstr ""
@@ -1141,6 +1156,12 @@ msgid "A timeout occurred while taking a screenshot."
 msgstr ""
 
 msgid "A valid color scheme is required"
+msgstr ""
+
+msgid ""
+"A value transform cannot contain a MySQL executable comment (/*! ... */ "
+"or /*M! ... */). Those are comments to every validator and statement text"
+" to the database, so what would run is not what was checked."
 msgstr ""
 
 #, python-format
@@ -1316,6 +1337,11 @@ msgstr ""
 
 #, fuzzy
 msgid "Add an annotation layer"
+msgstr ""
+
+msgid ""
+"Add an arrow on the left of collapsed JSON. A click on the arrow expands "
+"the value in the row. The icon on the right opens it in a dialog."
 msgstr ""
 
 msgid "Add an item"
@@ -1652,6 +1678,9 @@ msgstr ""
 msgid "Alert is active"
 msgstr ""
 
+msgid "Alert minimum interval"
+msgstr ""
+
 msgid "Alert name"
 msgstr ""
 
@@ -1703,6 +1732,18 @@ msgstr ""
 msgid "Alerts & Reports"
 msgstr ""
 
+msgid "Alerts & Reports configuration"
+msgstr ""
+
+msgid "Alerts & Reports configuration could not be updated."
+msgstr ""
+
+msgid "Alerts & Reports configuration parameters are invalid."
+msgstr ""
+
+msgid "Alerts & Reports configuration updated"
+msgstr ""
+
 msgid "Alerts & reports"
 msgstr ""
 
@@ -1710,6 +1751,9 @@ msgid "Align +/-"
 msgstr ""
 
 msgid "Align +/- for all columns"
+msgstr ""
+
+msgid "Alignment"
 msgstr ""
 
 msgid "All"
@@ -1805,6 +1849,9 @@ msgid "Allow users to select multiple values"
 msgstr ""
 
 msgid "Allowed Domains (comma separated)"
+msgstr ""
+
+msgid "Allowed e-mail domains"
 msgstr ""
 
 msgid "Alphabetical"
@@ -2099,6 +2146,9 @@ msgstr ""
 msgid "An error occurred while rendering the visualization: %s"
 msgstr ""
 
+msgid "An error occurred while saving the configuration"
+msgstr ""
+
 msgid "An error occurred while saving the semantic view"
 msgstr ""
 
@@ -2291,6 +2341,9 @@ msgstr ""
 msgid ""
 "Any databases that allow connections via SQL Alchemy URIs can be added. "
 "Learn about how to connect a database driver "
+msgstr ""
+
+msgid "Application default"
 msgstr ""
 
 #, python-format
@@ -3768,10 +3821,17 @@ msgstr ""
 msgid "Collapse"
 msgstr ""
 
+#, python-format
+msgid "Collapse %s"
+msgstr ""
+
 msgid "Collapse All"
 msgstr ""
 
 msgid "Collapse Datasource panel"
+msgstr ""
+
+msgid "Collapse JSON"
 msgstr ""
 
 msgid "Collapse all"
@@ -3781,6 +3841,9 @@ msgid "Collapse data panel"
 msgstr ""
 
 msgid "Collapse row"
+msgstr ""
+
+msgid "Collapse rows by default"
 msgstr ""
 
 msgid "Collapse settings"
@@ -4238,6 +4301,12 @@ msgstr ""
 msgid "Contains text (ILIKE %x%)"
 msgstr ""
 
+msgid "Content and permissions"
+msgstr ""
+
+msgid "Content and recipient edits are restricted"
+msgstr ""
+
 msgid "Content format"
 msgstr ""
 
@@ -4278,6 +4347,9 @@ msgstr ""
 msgid ""
 "Converted %s @import rule(s) to inline CSS. Review the result before "
 "saving."
+msgstr ""
+
+msgid "Copied"
 msgstr ""
 
 msgid "Copied to clipboard!"
@@ -6299,6 +6371,9 @@ msgstr ""
 msgid "Enable Retries"
 msgstr ""
 
+msgid "Enable attachments for alerts"
+msgstr ""
+
 msgid "Enable automatic retries on report failure"
 msgstr ""
 
@@ -6668,6 +6743,9 @@ msgstr ""
 msgid "Excluded subjects"
 msgstr ""
 
+msgid "Execute using my permissions"
+msgstr ""
+
 msgid "Executed SQL"
 msgstr ""
 
@@ -6683,6 +6761,10 @@ msgstr ""
 msgid "Existing dataset"
 msgstr ""
 
+#, python-format
+msgid "Existing minimum: %s seconds. Editing replaces it with whole minutes."
+msgstr ""
+
 msgid "Exit edit mode"
 msgstr ""
 
@@ -6692,7 +6774,14 @@ msgstr ""
 msgid "Expand"
 msgstr ""
 
+#, python-format
+msgid "Expand %s"
+msgstr ""
+
 msgid "Expand All"
+msgstr ""
+
+msgid "Expand JSON"
 msgstr ""
 
 msgid "Expand all"
@@ -6976,6 +7065,9 @@ msgstr ""
 
 #, python-format
 msgid "Failed to load columns for %s %s"
+msgstr ""
+
+msgid "Failed to load datasource metadata"
 msgstr ""
 
 #, python-format
@@ -7466,6 +7558,9 @@ msgid ""
 "{a} (series), {b} (name), {c} (value), {d} (percentage)"
 msgstr ""
 
+msgid "Format dates in email subjects"
+msgstr ""
+
 msgid ""
 "Format metrics or columns with currency symbols as prefixes or suffixes. "
 "Choose a symbol manually or use 'Auto-detect' to apply the correct symbol"
@@ -7770,6 +7865,9 @@ msgstr ""
 msgid "Horizontal alignment"
 msgstr ""
 
+msgid "Horizontal alignment of the metric value and supporting text"
+msgstr ""
+
 msgid "Host"
 msgstr ""
 
@@ -7961,6 +8059,9 @@ msgid "Include a description that will be sent with your report"
 msgstr ""
 
 msgid "Include a link back to Superset"
+msgstr ""
+
+msgid "Include attachment"
 msgstr ""
 
 #, python-format
@@ -8157,6 +8258,14 @@ msgstr ""
 msgid "Invalid date/timestamp format"
 msgstr ""
 
+#, python-format
+msgid "Invalid domain(s): %s"
+msgstr ""
+
+#, python-format
+msgid "Invalid e-mail domain: %(domain)s"
+msgstr ""
+
 msgid "Invalid executor type"
 msgstr ""
 
@@ -8214,6 +8323,9 @@ msgstr ""
 
 #, python-format
 msgid "Invalid rolling_type: %(type)s"
+msgstr ""
+
+msgid "Invalid semantic result cache version"
 msgstr ""
 
 msgid "Invalid state."
@@ -8315,6 +8427,9 @@ msgid "JSON Configuration"
 msgstr ""
 
 msgid "JSON Metadata"
+msgstr ""
+
+msgid "JSON in cell"
 msgstr ""
 
 msgid "JSON metadata"
@@ -8682,6 +8797,9 @@ msgid "Like (case insensitive)"
 msgstr ""
 
 msgid "Limit"
+msgstr ""
+
+msgid "Limit recipients to users"
 msgstr ""
 
 msgid "Limit type"
@@ -9741,6 +9859,9 @@ msgstr ""
 msgid "No archived items"
 msgstr ""
 
+msgid "No attachment will be generated. Saved attachment settings are retained."
+msgstr ""
+
 msgid "No available filters."
 msgstr ""
 
@@ -9794,6 +9915,12 @@ msgstr ""
 msgid "No filter"
 msgstr ""
 
+#, python-format
+msgid ""
+"No filter is mirrored onto %(partition)s — queries will scan every "
+"partition until a column is mapped."
+msgstr ""
+
 msgid "No filter is selected."
 msgstr ""
 
@@ -9840,6 +9967,9 @@ msgid "No multilayer deck.gl charts are currently added to this dashboard."
 msgstr ""
 
 msgid "No partition column is set."
+msgstr ""
+
+msgid "No provider query is available for this run."
 msgstr ""
 
 msgid "No records found"
@@ -10203,6 +10333,9 @@ msgstr ""
 msgid "One or more annotation layers failed loading."
 msgstr ""
 
+msgid "One or more chart-data queries failed"
+msgstr ""
+
 msgid "One or more columns already exist"
 msgstr ""
 
@@ -10240,10 +10373,16 @@ msgstr ""
 msgid "Only `SELECT` statements are allowed"
 msgstr ""
 
+msgid "Only admins can set this field to a user other than themselves"
+msgstr ""
+
 msgid "Only applies when \"Label Type\" is not set to a percentage."
 msgstr ""
 
 msgid "Only applies when \"Label Type\" is set to show values."
+msgstr ""
+
+msgid "Only e-mail addresses of existing active users can be used as recipients."
 msgstr ""
 
 msgid "Only exact match is available for non-string columns."
@@ -10298,6 +10437,9 @@ msgid "Open"
 msgstr ""
 
 msgid "Open Datasource tab"
+msgstr ""
+
+msgid "Open JSON"
 msgstr ""
 
 msgid "Open SQL Lab in a new tab"
@@ -11043,7 +11185,7 @@ msgid "Prefix or suffix"
 msgstr ""
 
 #, python-format
-msgid "Preparing %(count)s charts for export. This may take a moment."
+msgid "Preparing %(count)s rows for export. This may take a moment."
 msgstr ""
 
 msgid "Preparing dashboard Excel export…"
@@ -11538,6 +11680,12 @@ msgstr ""
 msgid "Replace"
 msgstr ""
 
+#, python-format
+msgid ""
+"Replace strftime date placeholders such as %Y-%m-%d in alert and report "
+"email subjects with the UTC date when sent."
+msgstr ""
+
 msgid "Report"
 msgstr ""
 
@@ -11601,6 +11749,12 @@ msgstr ""
 msgid "Report Schedule log prune failed."
 msgstr ""
 
+#, python-format
+msgid ""
+"Report Schedule not delivered: the following recipients are not allowed "
+"by the Alerts & Reports configuration: %(addresses)s"
+msgstr ""
+
 msgid "Report Schedule not found."
 msgstr ""
 
@@ -11623,6 +11777,9 @@ msgid "Report failed"
 msgstr ""
 
 msgid "Report is active"
+msgstr ""
+
+msgid "Report minimum interval"
 msgstr ""
 
 msgid "Report name"
@@ -11656,6 +11813,9 @@ msgid "Report updated"
 msgstr ""
 
 msgid "Reports"
+msgstr ""
+
+msgid "Reports require a content format"
 msgstr ""
 
 msgid "Repulsion"
@@ -12016,6 +12176,18 @@ msgstr ""
 msgid "Run a query to display results"
 msgstr ""
 
+msgid "Run alert query as"
+msgstr ""
+
+msgid "Run alert query as type"
+msgstr ""
+
+msgid "Run as"
+msgstr ""
+
+msgid "Run as type"
+msgstr ""
+
 msgid "Run current query"
 msgstr ""
 
@@ -12082,6 +12254,11 @@ msgstr ""
 msgid "SQL Query"
 msgstr ""
 
+msgid ""
+"SQL WHERE/HAVING expressions are not supported for semantic views. Remove"
+" the SQL clause or use a semantic dimension filter."
+msgstr ""
+
 msgid "SQL expression"
 msgstr ""
 
@@ -12138,6 +12315,9 @@ msgid "STRING"
 msgstr ""
 
 msgid "SUN"
+msgstr ""
+
+msgid "Same as \"Run as\""
 msgstr ""
 
 msgid "Sample Standard Deviation"
@@ -12865,6 +13045,9 @@ msgstr ""
 msgid "Select the type of color scheme to use."
 msgstr ""
 
+msgid "Select user"
+msgstr ""
+
 msgid "Select users"
 msgstr ""
 
@@ -12952,6 +13135,9 @@ msgstr ""
 msgid "Semantic views"
 msgstr ""
 
+msgid "Semantic views cannot enforce guest row-level security rules."
+msgstr ""
+
 msgid "Send Failed Reports"
 msgstr ""
 
@@ -12971,6 +13157,9 @@ msgid "Send as text"
 msgstr ""
 
 msgid "Send the failed report to all recipients after retries are exhausted"
+msgstr ""
+
+msgid "Separate domains with commas. Leave empty to allow any domain."
 msgstr ""
 
 msgid "September"
@@ -13364,6 +13553,9 @@ msgstr ""
 msgid "Show the main ticks on axes."
 msgstr ""
 
+msgid "Show the numbers along the value axis."
+msgstr ""
+
 msgid "Show total"
 msgstr ""
 
@@ -13524,6 +13716,11 @@ msgid "Solid background"
 msgstr ""
 
 msgid "Some charts did not finish loading. The export may be incomplete."
+msgstr ""
+
+msgid ""
+"Some existing alerts/reports conflict with the new configuration. Please "
+"update them first."
 msgstr ""
 
 msgid ""
@@ -13722,6 +13919,9 @@ msgstr ""
 msgid "Specific Date/Time"
 msgstr ""
 
+msgid "Specific user"
+msgstr ""
+
 msgid "Specify name to CREATE TABLE AS schema in: public"
 msgstr ""
 
@@ -13809,6 +14009,11 @@ msgid ""
 "Start field selection using current member IDs. This clears any existing "
 "query and formatting settings. Saved display titles cannot be safely "
 "mapped to member IDs. The saved chart is unchanged until you save."
+msgstr ""
+
+msgid ""
+"Start with row groups collapsed when row subtotals are shown. Each group "
+"can still be expanded with its arrow."
 msgstr ""
 
 msgid "Start y-axis at 0"
@@ -14433,6 +14638,9 @@ msgid ""
 "type DELETE again to continue."
 msgstr ""
 
+msgid "The alert query executor is only allowed on alerts"
+msgstr ""
+
 msgid "The annotation has been saved"
 msgstr ""
 
@@ -14714,6 +14922,12 @@ msgid ""
 "                    from rendering: %s"
 msgstr ""
 
+#, python-format
+msgid ""
+"The following recipients are not allowed by the Alerts & Reports "
+"configuration: %(addresses)s"
+msgstr ""
+
 msgid "The font size of the point labels"
 msgstr ""
 
@@ -14973,6 +15187,9 @@ msgstr ""
 msgid "The provided table was not found in the provided database"
 msgstr ""
 
+msgid "The provider query will be available after the chart runs."
+msgstr ""
+
 msgid "The query associated with the results was deleted."
 msgstr ""
 
@@ -15122,6 +15339,21 @@ msgid ""
 "objects."
 msgstr ""
 
+msgid ""
+"The semantic layer could not verify that this query result is complete. "
+"Retry the query; if it continues, ask an administrator to check the "
+"semantic-layer connection."
+msgstr ""
+
+msgid ""
+"The semantic layer returned only part of this query result. Narrow the "
+"time range or selected dimensions, or request a smaller explicit row "
+"limit, then retry. Result pagination is not supported yet."
+msgstr ""
+
+msgid "The semantic-layer provider is unavailable."
+msgstr ""
+
 msgid "The service url of the layer"
 msgstr ""
 
@@ -15254,6 +15486,18 @@ msgstr ""
 msgid "The user was updated successfully"
 msgstr ""
 
+msgid ""
+"The user whose database credentials are used to run the alert condition "
+"query. Defaults to the \"Run as\" user."
+msgstr ""
+
+#, python-format
+msgid ""
+"The user whose permissions and database credentials are used to render "
+"this %s. Application default uses ALERT_REPORTS_EXECUTORS. Only admins "
+"can pick another user."
+msgstr ""
+
 msgid "The user/password combination is not valid (Incorrect password for user)."
 msgstr ""
 
@@ -15290,6 +15534,12 @@ msgstr ""
 
 #, python-format
 msgid "The value transform on %(column)s cannot be saved: %(reason)s"
+msgstr ""
+
+#, python-format
+msgid ""
+"The value transform on %(mapped)s is not mirroring filters, so queries "
+"will scan every partition."
 msgstr ""
 
 msgid "The values overlap other breakpoint values"
@@ -15636,6 +15886,12 @@ msgstr ""
 
 #, python-format
 msgid ""
+"This %(schedule)s executes as another user. Only admins can change its "
+"content; set the Run As field to your own account to make this change."
+msgstr ""
+
+#, python-format
+msgid ""
 "This %(type)s will be moved to Recently Archived and may be permanently "
 "deleted on the next cleanup run."
 msgstr ""
@@ -15699,6 +15955,12 @@ msgid "This action will permanently delete the user."
 msgstr ""
 
 msgid ""
+"This alert query is not set to execute as your account. Only admins can "
+"change its condition; set \"Run alert query as\" to your own account "
+"first."
+msgstr ""
+
+msgid ""
 "This can be either an IP address (e.g. 127.0.0.1) or a domain name (e.g. "
 "mydatabase.com)."
 msgstr ""
@@ -15728,6 +15990,18 @@ msgid "This chart no longer exists."
 msgstr ""
 
 msgid "This chart only"
+msgstr ""
+
+msgid ""
+"This chart version can't be restored because the dataset it used has been"
+" permanently deleted. Restore a version that uses an existing dataset, or"
+" recreate the chart."
+msgstr ""
+
+msgid ""
+"This chart version can't be restored because the semantic view it used "
+"has been permanently deleted. Restore a version that uses an existing "
+"semantic view or dataset, or recreate the chart."
 msgstr ""
 
 msgid "This chart will be restored to the following version:"
@@ -16006,6 +16280,11 @@ msgstr ""
 msgid ""
 "This saved filter state predates the member-ID format. Reset it and "
 "explicitly choose its values again."
+msgstr ""
+
+msgid ""
+"This schedule will use your permissions. You need access to its content "
+"and, for alerts, its condition query. Changes take effect when you save."
 msgstr ""
 
 msgid ""
@@ -16685,6 +16964,9 @@ msgstr ""
 msgid "Unable to load dashboard"
 msgstr ""
 
+msgid "Unable to load the Alerts & Reports configuration."
+msgstr ""
+
 msgid ""
 "Unable to migrate query editor state to backend. Superset will retry "
 "later. Please contact your administrator if this problem persists."
@@ -16953,6 +17235,9 @@ msgstr ""
 msgid "Use %s to open in a new tab."
 msgstr ""
 
+msgid "Use 0 or leave empty to allow any schedule."
+msgstr ""
+
 msgid "Use :value for the filter bound."
 msgstr ""
 
@@ -16989,6 +17274,12 @@ msgid "Use current extent"
 msgstr ""
 
 msgid "Use date formatting even when metric value is not a timestamp"
+msgstr ""
+
+msgid ""
+"Use example.com for an exact domain, *.example.com for subdomains, or "
+"preset.* for preset.io and preset.ai. A trailing wildcard matches one "
+"segment. Leave empty to allow any domain."
 msgstr ""
 
 msgid "Use gradient"
@@ -17031,6 +17322,9 @@ msgid "User Name"
 msgstr ""
 
 msgid "User Registrations"
+msgstr ""
+
+msgid "User does not exist or is inactive"
 msgstr ""
 
 msgid "User doesn't have the proper permissions."
@@ -17125,6 +17419,9 @@ msgid "Value Format"
 msgstr ""
 
 msgid "Value and Percentage"
+msgstr ""
+
+msgid "Value axis labels"
 msgstr ""
 
 msgid "Value bounds"
@@ -17539,6 +17836,11 @@ msgid "When a secondary metric is provided, a linear color scale is used."
 msgstr ""
 
 msgid "When checked, the map will zoom to your data after each query"
+msgstr ""
+
+msgid ""
+"When disabled, alerts only send the message and link, without screenshots"
+" or data files. Applies to all alerts."
 msgstr ""
 
 msgid ""
@@ -18031,6 +18333,19 @@ msgstr ""
 msgid ""
 "You can create a new chart or use existing ones from the panel on the "
 "right"
+msgstr ""
+
+msgid ""
+"You can edit the name and schedule, but changing the delivered content or"
+" recipients requires updating it to execute with your permissions. Only "
+"admins can select other users."
+msgstr ""
+
+msgid ""
+"You can edit the name and schedule. Changing the alert condition requires"
+" its query to execute with your permissions. Changing the attachment "
+"content or recipients requires updating it to execute with your "
+"permissions. Only admins can select other users."
 msgstr ""
 
 msgid "You can enter a value that is not listed."
@@ -18789,6 +19104,9 @@ msgstr ""
 msgid "every month"
 msgstr ""
 
+msgid "example.com, *.example.org"
+msgstr ""
+
 msgid "expand"
 msgstr ""
 
@@ -18968,6 +19286,9 @@ msgstr ""
 msgid "minute(s)"
 msgstr ""
 
+msgid "minutes"
+msgstr ""
+
 msgid "month"
 msgstr ""
 
@@ -19119,6 +19440,10 @@ msgstr ""
 msgid "recent"
 msgstr ""
 
+#, python-format
+msgid "recipient %s is not allowed"
+msgstr ""
+
 msgid "recipients"
 msgstr ""
 
@@ -19143,10 +19468,17 @@ msgstr ""
 msgid "rowlevelsecurity"
 msgstr ""
 
+msgid "run as"
+msgstr ""
+
 msgid "running"
 msgstr ""
 
 msgid "save"
+msgstr ""
+
+#, python-format
+msgid "schedule \"%s\" runs more often than the minimum interval"
 msgstr ""
 
 #. do-not-translate
