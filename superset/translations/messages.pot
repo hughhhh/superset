@@ -900,6 +900,10 @@ msgstr ""
 msgid "A %(operator)s filter is only mirrored when the transform preserves ordering, which this one is not declared to do."
 msgstr ""
 
+#, python-format
+msgid "A %(operator)s filter on this text column is not mirrored: the database may treat strings that differ in case or trailing spaces as equal, and the mirrored predicate could then drop rows the filter keeps."
+msgstr ""
+
 msgid "A Big Number"
 msgstr ""
 
@@ -3754,7 +3758,7 @@ msgstr ""
 msgid "Column type"
 msgstr ""
 
-msgid "Column used for partition pruning on this table. Selecting one hides it from Explore's dimension and filter pickers by default."
+msgid "Column used for partition pruning on this table. Its Is filterable and Is dimension settings decide whether Explore offers it."
 msgstr ""
 
 msgid "Columnar upload"
